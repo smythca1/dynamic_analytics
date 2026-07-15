@@ -49,6 +49,7 @@ Docs and controls:
 
 - `VERSION_CONTRACT.md`
 - `PRODUCTION_MANIFEST.md`
+- `STRATEGY_LIFECYCLE.md`
 - `Makefile`
 
 ## Removed
