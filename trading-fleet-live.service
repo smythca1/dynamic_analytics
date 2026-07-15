@@ -1,0 +1,18 @@
+[Unit]
+Description=Trading Fleet Live Engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/trading-server
+EnvironmentFile=/root/trading-server/.env
+ExecStart=/root/trading-server/venv/bin/python fleet_runner.py --config /root/trading-server/configs/traders.live.example.json --execute-real --force-mode live --log-output /root/trading-server/artifacts/live/fleet_live_events.jsonl
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

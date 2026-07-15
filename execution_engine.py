@@ -1,0 +1,139 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Protocol
+
+import pandas as pd
+
+from alpaca_trader import AlpacaTrader, child_client_order_id, load_alpaca_credentials
+from trading_events import ExecutionEvent, OrderIntent, dataclass_to_jsonable
+
+
+class ExecutionEngine(Protocol):
+    def execute(self, intent: OrderIntent) -> ExecutionEvent:
+        ...
+
+
+class JsonlEventLog:
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def write(self, event_type: str, payload: dict) -> None:
+        record = {
+            "event_type": event_type,
+            "logged_at": pd.Timestamp.now(tz="UTC").isoformat(),
+            "payload": payload,
+        }
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+class ShadowExecutionEngine:
+    def __init__(self, log: JsonlEventLog | None = None) -> None:
+        self.log = log
+
+    def execute(self, intent: OrderIntent) -> ExecutionEvent:
+        event = ExecutionEvent(
+            timestamp=pd.Timestamp.now(tz="UTC"),
+            mode="shadow",
+            broker="none",
+            status="shadow_recorded",
+            intent=intent,
+            response=None,
+        )
+        if self.log:
+            self.log.write("execution", dataclass_to_jsonable(event))
+        return event
+
+
+class AlpacaExecutionEngine:
+    def __init__(
+        self,
+        mode: str | None = None,
+        credential_profile: str | None = None,
+        max_notional: float = 250000,
+        log: JsonlEventLog | None = None,
+    ) -> None:
+        self.trader = AlpacaTrader(
+            credentials=load_alpaca_credentials(mode, profile=credential_profile),
+            max_notional=max_notional,
+        )
+        self.log = log
+
+    def execute(self, intent: OrderIntent) -> ExecutionEvent:
+        action = "close" if intent.close_position else intent.side
+        payload: dict[str, object] = {
+            "symbol": intent.symbol,
+            "side": intent.side,
+            "order_type": intent.order_type,
+            "reason": intent.reason,
+            "client_order_id": intent.client_order_id,
+            "close_position": intent.close_position,
+        }
+        if intent.trader_id:
+            payload["trader_id"] = intent.trader_id
+        if intent.qty is not None:
+            payload["qty"] = intent.qty
+        if intent.target_qty is not None:
+            payload["target_qty"] = intent.target_qty
+        if intent.notional is not None:
+            payload["notional"] = intent.notional
+        if intent.limit_price is not None:
+            payload["limit_price"] = intent.limit_price
+        if intent.stop_price is not None:
+            payload["stop_price"] = intent.stop_price
+        if intent.stop_limit_price is not None:
+            payload["stop_limit_price"] = intent.stop_limit_price
+        if intent.exit_management:
+            payload["exit_management"] = intent.exit_management
+        if intent.stop_loss_order_type:
+            payload["stop_loss_order_type"] = intent.stop_loss_order_type
+        if intent.take_profit_limit_price is not None:
+            payload["take_profit_limit_price"] = intent.take_profit_limit_price
+        if intent.stop_loss_stop_price is not None:
+            payload["stop_loss_stop_price"] = intent.stop_loss_stop_price
+        if intent.stop_loss_limit_price is not None:
+            payload["stop_loss_limit_price"] = intent.stop_loss_limit_price
+        if intent.take_profit_offset is not None:
+            payload["take_profit_offset"] = intent.take_profit_offset
+        if intent.stop_loss_offset is not None:
+            payload["stop_loss_offset"] = intent.stop_loss_offset
+
+        response = self.trader.submit_order(payload, action=action, side=intent.side)
+        if (
+            intent.signal_type == "entry"
+            and intent.exit_management == "oco"
+            and intent.take_profit_limit_price is not None
+            and intent.stop_loss_stop_price is not None
+        ):
+            response = dict(response)
+            response["oco_exit_response"] = self.trader.submit_oco_exit_order(
+                symbol=intent.symbol,
+                entry_side=intent.side,
+                take_profit_limit_price=float(intent.take_profit_limit_price),
+                stop_loss_stop_price=float(intent.stop_loss_stop_price),
+                stop_loss_limit_price=float(intent.stop_loss_limit_price)
+                if intent.stop_loss_limit_price is not None
+                else None,
+                take_profit_offset=float(intent.take_profit_offset)
+                if intent.take_profit_offset is not None
+                else None,
+                stop_loss_offset=float(intent.stop_loss_offset)
+                if intent.stop_loss_offset is not None
+                else None,
+                client_order_id=child_client_order_id(intent.client_order_id, "oco"),
+                entry_order_id=str(response.get("response", {}).get("id") or "") or None,
+            )
+        event = ExecutionEvent(
+            timestamp=pd.Timestamp.now(tz="UTC"),
+            mode="real",
+            broker="alpaca",
+            status=str(response.get("status", "submitted")),
+            intent=intent,
+            response=response,
+        )
+        if self.log:
+            self.log.write("execution", dataclass_to_jsonable(event))
+        return event

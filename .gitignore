@@ -1,0 +1,28 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# Python/runtime
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local editor and OS metadata
+.vscode/
+.DS_Store
+
+# Generated trading/runtime data
+artifacts/
+data/
+*.log
+*.jsonl
+
+# Generated binaries/build outputs
+validated_renko_backtest
+*.o
+*.out

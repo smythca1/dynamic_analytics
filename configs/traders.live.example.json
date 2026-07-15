@@ -1,0 +1,364 @@
+{
+  "fleet_id": "production-camatron-aapl-nvda-tsla-1s-renko-e1-reversal-20260710",
+  "traders": [
+    {
+      "id": "camatron_aapl_1s_renko_1p3443_e1_reversal_1sh_20260701_live",
+      "enabled": true,
+      "execution_enabled": true,
+      "symbol": "AAPL",
+      "broker": "alpaca",
+      "account_alias": "camatron",
+      "mode": "live",
+      "event_log": "artifacts/live/fleet_live_events.jsonl",
+      "strategy_name": "aapl_1s_renko_e1_reversal_1p3443_long_short_overnight_1sh_camatron",
+      "profile": {
+        "source": "aapl_e1_reversal_1s_sip_2026-06_focused_0p38_0p58",
+        "trust_status": "user_requested_live_candidate",
+        "selection_note": "User-requested Camatron live deployment of AAPL 1S Renko E1 reversal strategy using best isolated June 2026 brick size.",
+        "renko_logic": "1s_close_tradingview_style_reversal",
+        "strategy_logic": "pure_e1_reversal_hold_overnight",
+        "brick_size": 1.3443,
+        "renko_brick_pct": 0.465,
+        "ltp_reference": 289.09,
+        "entry_bricks": 1,
+        "backtest_start": "2026-06-01",
+        "backtest_end": "2026-06-30",
+        "backtest_price_points": 491106,
+        "backtest_trades": 35,
+        "backtest_net_pnl_usd_10000_notional": 1364.48,
+        "backtest_return_pct_10000_notional": 13.64,
+        "backtest_max_drawdown_pct": 5.36,
+        "backtest_win_rate_pct": 37.1,
+        "backtest_profit_factor": 2.43,
+        "live_qty": 1
+      },
+      "data": {
+        "feed": "sip",
+        "renko_source": "1s_close"
+      },
+      "strategy": {
+        "type": "renko_reversal",
+        "brick_size": 1.3443,
+        "renko_anchor_mode": "grid",
+        "renko_anchor_price": 0.0,
+        "entry_bricks": 1,
+        "allow_short": true,
+        "order_type": "market",
+        "exit_management": "strategy"
+      },
+      "session": {
+        "timezone": "America/New_York",
+        "entry_start": "09:31:00",
+        "entry_end": "15:59:59",
+        "force_flat": null,
+        "active_start_date": "2026-07-01",
+        "active_end_date": null,
+        "allow_overnight": true
+      },
+      "sizing": {
+        "type": "qty",
+        "qty": 1
+      },
+      "risk": {
+        "max_daily_loss": 250,
+        "max_position_notional": 1000
+      },
+      "warm_start": {
+        "enabled": false,
+        "days": 0
+      }
+    },
+    {
+      "id": "camatron_nvda_1s_renko_1p149851_e1_reversal_1sh_20260701_live",
+      "enabled": true,
+      "execution_enabled": true,
+      "symbol": "NVDA",
+      "broker": "alpaca",
+      "account_alias": "camatron",
+      "mode": "live",
+      "event_log": "artifacts/live/fleet_live_events.jsonl",
+      "strategy_name": "nvda_1s_renko_e1_reversal_1p149851_long_short_overnight_1sh_camatron",
+      "profile": {
+        "source": "nvda_e1_reversal_1s_sip_2026-06-01_2026-06-29",
+        "trust_status": "user_requested_live_candidate",
+        "selection_note": "User-requested Camatron live deployment of NVDA 1S Renko E1 reversal strategy using the best neighbor-stable June 2026 brick size.",
+        "renko_logic": "1s_close_tradingview_style_reversal",
+        "strategy_logic": "pure_e1_reversal_hold_overnight",
+        "brick_size": 1.149851,
+        "renko_brick_pct": 0.59,
+        "ltp_reference": 194.89,
+        "entry_bricks": 1,
+        "backtest_start": "2026-06-01",
+        "backtest_end": "2026-06-29",
+        "backtest_price_points": 467999,
+        "backtest_trades": 38,
+        "backtest_net_pnl_usd_10000_notional": 1057.70,
+        "backtest_return_pct_10000_notional": 10.58,
+        "backtest_max_drawdown_pct": 11.27,
+        "backtest_win_rate_pct": 44.7,
+        "backtest_profit_factor": 1.50,
+        "backtest_neighbor_avg_return_pct": 15.79,
+        "backtest_neighbor_profitability_pct": 100.0,
+        "live_qty": 1
+      },
+      "data": {
+        "feed": "sip",
+        "renko_source": "1s_close"
+      },
+      "strategy": {
+        "type": "renko_reversal",
+        "brick_size": 1.149851,
+        "renko_anchor_mode": "grid",
+        "renko_anchor_price": 0.0,
+        "entry_bricks": 1,
+        "allow_short": true,
+        "order_type": "market",
+        "exit_management": "strategy"
+      },
+      "session": {
+        "timezone": "America/New_York",
+        "entry_start": "09:31:00",
+        "entry_end": "15:59:59",
+        "force_flat": null,
+        "active_start_date": "2026-07-01",
+        "active_end_date": null,
+        "allow_overnight": true
+      },
+      "sizing": {
+        "type": "qty",
+        "qty": 1
+      },
+      "risk": {
+        "max_daily_loss": 250,
+        "max_position_notional": 1000
+      },
+      "warm_start": {
+        "enabled": false,
+        "days": 0
+      }
+    },
+    {
+      "id": "camatron_tsla_1s_renko_2p31165_e1_reversal_1sh_20260710_live",
+      "enabled": true,
+      "execution_enabled": true,
+      "symbol": "TSLA",
+      "broker": "alpaca",
+      "account_alias": "camatron",
+      "mode": "live",
+      "event_log": "artifacts/live/fleet_live_events.jsonl",
+      "strategy_name": "tsla_1s_renko_e1_reversal_2p31165_long_short_overnight_1sh_camatron",
+      "profile": {
+        "source": "tsla_e1_reversal_1s_sip_2026-06-01_2026-06-30_with_2026-07-01_2026-07-09_validation",
+        "trust_status": "user_requested_live_candidate",
+        "selection_note": "User-requested Camatron live deployment of TSLA 1S Renko E1 reversal strategy using a June top candidate that validated positively on July 1-9.",
+        "renko_logic": "1s_close_tradingview_style_reversal",
+        "strategy_logic": "pure_e1_reversal_hold_overnight",
+        "brick_size": 2.31165,
+        "renko_brick_pct": 0.55,
+        "ltp_reference": 420.3,
+        "entry_bricks": 1,
+        "backtest_start": "2026-06-01",
+        "backtest_end": "2026-06-30",
+        "backtest_price_points": 491249,
+        "backtest_trades": 41,
+        "backtest_net_pnl_usd_10000_notional": 3785.87,
+        "backtest_return_pct_10000_notional": 37.86,
+        "backtest_max_drawdown_pct": 4.92,
+        "backtest_win_rate_pct": 48.8,
+        "backtest_profit_factor": 3.55,
+        "backtest_neighbor_avg_return_pct": 34.11,
+        "backtest_neighbor_profitability_pct": 100.0,
+        "validation_start": "2026-07-01",
+        "validation_end": "2026-07-09",
+        "validation_price_points": 140351,
+        "validation_trades": 16,
+        "validation_net_pnl_usd_10000_notional": 873.60,
+        "validation_return_pct_10000_notional": 8.74,
+        "validation_max_drawdown_pct": 4.35,
+        "validation_win_rate_pct": 37.5,
+        "validation_profit_factor": 2.02,
+        "live_qty": 1
+      },
+      "data": {
+        "feed": "sip",
+        "renko_source": "1s_close"
+      },
+      "strategy": {
+        "type": "renko_reversal",
+        "brick_size": 2.31165,
+        "renko_anchor_mode": "grid",
+        "renko_anchor_price": 0.0,
+        "entry_bricks": 1,
+        "allow_short": true,
+        "order_type": "market",
+        "exit_management": "strategy"
+      },
+      "session": {
+        "timezone": "America/New_York",
+        "entry_start": "09:31:00",
+        "entry_end": "15:59:59",
+        "force_flat": null,
+        "active_start_date": "2026-07-10",
+        "active_end_date": null,
+        "allow_overnight": true
+      },
+      "sizing": {
+        "type": "qty",
+        "qty": 1
+      },
+      "risk": {
+        "max_daily_loss": 250,
+        "max_position_notional": 1000
+      },
+      "warm_start": {
+        "enabled": false,
+        "days": 0
+      }
+    },
+    {
+      "id": "camatron_qqq_1s_chop_mean_reversion_w180_z2_eff035_1sh_20260715_live",
+      "enabled": true,
+      "execution_enabled": true,
+      "symbol": "QQQ",
+      "broker": "alpaca",
+      "account_alias": "camatron",
+      "mode": "live",
+      "event_log": "artifacts/live/fleet_live_events.jsonl",
+      "strategy_name": "qqq_1s_chop_mean_reversion_w180_z2_eff035_hold300_1sh_camatron",
+      "profile": {
+        "source": "qqq_chop_mean_reversion_live_archive_20260527_20260618_rth_slip005",
+        "trust_status": "user_requested_live_candidate",
+        "selection_note": "User-requested Camatron production deployment of QQQ chop-native rolling mean reversion hedge, validated on archived live QQQ ticks with $0.05/share slippage assumption.",
+        "strategy_logic": "rolling_mean_reversion_low_efficiency_chop_gate",
+        "window_seconds": 180,
+        "entry_z": 2.0,
+        "exit_z": 0.10,
+        "stop_z": 3.0,
+        "efficiency_max": 0.35,
+        "trend_exit_efficiency": 0.65,
+        "max_hold_seconds": 300,
+        "backtest_start": "2026-05-27",
+        "backtest_end": "2026-06-18",
+        "backtest_regular_session_only": true,
+        "backtest_price_points": 147224,
+        "backtest_raw_price_points": 201556,
+        "backtest_trading_days": 12,
+        "backtest_slippage_per_share": 0.05,
+        "backtest_trades": 1487,
+        "backtest_net_pnl_usd_10000_notional": 960.18,
+        "backtest_return_pct_10000_notional": 9.60,
+        "backtest_max_drawdown_pct": 3.34,
+        "backtest_win_rate_pct": 52.99,
+        "backtest_profit_factor": 1.41,
+        "buy_hold_return_pct_same_period": 0.91,
+        "live_qty": 1
+      },
+      "data": {
+        "feed": "sip",
+        "renko_source": "1s_close"
+      },
+      "strategy": {
+        "type": "chop_mean_reversion",
+        "window_seconds": 180,
+        "entry_z": 2.0,
+        "exit_z": 0.10,
+        "stop_z": 3.0,
+        "efficiency_max": 0.35,
+        "trend_exit_efficiency": 0.65,
+        "max_hold_seconds": 300,
+        "allow_short": true,
+        "order_type": "market",
+        "exit_management": "strategy"
+      },
+      "session": {
+        "timezone": "America/New_York",
+        "entry_start": "09:35:00",
+        "entry_end": "15:45:00",
+        "force_flat": "15:58:00",
+        "active_start_date": "2026-07-15",
+        "active_end_date": null,
+        "allow_overnight": false
+      },
+      "sizing": {
+        "type": "qty",
+        "qty": 1
+      },
+      "risk": {
+        "max_daily_loss": 250,
+        "max_position_notional": 1000
+      },
+      "warm_start": {
+        "enabled": false,
+        "days": 0
+      }
+    },
+    {
+      "id": "candidate_tsla_renko_psar_1p90_e2_i3_a0p04_m0p6_disabled",
+      "enabled": false,
+      "execution_enabled": false,
+      "symbol": "TSLA",
+      "broker": "alpaca",
+      "account_alias": "research",
+      "mode": "paper",
+      "event_log": "artifacts/live/fleet_live_events.jsonl",
+      "strategy_name": "tsla_renko_psar_1p90_e2_i3_a0p04_m0p6_candidate_disabled",
+      "profile": {
+        "source": "psar_rebuild_candidate_20260618",
+        "trust_status": "unvalidated_candidate",
+        "selection_note": "Legacy PSAR parameters carried forward only as a disabled hypothesis. Not production eligible until reproduced through production tick replay and a green parity gate.",
+        "nominal_brick_size": 1.9,
+        "entry_bricks": 2,
+        "psar_initial_stop_bricks": 3,
+        "psar_af_step": 0.04,
+        "psar_af_max": 0.6
+      },
+      "data": {
+        "feed": "sip",
+        "renko_source": "ticks"
+      },
+      "strategy": {
+        "type": "renko_psar",
+        "brick_size": 1.9,
+        "renko_anchor_mode": "grid",
+        "renko_anchor_price": 0.0,
+        "entry_bricks": 2,
+        "psar_initial_stop_bricks": 3,
+        "psar_af_step": 0.04,
+        "psar_af_max": 0.6,
+        "allow_short": true,
+        "order_type": "market",
+        "exit_management": "strategy"
+      },
+      "session": {
+        "timezone": "America/New_York",
+        "entry_start": "09:31:00",
+        "entry_end": "15:59:00",
+        "force_flat": "15:59:30",
+        "active_start_date": null,
+        "active_end_date": null,
+        "allow_overnight": false
+      },
+      "sizing": {
+        "type": "qty",
+        "qty": 1
+      },
+      "risk": {
+        "max_daily_loss": 250,
+        "max_position_notional": 1000
+      },
+      "promotion": {
+        "production_eligible": false,
+        "required_before_enable": [
+          "production tick archive replay",
+          "live-vs-replay signal parity",
+          "broker fill reconciliation",
+          "green parity gate"
+        ]
+      },
+      "warm_start": {
+        "enabled": false,
+        "days": 0
+      }
+    }
+  ]
+}

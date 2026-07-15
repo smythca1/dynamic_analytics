@@ -1,0 +1,20 @@
+[Unit]
+Description=Trading Mission Control Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/trading-server
+EnvironmentFile=/root/trading-server/.env
+Environment=TRADER_CONFIG_PATH=/root/trading-server/configs/traders.live.example.json
+Environment=LIVE_EVENT_LOG=/root/trading-server/artifacts/live/fleet_live_events.jsonl
+ExecStart=/root/trading-server/venv/bin/python -m uvicorn --app-dir /root/trading-server monitoring_app:app --host 127.0.0.1 --port 8080
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

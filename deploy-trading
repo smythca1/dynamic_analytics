@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HOST="${DEPLOY_HOST:-157.230.54.46}"
+USER_NAME="${DEPLOY_USER:-root}"
+REMOTE_DIR="${DEPLOY_REMOTE_DIR:-~/trading-server}"
+SERVICE_NAME="${DEPLOY_SERVICE_NAME:-trading-fleet-live}"
+SERVICE_UNIT_FILE="${SERVICE_NAME}.service"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INCLUDE_ENV="${DEPLOY_WITH_ENV:-0}"
+FILES=(
+  "alpaca_trader.py"
+  "execution_engine.py"
+  "fleet_runner.py"
+  "monitoring_app.py"
+  "renko_builder.py"
+  "strategy_engine.py"
+  "trading_events.py"
+  "validated_renko_backtest.cpp"
+  "requirements.txt"
+  "mission-control.service"
+  "trading-fleet-live.service"
+)
+CONFIG_FILES=(
+  "configs/traders.live.example.json"
+)
+
+if [[ "${INCLUDE_ENV}" == "1" ]]; then
+  FILES+=(".env")
+fi
+
+CONTROL_PATH="/tmp/${SERVICE_NAME}-deploy-%r@%h:%p"
+SSH_BASE=(ssh -o ControlMaster=auto -o ControlPersist=600 -o ControlPath="${CONTROL_PATH}")
+SCP_BASE=(scp -o ControlMaster=auto -o ControlPersist=600 -o ControlPath="${CONTROL_PATH}")
+
+for file in "${FILES[@]}"; do
+  if [[ ! -f "$SCRIPT_DIR/$file" ]]; then
+    echo "Missing required file: $SCRIPT_DIR/$file" >&2
+    exit 1
+  fi
+done
+for file in "${CONFIG_FILES[@]}"; do
+  if [[ ! -f "$SCRIPT_DIR/$file" ]]; then
+    echo "Missing required file: $SCRIPT_DIR/$file" >&2
+    exit 1
+  fi
+done
+
+cleanup() {
+  "${SSH_BASE[@]}" -O exit "${USER_NAME}@${HOST}" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+echo "Uploading files to ${USER_NAME}@${HOST}:${REMOTE_DIR}"
+if [[ "${INCLUDE_ENV}" == "1" ]]; then
+  echo "Including local .env in deploy because DEPLOY_WITH_ENV=1"
+else
+  echo "Skipping local .env; remote environment file will be left unchanged"
+fi
+"${SSH_BASE[@]}" "${USER_NAME}@${HOST}" "mkdir -p ${REMOTE_DIR}/configs ${REMOTE_DIR}/artifacts/live"
+
+SOURCE_FILES=()
+for file in "${FILES[@]}"; do
+  SOURCE_FILES+=("$SCRIPT_DIR/$file")
+done
+
+"${SCP_BASE[@]}" "${SOURCE_FILES[@]}" "${USER_NAME}@${HOST}:${REMOTE_DIR}/"
+"${SCP_BASE[@]}" "${SCRIPT_DIR}/configs/traders.live.example.json" "${USER_NAME}@${HOST}:${REMOTE_DIR}/configs/"
+
+echo "Installing production fleet services on ${HOST}"
+"${SSH_BASE[@]}" -t "${USER_NAME}@${HOST}" "bash -lc '
+set -euo pipefail
+cd ${REMOTE_DIR}
+
+if [[ ! -d venv ]]; then
+  python3 -m venv venv
+fi
+
+source venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m py_compile alpaca_trader.py trading_events.py renko_builder.py strategy_engine.py execution_engine.py fleet_runner.py monitoring_app.py
+
+install -m 0644 mission-control.service /etc/systemd/system/mission-control.service
+install -m 0644 trading-fleet-live.service /etc/systemd/system/trading-fleet-live.service
+systemctl daemon-reload
+systemctl enable mission-control.service
+systemctl disable trading-server.service 2>/dev/null || true
+systemctl stop trading-server.service 2>/dev/null || true
+
+systemctl restart mission-control.service
+
+sleep 5
+if ! systemctl is-active --quiet mission-control.service; then
+  echo
+  echo "Service failed to stay active: mission-control.service"
+  systemctl status mission-control.service --no-pager || true
+  journalctl -u mission-control.service -n 50 --no-pager || true
+  exit 1
+fi
+
+if ! curl --fail --silent http://127.0.0.1:8080/ >/dev/null; then
+  echo
+  echo "Mission-control health check failed"
+  systemctl status mission-control.service --no-pager || true
+  journalctl -u mission-control.service -n 50 --no-pager || true
+  exit 1
+fi
+systemctl --no-pager --lines=5 status mission-control.service
+
+if [[ "${DEPLOY_START_FLEET:-0}" == "1" ]]; then
+  systemctl enable trading-fleet-live.service
+  systemctl restart trading-fleet-live.service
+  sleep 5
+  if ! systemctl is-active --quiet trading-fleet-live.service; then
+    echo
+    echo \"Service failed to stay active: trading-fleet-live.service\"
+    systemctl status trading-fleet-live.service --no-pager || true
+    journalctl -u trading-fleet-live.service -n 80 --no-pager || true
+    exit 1
+  fi
+  systemctl --no-pager --lines=5 status trading-fleet-live.service
+else
+  echo \"trading-fleet-live.service installed but not started. Set DEPLOY_START_FLEET=1 to start it during deploy.\"
+fi
+'"
+
+echo
+echo "Mission-control was verified from inside the droplet."
+echo
+echo "Deploy complete."

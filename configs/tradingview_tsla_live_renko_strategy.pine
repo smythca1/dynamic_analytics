@@ -1,0 +1,237 @@
+//@version=6
+// Use this on a TSLA TradingView Renko chart configured with a fixed nominal
+// brick size of 1.99365. This mirrors the live 1-second-close continuation
+// Renko profile: E1 TP2 SL2, 1 share, RTH-only, force-flat at 15:59 ET.
+//
+// Slippage is set to 4 ticks because today's adverse TSLA entry slippage was:
+// 0.0395 and 0.0430 per share. The first fill was favorable by 0.2820, but
+// TradingView's strategy slippage is adverse-only, so the adverse-only average
+// is the least misleading live-aligned default.
+strategy(
+    "TSLA Live Renko - 1.99365 nominal, E1 TP2 SL2, 1sh, intraday",
+    overlay = true,
+    pyramiding = 0,
+    initial_capital = 22000,
+    default_qty_type = strategy.fixed,
+    default_qty_value = 1,
+    commission_type = strategy.commission.percent,
+    commission_value = 0.0,
+    slippage = 4,
+    process_orders_on_close = true,
+    calc_on_every_tick = true,
+    calc_on_order_fills = true
+)
+
+// -------------------------
+// Session clock
+// -------------------------
+useSessionClock = input.bool(true, "Use 1m Standard Session Clock")
+sessionClockTf  = input.timeframe("1", "Session Clock Timeframe")
+
+// -------------------------
+// Backtest window
+// -------------------------
+useDateWindow     = input.bool(true, "Use Backtest Date Window")
+startDate         = input.time(timestamp("2026-05-01 00:00 +0000"), "Start Date")
+endDate           = input.time(timestamp("2026-12-31 23:59 +0000"), "End Date")
+renkoDecisionTime = nz(time_close, time)
+clockSymbol       = ticker.standard(syminfo.tickerid)
+clockDecisionTime = request.security(clockSymbol, sessionClockTf, time, gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+decisionTime      = useSessionClock ? nz(clockDecisionTime, renkoDecisionTime) : renkoDecisionTime
+inDateWindow      = not useDateWindow or (decisionTime >= startDate and decisionTime <= endDate)
+
+// -------------------------
+// Inputs matching production
+// -------------------------
+allowLongs    = input.bool(true, "Enable Longs")
+allowShorts   = input.bool(true, "Enable Shorts")
+entryRunLen   = input.int(1, "Entry Brick Number", minval = 1)
+stopBricks    = input.float(2.0, "Stop Loss (bricks)", minval = 0.1, step = 0.1)
+takeBricks    = input.float(2.0, "Take Profit (bricks)", minval = 0.1, step = 0.1)
+
+useEntrySession       = input.bool(true, "Limit New Entries to RTH Session")
+entrySessionStartHour = input.int(9, "Entry Session Start Hour", minval = 0, maxval = 23)
+entrySessionStartMin  = input.int(30, "Entry Session Start Minute", minval = 0, maxval = 59)
+forceCloseHour        = input.int(15, "Force Close Hour", minval = 0, maxval = 23)
+forceCloseMin         = input.int(59, "Force Close Minute", minval = 0, maxval = 59)
+
+showSignals = input.bool(true, "Show Setup Signals")
+showLevels  = input.bool(true, "Show TP/SL Levels")
+showLabels  = input.bool(true, "Show Entry/Exit Labels")
+showWindow  = input.bool(true, "Highlight Active Window")
+debugBars   = input.bool(true, "Color Bars")
+
+// -------------------------
+// Renko brick direction
+// -------------------------
+brickUp   = close > open
+brickDown = close < open
+brickSize = math.abs(close - open)
+dir       = brickUp ? 1 : brickDown ? -1 : 0
+
+// -------------------------
+// Session timing
+// -------------------------
+decisionHour            = hour(decisionTime, syminfo.timezone)
+decisionMinute          = minute(decisionTime, syminfo.timezone)
+decisionMinuteOfDay     = decisionHour * 60 + decisionMinute
+entrySessionStartMinute = entrySessionStartHour * 60 + entrySessionStartMin
+forceCloseMinuteOfDay   = forceCloseHour * 60 + forceCloseMin
+inEntrySession          = not useEntrySession or (decisionMinuteOfDay >= entrySessionStartMinute and decisionMinuteOfDay < forceCloseMinuteOfDay)
+pastForceClose          = decisionMinuteOfDay >= forceCloseMinuteOfDay
+
+// -------------------------
+// Track consecutive bricks
+// -------------------------
+var int runDir = 0
+var int runLen = 0
+
+if barstate.isconfirmed and dir != 0
+    if dir == runDir
+        runLen += 1
+    else
+        runDir := dir
+        runLen := 1
+
+// -------------------------
+// Track actual filled trade state
+// -------------------------
+var float entryPrice     = na
+var float entryBrickSize = na
+var int   entrySide      = 0   // 1 = long, -1 = short, 0 = flat
+var int   lastExitType   = 0   // 1 = TP, -1 = SL, 0 = force/end close
+var int   pendingExitType = na
+var bool  didForceCloseToday = false
+var int   lastDecisionDay = na
+
+currentDecisionDay = year(decisionTime, syminfo.timezone) * 10000 + month(decisionTime, syminfo.timezone) * 100 + dayofmonth(decisionTime, syminfo.timezone)
+
+if na(lastDecisionDay) or currentDecisionDay != lastDecisionDay
+    didForceCloseToday := false
+    lastDecisionDay := currentDecisionDay
+
+newLongEntry  = strategy.position_size > 0 and strategy.position_size[1] == 0
+newShortEntry = strategy.position_size < 0 and strategy.position_size[1] == 0
+newExit       = strategy.position_size == 0 and strategy.position_size[1] != 0
+
+if newLongEntry
+    entryPrice     := strategy.position_avg_price
+    entryBrickSize := brickSize
+    entrySide      := 1
+    lastExitType   := 0
+    pendingExitType := na
+
+if newShortEntry
+    entryPrice     := strategy.position_avg_price
+    entryBrickSize := brickSize
+    entrySide      := -1
+    lastExitType   := 0
+    pendingExitType := na
+
+if newExit
+    if pendingExitType == 0
+        lastExitType := 0
+    else
+        exitFill = strategy.closedtrades > 0 ? strategy.closedtrades.exit_price(strategy.closedtrades - 1) : na
+        expectedTP = entrySide == 1 ? entryPrice + entryBrickSize * takeBricks : entryPrice - entryBrickSize * takeBricks
+        tpTolerance = syminfo.mintick * 5.0
+        tpHit = not na(exitFill) and not na(expectedTP) and ((entrySide == 1 and exitFill >= expectedTP - tpTolerance) or (entrySide == -1 and exitFill <= expectedTP + tpTolerance))
+        lastExitType := tpHit ? 1 : -1
+
+    entryPrice := na
+    entryBrickSize := na
+    pendingExitType := na
+
+// -------------------------
+// TP/SL levels from actual filled entry
+// -------------------------
+longTP  = strategy.position_size > 0 and not na(entryPrice) and not na(entryBrickSize) ? entryPrice + entryBrickSize * takeBricks : na
+longSL  = strategy.position_size > 0 and not na(entryPrice) and not na(entryBrickSize) ? entryPrice - entryBrickSize * stopBricks : na
+shortTP = strategy.position_size < 0 and not na(entryPrice) and not na(entryBrickSize) ? entryPrice - entryBrickSize * takeBricks : na
+shortSL = strategy.position_size < 0 and not na(entryPrice) and not na(entryBrickSize) ? entryPrice + entryBrickSize * stopBricks : na
+
+// -------------------------
+// Setup logic
+// -------------------------
+longSignal  = barstate.isconfirmed and not newExit and inDateWindow and inEntrySession and allowLongs and dir == 1 and runLen == entryRunLen and strategy.position_size == 0
+shortSignal = barstate.isconfirmed and not newExit and inDateWindow and inEntrySession and allowShorts and dir == -1 and runLen == entryRunLen and strategy.position_size == 0
+
+// -------------------------
+// Submit entries
+// -------------------------
+if longSignal
+    strategy.entry("Long", strategy.long)
+
+if shortSignal
+    strategy.entry("Short", strategy.short)
+
+// -------------------------
+// Production-style OCO exits
+// -------------------------
+if strategy.position_size > 0 and not na(longTP) and not na(longSL)
+    strategy.exit("Long OCO", from_entry = "Long", limit = longTP, stop = longSL, comment = "TP/SL")
+
+if strategy.position_size < 0 and not na(shortTP) and not na(shortSL)
+    strategy.exit("Short OCO", from_entry = "Short", limit = shortTP, stop = shortSL, comment = "TP/SL")
+
+if strategy.position_size != 0 and pastForceClose and not didForceCloseToday
+    pendingExitType := 0
+    strategy.close_all(comment = "Session Close")
+    didForceCloseToday := true
+
+if useDateWindow and decisionTime > endDate and strategy.position_size != 0
+    pendingExitType := 0
+    strategy.close_all(comment = "End Window")
+
+exitWasTP    = newExit and lastExitType == 1
+exitWasSL    = newExit and lastExitType == -1
+exitWasOther = newExit and lastExitType == 0
+
+// -------------------------
+// Draw labels
+// -------------------------
+if showLabels and newLongEntry
+    label.new(bar_index, low, "BUY", style = label.style_label_up, textcolor = color.white, color = color.new(color.green, 0), size = size.small)
+
+if showLabels and newShortEntry
+    label.new(bar_index, high, "SELL", style = label.style_label_down, textcolor = color.white, color = color.new(color.red, 0), size = size.small)
+
+if showLabels and exitWasTP
+    label.new(bar_index, entrySide == 1 ? high : low, "TP", style = entrySide == 1 ? label.style_label_down : label.style_label_up, textcolor = color.white, color = color.new(color.blue, 0), size = size.small)
+
+if showLabels and exitWasSL
+    label.new(bar_index, entrySide == 1 ? low : high, "SL", style = entrySide == 1 ? label.style_label_up : label.style_label_down, textcolor = color.white, color = color.new(color.orange, 0), size = size.small)
+
+if showLabels and exitWasOther
+    label.new(bar_index, entrySide == 1 ? high : low, "CLOSE", style = entrySide == 1 ? label.style_label_down : label.style_label_up, textcolor = color.white, color = color.new(color.gray, 0), size = size.small)
+
+// -------------------------
+// Optional setup markers
+// -------------------------
+plotshape(showSignals and longSignal, title = "Long Setup", style = shape.triangleup, location = location.belowbar, size = size.tiny, text = "L", color = color.new(color.lime, 0))
+plotshape(showSignals and shortSignal, title = "Short Setup", style = shape.triangledown, location = location.abovebar, size = size.tiny, text = "S", color = color.new(color.red, 0))
+
+// -------------------------
+// TP/SL lines while in trade
+// -------------------------
+plot(showLevels and strategy.position_size > 0 ? longTP : na, "Long TP", color = color.green, linewidth = 2, style = plot.style_linebr)
+plot(showLevels and strategy.position_size > 0 ? longSL : na, "Long SL", color = color.red, linewidth = 2, style = plot.style_linebr)
+plot(showLevels and strategy.position_size < 0 ? shortTP : na, "Short TP", color = color.green, linewidth = 2, style = plot.style_linebr)
+plot(showLevels and strategy.position_size < 0 ? shortSL : na, "Short SL", color = color.red, linewidth = 2, style = plot.style_linebr)
+
+bgcolor(showWindow and inDateWindow ? color.new(color.teal, 92) : na, title = "Active Window")
+barcolor(debugBars ? (dir == 1 ? color.new(color.lime, 70) : dir == -1 ? color.new(color.red, 70) : na) : na)
+
+// -------------------------
+// Data window
+// -------------------------
+plot(runLen, "Run Length", display = display.data_window)
+plot(brickSize, "Brick Size", display = display.data_window)
+plot(entryBrickSize, "Entry Brick Size", display = display.data_window)
+plot(entryPrice, "Entry Price", display = display.data_window)
+plot(strategy.position_size, "Position Size", display = display.data_window)
+plot(inDateWindow ? 1 : 0, "In Date Window", display = display.data_window)
+plot(inEntrySession ? 1 : 0, "In Entry Session", display = display.data_window)
+plot(pastForceClose ? 1 : 0, "Past Force Close", display = display.data_window)
+plot(4, "Live Slippage Ticks", display = display.data_window)
+plot(0.04, "Live Slippage Dollars", display = display.data_window)
