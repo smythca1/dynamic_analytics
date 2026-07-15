@@ -26,7 +26,7 @@ from strategy_engine import (
     RenkoStrategyConfig,
     RenkoStrategyEngine,
 )
-from trading_events import MarketTick, is_price_forming_trade
+from trading_events import MarketTick, PositionState, is_price_forming_trade
 
 
 class MemoryLog:
@@ -376,6 +376,75 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
         self.assertEqual(reversal_intent.side, "sell")
         self.assertEqual(reversal_intent.qty, 2)
         self.assertEqual(reversal_intent.target_qty, 1)
+
+    def test_renko_reversal_allows_existing_position_reversal_before_entry_start(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_aapl_reversal_open_test",
+                symbol="AAPL",
+                strategy_type="renko_reversal",
+                brick_size=1.0,
+                entry_bricks=1,
+                qty=1,
+                renko_anchor_mode="grid",
+                renko_anchor_price=0.0,
+                entry_start="09:31:00",
+                entry_end="15:59:59",
+                allow_overnight=True,
+            )
+        )
+        engine.position = PositionState(
+            symbol="AAPL",
+            side="short",
+            entry_time=pd.Timestamp("2026-07-14T15:55:58Z"),
+            entry_price=313.22,
+            qty=1,
+        )
+
+        actions = engine._on_brick_reversal(
+            {
+                "timestamp": pd.Timestamp("2026-07-15T13:30:00Z"),
+                "brick_close": 317.25,
+                "direction": 1,
+                "run_len": 1,
+            }
+        )
+
+        self.assertEqual(len(actions), 1)
+        signal, intent = actions[0]
+        self.assertEqual(signal.reason, "long_entry_e1_reversal")
+        self.assertEqual(signal.side, "long")
+        self.assertEqual(intent.side, "buy")
+        self.assertEqual(intent.qty, 2)
+        self.assertEqual(intent.target_qty, 1)
+
+    def test_renko_reversal_blocks_flat_entry_before_entry_start(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_aapl_reversal_open_test",
+                symbol="AAPL",
+                strategy_type="renko_reversal",
+                brick_size=1.0,
+                entry_bricks=1,
+                qty=1,
+                renko_anchor_mode="grid",
+                renko_anchor_price=0.0,
+                entry_start="09:31:00",
+                entry_end="15:59:59",
+                allow_overnight=True,
+            )
+        )
+
+        actions = engine._on_brick_reversal(
+            {
+                "timestamp": pd.Timestamp("2026-07-15T13:30:00Z"),
+                "brick_close": 317.25,
+                "direction": 1,
+                "run_len": 1,
+            }
+        )
+
+        self.assertEqual(actions, [])
 
     def test_fleet_strategy_config_reads_order_type(self):
         config = build_strategy_config(

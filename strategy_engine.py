@@ -353,8 +353,6 @@ class RenkoStrategyEngine:
 
         if run_len != self.config.entry_bricks:
             return []
-        if not self._entry_allowed(timestamp):
-            return []
         if direction == -1 and not self.config.allow_short:
             return []
 
@@ -364,6 +362,8 @@ class RenkoStrategyEngine:
 
         if self.position is not None:
             if self.position.side == side:
+                return []
+            if not self._reversal_entry_allowed(timestamp):
                 return []
             if not self._reversal_allowed(timestamp):
                 return []
@@ -396,6 +396,9 @@ class RenkoStrategyEngine:
                     ),
                 )
             ]
+
+        if not self._entry_allowed(timestamp):
+            return []
 
         reason = f"{side}_entry_e1"
         self.position = PositionState(
@@ -634,6 +637,22 @@ class RenkoStrategyEngine:
             return False
         current_time = local_timestamp.time()
         if self.entry_start and current_time < self.entry_start:
+            return False
+        if self.entry_end and current_time > self.entry_end:
+            return False
+        if not self.config.allow_overnight and self.force_flat and current_time >= self.force_flat:
+            return False
+        return True
+
+    def _reversal_entry_allowed(self, timestamp: pd.Timestamp) -> bool:
+        local_timestamp = self._local_timestamp(timestamp)
+        current_date = local_timestamp.date().isoformat()
+        if self.active_start_date and current_date < self.active_start_date:
+            return False
+        if self.active_end_date and current_date > self.active_end_date:
+            return False
+        current_time = local_timestamp.time()
+        if current_time < time(9, 30):
             return False
         if self.entry_end and current_time > self.entry_end:
             return False
