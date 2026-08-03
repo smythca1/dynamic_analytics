@@ -1,0 +1,773 @@
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = REPO_ROOT / "deploy-trading"
+
+
+class DeployTradingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        shutil.copy2(SCRIPT, self.repo / "deploy-trading")
+        (self.repo / "deploy-trading").chmod(0o755)
+        self._git("init")
+        self._git("config", "user.email", "deploy-test@example.com")
+        self._git("config", "user.name", "Deploy Test")
+        self._write_payload("committed")
+        self._git("add", ".")
+        self._git("commit", "-m", "initial")
+        self.commit = self._git("rev-parse", "HEAD").stdout.strip()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _git(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["git", *args], cwd=self.repo, text=True, capture_output=True, check=True)
+
+    def _run(self, *args: str, check: bool = True, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        merged_env = os.environ.copy()
+        if env:
+            merged_env.update(env)
+        return subprocess.run(
+            ["./deploy-trading", *args],
+            cwd=self.repo,
+            text=True,
+            capture_output=True,
+            check=check,
+            env=merged_env,
+        )
+
+    def _write(self, relative: str, text: str) -> None:
+        path = self.repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def _write_payload(self, marker: str) -> None:
+        for filename in (
+            "alpaca_trader.py",
+            "execution_engine.py",
+            "fleet_runner.py",
+            "monitoring_app.py",
+            "renko_builder.py",
+            "strategy_engine.py",
+            "trading_events.py",
+        ):
+            self._write(filename, f"# {filename} {marker}\n")
+        self._write("requirements.txt", "pandas\n")
+        self._write("mission-control.service", "[Service]\nExecStart=mission\n")
+        self._write("trading-fleet-live.service", "[Service]\nExecStart=fleet\n")
+        self._write("shared/__init__.py", "# shared\n")
+        self._write("shared/config/__init__.py", "# config\n")
+        self._write("shared/config/trader_config.py", "def build_strategy_config(trader):\n    return trader\n")
+        self._write("silver/__init__.py", "# silver\n")
+        self._write("silver/market/__init__.py", "# market\n")
+        self._write("silver/market/one_second_sampler.py", "# sampler\n")
+        self._write("silver/evidence/__init__.py", "# evidence\n")
+        self._write("silver/evidence/logger.py", "# logger\n")
+        self._write("silver/evidence/shadow_sampler.py", "# shadow\n")
+        self._write("configs/traders.live.example.json", '{"traders": [{"id": "t1", "enabled": true}]}\n')
+        self._write("replay/engine.py", "# excluded\n")
+        self._write("tests/test_example.py", "# excluded\n")
+        self._write("artifacts/live/out.jsonl", "{}\n")
+        self._write(".env", "SECRET=do-not-deploy\n")
+        self._write("venv/bin/python", "venv\n")
+        self._write("validated_renko_backtest.cpp", "// excluded unless required\n")
+
+    def test_explicit_commit_resolves_to_full_sha(self) -> None:
+        result = self._run("--commit", self.commit[:8], "--dry-run")
+        self.assertIn(f"Resolved commit: {self.commit}", result.stdout)
+
+    def test_invalid_commit_fails(self) -> None:
+        result = self._run("--commit", "not-a-commit", "--dry-run", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid commit", result.stderr)
+
+    def test_dirty_working_tree_cannot_affect_payload(self) -> None:
+        committed_hash = self._sha256(self.repo / "fleet_runner.py")
+        self._write("fleet_runner.py", "event = runtime.execution.execute(intent)\nexecution_status_failed\n")
+        result = self._run("--commit", self.commit, "--dry-run")
+        self.assertIn("Dirty caller worktree: yes - ignored for payload", result.stdout)
+        self.assertIn(f"fleet_runner.py {committed_hash}", result.stdout)
+        self.assertNotIn("execution_status_failed", result.stdout)
+
+    def test_temporary_source_is_clean_and_cleaned_up_on_success(self) -> None:
+        result = self._run("--commit", self.commit, "--dry-run")
+        self.assertIn("Clean source status: clean", result.stdout)
+        source_path = self._extract_clean_source_path(result.stdout)
+        self.assertFalse(source_path.exists())
+
+    def test_shared_and_silver_are_included(self) -> None:
+        result = self._run("--commit", self.commit, "--dry-run")
+        self.assertIn("  shared", result.stdout)
+        self.assertIn("  silver", result.stdout)
+
+    def test_excluded_paths_are_not_included(self) -> None:
+        result = self._run("--commit", self.commit, "--dry-run")
+        includes = self._payload_includes(result.stdout)
+        self.assertNotIn("replay", includes)
+        self.assertNotIn("tests", includes)
+        self.assertNotIn("artifacts", includes)
+        self.assertNotIn(".env", includes)
+        self.assertNotIn("venv", includes)
+        self.assertNotIn("validated_renko_backtest.cpp", includes)
+
+    def test_config_preserved_by_default(self) -> None:
+        result = self._run("--commit", self.commit, "--dry-run")
+        self.assertIn("Config policy: preserve_remote", result.stdout)
+        self.assertNotIn(f"  configs/traders.live.example.json\n", result.stdout)
+
+    def test_deploy_config_explicitly_includes_config(self) -> None:
+        result = self._run("--commit", self.commit, "--dry-run", "--deploy-config")
+        self.assertIn("Config policy: replace_from_commit", result.stdout)
+        self.assertIn("  configs/traders.live.example.json", result.stdout)
+
+    def test_default_deployment_performs_no_restart(self) -> None:
+        result = self._run("--commit", self.commit, "--dry-run")
+        self.assertIn("Services restarted by this command: none", result.stdout)
+
+    def test_no_restart_flag_is_accepted_and_does_not_restart(self) -> None:
+        result = self._run("--commit", self.commit, "--dry-run", "--no-restart")
+        self.assertIn("Services restarted by this command: none", result.stdout)
+
+    def test_generated_deployment_id_uses_microseconds_and_process_suffix(self) -> None:
+        result = self._run("--commit", self.commit, "--dry-run")
+        match = re.search(r"Deployment ID: (\S+)", result.stdout)
+        self.assertIsNotNone(match)
+        deployment_id = match.group(1)
+        self.assertRegex(deployment_id, r"^\d{8}T\d{12}Z-[0-9a-f]{12}-[0-9a-f]+$")
+
+    def test_restart_fleet_targets_only_fleet_service(self) -> None:
+        fake_bin = self._fake_bin()
+        result = self._run("--restart-fleet", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+        self.assertIn("trading-fleet-live.service", (fake_bin / "ssh.log").read_text())
+        self.assertNotIn("mission-control.service", (fake_bin / "ssh.log").read_text())
+        self.assertEqual(result.returncode, 0)
+
+    def test_dry_run_performs_no_ssh_or_scp(self) -> None:
+        fake_bin = self._fake_bin()
+        result = self._run("--commit", self.commit, "--dry-run", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+        self.assertIn("no SSH, SCP", result.stdout)
+        self.assertFalse((fake_bin / "ssh.log").exists())
+        self.assertFalse((fake_bin / "scp.log").exists())
+
+    def test_valid_deployment_id_is_accepted_for_rollback_dry_run(self) -> None:
+        result = self._run("--rollback", "20260802T010203Z-abcdef123456", "--dry-run")
+        self.assertIn("Rollback deployment ID: 20260802T010203Z-abcdef123456", result.stdout)
+
+    def test_invalid_rollback_ids_fail_before_remote_operations(self) -> None:
+        invalid_ids = [
+            "../../x",
+            "/root/x",
+            "a/b",
+            r"a\b",
+            "a'b",
+            'a"b',
+            "a\nb",
+            "a;b",
+            "",
+            "a" * 129,
+            ".",
+            "..",
+        ]
+        for deployment_id in invalid_ids:
+            with self.subTest(deployment_id=deployment_id):
+                fake_bin = self._fake_bin()
+                result = self._run(
+                    "--rollback",
+                    deployment_id,
+                    "--dry-run",
+                    check=False,
+                    env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("invalid deployment ID", result.stderr)
+                self.assertFalse((fake_bin / "ssh.log").exists())
+                self.assertFalse((fake_bin / "scp.log").exists())
+
+    def test_unsafe_remote_dir_fails_before_remote_operations(self) -> None:
+        fake_bin = self._fake_bin()
+        result = self._run(
+            "--rollback",
+            "deploy-1",
+            "--dry-run",
+            "--remote-dir",
+            "/root/trading;rm -rf",
+            check=False,
+            env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsafe characters", result.stderr)
+        self.assertFalse((fake_bin / "ssh.log").exists())
+        self.assertFalse((fake_bin / "scp.log").exists())
+
+    def test_remote_dir_newline_and_metacharacters_rejected(self) -> None:
+        invalid_remote_dirs = [
+            "/root/trading\nserver",
+            "/root/trading'server",
+            '/root/trading"server',
+            "/root/trading$server",
+            "/root/trading;server",
+        ]
+        for remote_dir in invalid_remote_dirs:
+            with self.subTest(remote_dir=remote_dir):
+                fake_bin = self._fake_bin()
+                result = self._run(
+                    "--rollback",
+                    "deploy-1",
+                    "--dry-run",
+                    "--remote-dir",
+                    remote_dir,
+                    check=False,
+                    env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((fake_bin / "ssh.log").exists())
+                self.assertFalse((fake_bin / "scp.log").exists())
+
+    def test_generated_python_source_does_not_embed_user_values(self) -> None:
+        script = (self.repo / "deploy-trading").read_text(encoding="utf-8")
+        self.assertNotIn("Path('${REMOTE_DIR}", script)
+        self.assertNotIn("Path('${staging_dir}", script)
+        self.assertNotIn('"deployment_id": "$deployment_id"', script)
+        self.assertIn("Path(sys.argv[1])", script)
+        self.assertIn("Path(sys.argv[2])", script)
+        self.assertIn('"deployment_id": sys.argv[1]', script)
+
+    def test_remote_python_source_is_stable_with_different_user_values(self) -> None:
+        script = (self.repo / "deploy-trading").read_text(encoding="utf-8")
+        self.assertNotIn("Path('/root/trading-server", script)
+        self.assertNotIn("20260802T010203Z", script)
+        self.assertNotIn("unicode-", script)
+
+    def test_manifest_uses_requested_commit_in_script(self) -> None:
+        script = (self.repo / "deploy-trading").read_text()
+        self.assertIn('"git_commit": commit', script)
+        self.assertIn('"deployment_id": deployment_id', script)
+
+    def test_validation_excludes_execute_real(self) -> None:
+        result = self._run("--commit", self.commit, "--dry-run")
+        validation = result.stdout.split("Validation commands:", 1)[1]
+        self.assertNotIn("--execute-real", validation)
+        self.assertIn("python fleet_runner.py --help", validation)
+
+    def test_backup_excludes_persistent_artifacts_and_venv(self) -> None:
+        script = (self.repo / "deploy-trading").read_text()
+        backup_section = script.split("remote_backup_script()", 1)[1].split("remote_promote_script()", 1)[0]
+        self.assertNotIn("artifacts", backup_section)
+        self.assertNotIn("venv", backup_section)
+
+    def test_rollback_dry_run_restores_only_backed_up_runtime_files(self) -> None:
+        result = self._run("--rollback", "deploy-1", "--dry-run")
+        self.assertIn("Would restore backed-up runtime files, shared/, silver/", result.stdout)
+        self.assertIn("Would preserve artifacts, venv, evidence, logs, and state.", result.stdout)
+
+    def test_rollback_validates_id_before_any_remote_command(self) -> None:
+        fake_bin = self._fake_bin()
+        result = self._run(
+            "--rollback",
+            "../../bad",
+            check=False,
+            env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((fake_bin / "ssh.log").exists())
+        self.assertFalse((fake_bin / "scp.log").exists())
+
+    def test_temporary_worktree_cleanup_occurs_on_failure(self) -> None:
+        self._git("rm", "-r", "silver")
+        self._git("commit", "-m", "remove silver")
+        bad_commit = self._git("rev-parse", "HEAD").stdout.strip()
+        result = self._run("--commit", bad_commit, "--dry-run", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        worktrees = self._git("worktree", "list").stdout
+        self.assertNotIn("deploy-trading.", worktrees)
+
+    def test_worktree_parent_cleanup_when_worktree_add_fails(self) -> None:
+        fake_bin = self.root / "fake-git-bin"
+        fake_bin.mkdir()
+        git = fake_bin / "git"
+        git.write_text(
+            "#!/usr/bin/env bash\n"
+            "if [[ \"$1\" == \"status\" ]]; then exit 0; fi\n"
+            "if [[ \"$1\" == \"rev-parse\" ]]; then echo 0123456789abcdef0123456789abcdef01234567; exit 0; fi\n"
+            "if [[ \"$1\" == \"worktree\" && \"$2\" == \"add\" ]]; then exit 44; fi\n"
+            "if [[ \"$1\" == \"worktree\" && \"$2\" == \"remove\" ]]; then exit 0; fi\n"
+            "exec /usr/bin/git \"$@\"\n",
+            encoding="utf-8",
+        )
+        git.chmod(git.stat().st_mode | stat.S_IXUSR)
+        tmpdir = self.root / "worktree-tmp"
+        tmpdir.mkdir()
+        result = self._run(
+            "--commit",
+            "abc123",
+            "--dry-run",
+            check=False,
+            env={"PATH": f"{fake_bin}:{os.environ['PATH']}", "TMPDIR": str(tmpdir)},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual([], list(tmpdir.glob("deploy-trading.*")))
+
+    def test_local_temporary_resources_cleanup_after_upload_failure(self) -> None:
+        fake_bin = self._fake_bin()
+        tmpdir = self.root / "script-tmp"
+        tmpdir.mkdir()
+        result = self._run(
+            "--commit",
+            self.commit,
+            "--no-restart",
+            check=False,
+            env={
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "TMPDIR": str(tmpdir),
+                "DEPLOY_TEST_FAIL_SCP": "1",
+            },
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual([], list(tmpdir.glob("deploy-release.*")))
+        self.assertEqual([], list(tmpdir.glob("deploy-trading.*")))
+
+    def test_validation_failure_prevents_promotion(self) -> None:
+        fake_bin = self._fake_bin()
+        result = self._run(
+            "--commit",
+            self.commit,
+            "--no-restart",
+            check=False,
+            env={
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "DEPLOY_TEST_FAIL_SSH_CONTAINS": "py_compile",
+            },
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Validating staged release", result.stdout)
+        self.assertNotIn("Promoting staged runtime files", result.stdout)
+
+    def test_promotion_failure_prevents_success_manifest(self) -> None:
+        fake_bin = self._fake_bin()
+        result = self._run(
+            "--commit",
+            self.commit,
+            "--no-restart",
+            check=False,
+            env={
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "DEPLOY_TEST_FAIL_SSH_CONTAINS": "activate_dir",
+            },
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Promoting staged runtime files", result.stdout)
+        self.assertNotIn("Writing deployment manifest", result.stdout)
+
+    def test_shared_temporary_copy_failure_prevents_success_manifest(self) -> None:
+        fake_bin = self._fake_bin()
+        result = self._run(
+            "--commit",
+            self.commit,
+            "--no-restart",
+            check=False,
+            env={
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "DEPLOY_TEST_FAIL_SSH_CONTAINS": 'cp -a /root/trading-server/.deploy-staging',
+            },
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Writing deployment manifest", result.stdout)
+
+    def test_partial_promotion_restore_logic_is_present_for_files_and_packages(self) -> None:
+        fake_bin = self._fake_bin()
+        self._run("--commit", self.commit, "--no-restart", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+        ssh_log = (fake_bin / "ssh.log").read_text(encoding="utf-8")
+        self.assertIn("trap restore_promoted ERR", ssh_log)
+        self.assertIn("txn_kind=()", ssh_log)
+        self.assertIn('txn_state+=("prepared")', ssh_log)
+        self.assertIn('set_txn_state "$idx" "old_moved"', ssh_log)
+        self.assertIn('restore_txn "$idx"', ssh_log)
+        self.assertIn("trap - ERR", ssh_log)
+
+    def test_normal_deploy_invokes_upload_validation_backup_and_promotion_without_restart(self) -> None:
+        fake_bin = self._fake_bin()
+        result = self._run(
+            "--commit",
+            self.commit,
+            "--no-restart",
+            env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Uploading release", result.stdout)
+        self.assertIn("Validating staged release", result.stdout)
+        self.assertIn("Backing up replaced runtime files", result.stdout)
+        self.assertIn("Promoting staged runtime files", result.stdout)
+        ssh_log = (fake_bin / "ssh.log").read_text(encoding="utf-8")
+        scp_log = (fake_bin / "scp.log").read_text(encoding="utf-8")
+        self.assertIn("py_compile", ssh_log)
+        self.assertIn("backup_metadata", ssh_log)
+        self.assertIn("activate_dir", ssh_log)
+        self.assertIn("DEPLOYED_VERSION.json", ssh_log)
+        self.assertIn(".deploy-staging", scp_log)
+        self.assertNotIn("systemctl restart", ssh_log)
+
+    def test_safe_promotion_script_uses_staged_activation_for_packages(self) -> None:
+        fake_bin = self._fake_bin()
+        self._run("--commit", self.commit, "--no-restart", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+        ssh_log = (fake_bin / "ssh.log").read_text(encoding="utf-8")
+        self.assertIn("restore_promoted", ssh_log)
+        self.assertIn("for d in shared silver", ssh_log)
+        self.assertIn('activate_dir "$d"', ssh_log)
+        self.assertIn(".__new__.", ssh_log)
+        self.assertIn(".__old__.", ssh_log)
+
+    def test_successful_directory_activation_executes_on_filesystem(self) -> None:
+        runtime, staging = self._runtime_and_staging()
+        script = self._internal_script("promote-script", runtime, "deploy-1", staging)
+        result = self._run_shell_script(script)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual("new-shared", self._marker(runtime / "shared"))
+        self.assertEqual("new-silver", self._marker(runtime / "silver"))
+
+    def test_directory_activation_failure_after_old_moved_restores_old(self) -> None:
+        runtime, staging = self._runtime_and_staging()
+        script = self._internal_script("promote-script", runtime, "deploy-2", staging)
+        result = self._run_shell_script(script, env={"DEPLOY_TEST_FAIL_ACTIVATE_AFTER_OLD_MOVED": "shared"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual("old-shared", self._marker(runtime / "shared"))
+        self.assertEqual("old-silver", self._marker(runtime / "silver"))
+        self.assertFalse((runtime / ".last_deployment_id").exists())
+
+    def test_successful_file_activation_executes_on_filesystem(self) -> None:
+        runtime, staging = self._runtime_and_staging()
+        script = self._internal_script("promote-script", runtime, "deploy-3", staging)
+        result = self._run_shell_script(script)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual("# fleet_runner.py new\n", (runtime / "fleet_runner.py").read_text(encoding="utf-8"))
+
+    def test_file_activation_failure_after_old_moved_restores_old(self) -> None:
+        runtime, staging = self._runtime_and_staging()
+        script = self._internal_script("promote-script", runtime, "deploy-4", staging)
+        result = self._run_shell_script(script, env={"DEPLOY_TEST_FAIL_ACTIVATE_AFTER_OLD_MOVED": "fleet_runner.py"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual("# fleet_runner.py old\n", (runtime / "fleet_runner.py").read_text(encoding="utf-8"))
+        self.assertEqual("old-shared", self._marker(runtime / "shared"))
+        self.assertEqual("old-silver", self._marker(runtime / "silver"))
+
+    def test_shared_success_silver_failure_restores_both_packages(self) -> None:
+        runtime, staging = self._runtime_and_staging()
+        script = self._internal_script("promote-script", runtime, "deploy-5", staging)
+        result = self._run_shell_script(script, env={"DEPLOY_TEST_FAIL_ACTIVATE_AFTER_OLD_MOVED": "silver"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual("old-shared", self._marker(runtime / "shared"))
+        self.assertEqual("old-silver", self._marker(runtime / "silver"))
+
+    def test_top_level_file_restored_when_later_package_fails(self) -> None:
+        runtime, staging = self._runtime_and_staging()
+        runtime.joinpath("shared").rename(runtime / "shared.saved")
+        runtime.joinpath("silver").rename(runtime / "silver.saved")
+        staging.joinpath("silver").rename(staging / "silver.missing")
+        script = self._internal_script("promote-script", runtime, "deploy-6", staging)
+        result = self._run_shell_script(script, env={"DEPLOY_TEST_FAIL_ACTIVATE_AFTER_OLD_MOVED": "renko_builder.py"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual("# alpaca_trader.py old\n", (runtime / "alpaca_trader.py").read_text(encoding="utf-8"))
+        self.assertEqual("# renko_builder.py old\n", (runtime / "renko_builder.py").read_text(encoding="utf-8"))
+        runtime.joinpath("shared.saved").rename(runtime / "shared")
+        runtime.joinpath("silver.saved").rename(runtime / "silver")
+        staging.joinpath("silver.missing").rename(staging / "silver")
+
+    def test_active_package_absent_before_failed_deploy_is_not_invented(self) -> None:
+        runtime, staging = self._runtime_and_staging()
+        shutil.rmtree(runtime / "shared")
+        script = self._internal_script("promote-script", runtime, "deploy-7", staging)
+        result = self._run_shell_script(script, env={"DEPLOY_TEST_FAIL_ACTIVATE_AFTER_OLD_MOVED": "shared"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((runtime / "shared").exists())
+        self.assertEqual("old-silver", self._marker(runtime / "silver"))
+
+    def test_successful_deployment_leaves_shared_and_silver_active(self) -> None:
+        runtime, staging = self._runtime_and_staging()
+        script = self._internal_script("promote-script", runtime, "deploy-8", staging)
+        result = self._run_shell_script(script)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((runtime / "shared").is_dir())
+        self.assertTrue((runtime / "silver").is_dir())
+        self.assertEqual("deploy-8", (runtime / ".last_deployment_id").read_text(encoding="utf-8").strip())
+
+    def test_cleanup_old_siblings_runs_after_success(self) -> None:
+        runtime, staging = self._runtime_and_staging()
+        promote = self._internal_script("promote-script", runtime, "deploy-9", staging)
+        self.assertEqual(self._run_shell_script(promote).returncode, 0)
+        self.assertTrue((runtime / "shared.__old__.deploy-9").exists())
+        cleanup = self._internal_script("cleanup-old-script", runtime, "deploy-9")
+        self.assertEqual(self._run_shell_script(cleanup).returncode, 0)
+        self.assertFalse((runtime / "shared.__old__.deploy-9").exists())
+
+    def test_success_manifest_absent_on_executable_promotion_failure(self) -> None:
+        runtime, staging = self._runtime_and_staging()
+        script = self._internal_script("promote-script", runtime, "deploy-10", staging)
+        result = self._run_shell_script(script, env={"DEPLOY_TEST_FAIL_ACTIVATE_AFTER_OLD_MOVED": "silver"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((runtime / "DEPLOYED_VERSION.json").exists())
+
+    def test_success_manifest_written_only_after_complete_command_flow(self) -> None:
+        fake_bin = self._fake_bin()
+        self._run("--commit", self.commit, "--no-restart", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+        ssh_log = (fake_bin / "ssh.log").read_text(encoding="utf-8")
+        self.assertIn("DEPLOYED_VERSION.json", ssh_log)
+        self.assertLess(ssh_log.index("activate_dir"), ssh_log.rindex("DEPLOYED_VERSION.json"))
+
+    def test_successful_rollback_safely_activates_backup_packages(self) -> None:
+        runtime, backup = self._runtime_and_backup()
+        script = self._internal_script("rollback-script", runtime, "deploy-r1", backup)
+        result = self._run_shell_script(script)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual("backup-shared", self._marker(runtime / "shared"))
+        self.assertEqual("backup-silver", self._marker(runtime / "silver"))
+
+    def test_rollback_package_copy_failure_preserves_current_active(self) -> None:
+        runtime, backup = self._runtime_and_backup()
+        script = self._internal_script("rollback-script", runtime, "deploy-r2", backup)
+        result = self._run_shell_script(script, env={"DEPLOY_TEST_FAIL_ROLLBACK_COPY": "shared"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual("old-shared", self._marker(runtime / "shared"))
+        self.assertEqual("old-silver", self._marker(runtime / "silver"))
+
+    def test_rollback_activation_failure_restores_current_active_package(self) -> None:
+        runtime, backup = self._runtime_and_backup()
+        script = self._internal_script("rollback-script", runtime, "deploy-r3", backup)
+        result = self._run_shell_script(script, env={"DEPLOY_TEST_FAIL_ROLLBACK_AFTER_OLD_MOVED": "shared"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual("old-shared", self._marker(runtime / "shared"))
+        self.assertEqual("old-silver", self._marker(runtime / "silver"))
+
+    def test_partial_rollback_failure_restores_all_changed_items(self) -> None:
+        runtime, backup = self._runtime_and_backup()
+        script = self._internal_script("rollback-script", runtime, "deploy-r4", backup)
+        result = self._run_shell_script(script, env={"DEPLOY_TEST_FAIL_ROLLBACK_AFTER_OLD_MOVED": "silver"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual("old-shared", self._marker(runtime / "shared"))
+        self.assertEqual("old-silver", self._marker(runtime / "silver"))
+
+    def test_rollback_file_activation_failure_restores_current_file(self) -> None:
+        runtime, backup = self._runtime_and_backup()
+        script = self._internal_script("rollback-script", runtime, "deploy-r5", backup)
+        result = self._run_shell_script(script, env={"DEPLOY_TEST_FAIL_ROLLBACK_AFTER_OLD_MOVED": "fleet_runner.py"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual("# fleet_runner.py old\n", (runtime / "fleet_runner.py").read_text(encoding="utf-8"))
+
+    def test_service_restart_never_invoked_on_deploy_or_rollback_failure(self) -> None:
+        runtime, staging = self._runtime_and_staging()
+        script = self._internal_script("promote-script", runtime, "deploy-11", staging)
+        result = self._run_shell_script(script, env={"DEPLOY_TEST_FAIL_ACTIVATE_AFTER_OLD_MOVED": "shared"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("systemctl restart", script)
+        runtime, backup = self._runtime_and_backup()
+        rollback = self._internal_script("rollback-script", runtime, "deploy-r6", backup)
+        result = self._run_shell_script(rollback, env={"DEPLOY_TEST_FAIL_ROLLBACK_AFTER_OLD_MOVED": "shared"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("systemctl restart", rollback)
+
+    def test_service_files_are_preserved_without_deploy_services(self) -> None:
+        fake_bin = self._fake_bin()
+        self._run("--commit", self.commit, "--no-restart", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+        ssh_log = (fake_bin / "ssh.log").read_text(encoding="utf-8")
+        self.assertNotIn("daemon-reload", ssh_log)
+        result = self._run("--commit", self.commit, "--dry-run")
+        self.assertIn("Service file policy: preserve_remote", result.stdout)
+
+    def test_deploy_services_explicitly_includes_service_files(self) -> None:
+        fake_bin = self._fake_bin()
+        result = self._run(
+            "--commit",
+            self.commit,
+            "--no-restart",
+            "--deploy-services",
+            env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        )
+        self.assertEqual(result.returncode, 0)
+        ssh_log = (fake_bin / "ssh.log").read_text(encoding="utf-8")
+        self.assertIn("daemon-reload", ssh_log)
+        dry_run = self._run("--commit", self.commit, "--dry-run", "--deploy-services")
+        self.assertIn("Service file policy: replace_from_commit", dry_run.stdout)
+        self.assertIn("  mission-control.service", dry_run.stdout)
+        self.assertIn("  trading-fleet-live.service", dry_run.stdout)
+
+    def test_clean_commit_payload_not_dirty_working_tree_used_for_non_dry_deploy(self) -> None:
+        self._write("fleet_runner.py", "dirty execution_status_should_not_deploy\n")
+        fake_bin = self._fake_bin()
+        self._run("--commit", self.commit, "--no-restart", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+        source = fake_bin / "scp_payload"
+        deployed_fleet = (source / "fleet_runner.py").read_text(encoding="utf-8")
+        self.assertIn("committed", deployed_fleet)
+        self.assertNotIn("execution_status_should_not_deploy", deployed_fleet)
+
+    def test_shell_quoting_handles_paths_and_commit_args_safely(self) -> None:
+        result = self._run("--commit", self.commit, "--dry-run", "--remote-dir", "/root/path with space")
+        self.assertIn("Remote destination: root@157.230.54.46:/root/path with space", result.stdout)
+        self.assertIn("source /root/path with space/venv/bin/activate", result.stdout)
+
+    def test_commit_008b9e4_payload_excludes_current_execution_status_hunk_when_available(self) -> None:
+        commit = "008b9e4dec2cbb4dc09033e55e8d36082ee6b123"
+        if subprocess.run(["git", "rev-parse", "--verify", f"{commit}^{{commit}}"], cwd=REPO_ROOT, capture_output=True).returncode != 0:
+            self.skipTest("repository commit 008b9e4 is not available")
+        committed_fleet_runner = subprocess.run(
+            ["git", "show", f"{commit}:fleet_runner.py"],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout
+        unstaged_fleet_diff = subprocess.run(
+            ["git", "diff", "--", "fleet_runner.py"],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout
+        self.assertIn("execution_status_", unstaged_fleet_diff)
+        self.assertNotIn("TERMINAL_EXECUTION_FAILURE_STATUSES", committed_fleet_runner)
+        self.assertNotIn("execution_status_", committed_fleet_runner)
+
+    def test_existing_remote_config_path_preserved_without_deploy_config(self) -> None:
+        result = self._run("--commit", self.commit, "--dry-run")
+        self.assertIn("Config path used by service: /root/trading-server/configs/traders.live.example.json", result.stdout)
+        self.assertIn("Config policy: preserve_remote", result.stdout)
+
+    def _payload_includes(self, output: str) -> set[str]:
+        block = output.split("Payload includes:", 1)[1].split("Payload excludes:", 1)[0]
+        return {line.strip() for line in block.splitlines() if line.strip()}
+
+    def _extract_clean_source_path(self, output: str) -> Path:
+        match = re.search(r"Clean source path: (.+)", output)
+        self.assertIsNotNone(match)
+        return Path(match.group(1).strip())
+
+    def _fake_bin(self) -> Path:
+        fake_bin = self.root / "fake-bin"
+        fake_bin.mkdir(exist_ok=True)
+        ssh = fake_bin / "ssh"
+        ssh.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' \"$*\" >> \"{fake_bin}/ssh.log\"\n"
+            "if [[ -n \"${DEPLOY_TEST_FAIL_SSH_CONTAINS:-}\" && \"$*\" == *\"${DEPLOY_TEST_FAIL_SSH_CONTAINS}\"* ]]; then\n"
+            "  exit 42\n"
+            "fi\n",
+            encoding="utf-8",
+        )
+        ssh.chmod(ssh.stat().st_mode | stat.S_IXUSR)
+        scp = fake_bin / "scp"
+        scp.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' \"$*\" >> \"{fake_bin}/scp.log\"\n"
+            "if [[ \"${DEPLOY_TEST_FAIL_SCP:-0}\" == \"1\" ]]; then\n"
+            "  exit 43\n"
+            "fi\n"
+            f"rm -rf \"{fake_bin}/scp_payload\"\n"
+            f"mkdir -p \"{fake_bin}/scp_payload\"\n"
+            "args=(\"$@\")\n"
+            "src=\"${args[$((${#args[@]} - 2))]}\"\n"
+            f"cp -a \"$src\" \"{fake_bin}/scp_payload/\" 2>/dev/null || true\n",
+            encoding="utf-8",
+        )
+        scp.chmod(scp.stat().st_mode | stat.S_IXUSR)
+        return fake_bin
+
+    def _internal_script(self, command: str, runtime: Path, deployment_id: str, payload: Path | None = None) -> str:
+        args = [deployment_id]
+        if payload is not None:
+            args.append(str(payload))
+        result = self._run(
+            *args,
+            env={
+                "DEPLOY_TRADING_INTERNAL_COMMAND": command,
+                "DEPLOY_REMOTE_DIR": str(runtime),
+            },
+        )
+        return result.stdout
+
+    def _run_shell_script(self, script: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        merged_env = os.environ.copy()
+        if env:
+            merged_env.update(env)
+        return subprocess.run(["bash"], input=script, text=True, capture_output=True, env=merged_env)
+
+    def _runtime_and_staging(self) -> tuple[Path, Path]:
+        runtime = self.root / f"runtime-{len(list(self.root.glob('runtime-*')))}"
+        staging = self.root / f"staging-{len(list(self.root.glob('staging-*')))}"
+        runtime.mkdir()
+        staging.mkdir()
+        self._write_runtime_payload(runtime, "old")
+        self._write_runtime_payload(staging, "new")
+        return runtime, staging
+
+    def _runtime_and_backup(self) -> tuple[Path, Path]:
+        runtime = self.root / f"runtime-r-{len(list(self.root.glob('runtime-r-*')))}"
+        backup = self.root / f"backup-{len(list(self.root.glob('backup-*')))}"
+        runtime.mkdir()
+        backup.mkdir()
+        self._write_runtime_payload(runtime, "old")
+        self._write_runtime_payload(backup, "backup")
+        (runtime / "venv/bin").mkdir(parents=True)
+        (runtime / "venv/bin/activate").write_text(
+            f"export PATH={runtime / 'venv/bin'}:$PATH\n",
+            encoding="utf-8",
+        )
+        (runtime / "venv/bin/python").symlink_to(Path(sys.executable))
+        (runtime / "DEPLOYED_VERSION.json").write_text("{}\n", encoding="utf-8")
+        return runtime, backup
+
+    def _write_runtime_payload(self, root: Path, marker: str) -> None:
+        for filename in (
+            "alpaca_trader.py",
+            "execution_engine.py",
+            "fleet_runner.py",
+            "monitoring_app.py",
+            "renko_builder.py",
+            "strategy_engine.py",
+            "trading_events.py",
+        ):
+            path = root / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"# {filename} {marker}\n", encoding="utf-8")
+        (root / "requirements.txt").write_text(f"# requirements {marker}\n", encoding="utf-8")
+        self._write_package(root / "shared", f"{marker}-shared")
+        self._write_package(root / "silver", f"{marker}-silver")
+        (root / "shared/config").mkdir(parents=True, exist_ok=True)
+        (root / "shared/config/__init__.py").write_text("", encoding="utf-8")
+        (root / "shared/config/trader_config.py").write_text(
+            "def build_strategy_config(trader):\n    return trader\n",
+            encoding="utf-8",
+        )
+        (root / "silver/market").mkdir(parents=True, exist_ok=True)
+        (root / "silver/market/__init__.py").write_text("", encoding="utf-8")
+        (root / "silver/market/one_second_sampler.py").write_text("", encoding="utf-8")
+        (root / "silver/evidence").mkdir(parents=True, exist_ok=True)
+        (root / "silver/evidence/__init__.py").write_text("", encoding="utf-8")
+        (root / "silver/evidence/logger.py").write_text("", encoding="utf-8")
+        (root / "silver/evidence/shadow_sampler.py").write_text("", encoding="utf-8")
+
+    def _write_package(self, path: Path, marker: str) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "__init__.py").write_text("", encoding="utf-8")
+        (path / "marker.txt").write_text(marker, encoding="utf-8")
+
+    def _marker(self, path: Path) -> str:
+        return (path / "marker.txt").read_text(encoding="utf-8")
+
+    def _sha256(self, path: Path) -> str:
+        result = subprocess.run(["shasum", "-a", "256", str(path)], text=True, capture_output=True, check=True)
+        return result.stdout.split()[0]
+
+
+if __name__ == "__main__":
+    unittest.main()

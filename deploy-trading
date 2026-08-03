@@ -3,13 +3,15 @@ set -euo pipefail
 
 HOST="${DEPLOY_HOST:-157.230.54.46}"
 USER_NAME="${DEPLOY_USER:-root}"
-REMOTE_DIR="${DEPLOY_REMOTE_DIR:-~/trading-server}"
-SERVICE_NAME="${DEPLOY_SERVICE_NAME:-trading-fleet-live}"
-SERVICE_UNIT_FILE="${SERVICE_NAME}.service"
+REMOTE_DIR="${DEPLOY_REMOTE_DIR:-/root/trading-server}"
+FLEET_SERVICE="${DEPLOY_FLEET_SERVICE:-trading-fleet-live.service}"
+MISSION_SERVICE="${DEPLOY_MISSION_SERVICE:-mission-control.service}"
+SOURCE_REPOSITORY="${DEPLOY_SOURCE_REPOSITORY:-$(basename "$(pwd)")}"
+CLEAN_SOURCE=""
+WORKTREE_PARENT=""
+LOCAL_RELEASE_DIR=""
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INCLUDE_ENV="${DEPLOY_WITH_ENV:-0}"
-FILES=(
+RUNTIME_FILES=(
   "alpaca_trader.py"
   "execution_engine.py"
   "fleet_runner.py"
@@ -17,116 +19,1133 @@ FILES=(
   "renko_builder.py"
   "strategy_engine.py"
   "trading_events.py"
-  "validated_renko_backtest.cpp"
   "requirements.txt"
+)
+PACKAGE_DIRS=(
+  "shared"
+  "silver"
+)
+SERVICE_FILES=(
   "mission-control.service"
   "trading-fleet-live.service"
 )
-CONFIG_FILES=(
-  "configs/traders.live.example.json"
+CONFIG_FILE="configs/traders.live.example.json"
+
+EXCLUDED_PATHS=(
+  ".git/"
+  ".env"
+  "venv/"
+  ".venv/"
+  "__pycache__/"
+  ".pytest_cache/"
+  "artifacts/"
+  "data/"
+  "docs/"
+  "replay/"
+  "tests/"
+  "*.log"
+  "*.patch"
+  "*.diff"
 )
 
-if [[ "${INCLUDE_ENV}" == "1" ]]; then
-  FILES+=(".env")
-fi
+COMMIT_ARG=""
+ROLLBACK_ID=""
+ROLLBACK_REQUESTED=0
+DRY_RUN=0
+DEPLOY_CONFIG=0
+RESTART_FLEET=0
+RESTART_MISSION=0
+DEPLOY_SERVICES=0
 
-CONTROL_PATH="/tmp/${SERVICE_NAME}-deploy-%r@%h:%p"
-SSH_BASE=(ssh -o ControlMaster=auto -o ControlPersist=600 -o ControlPath="${CONTROL_PATH}")
-SCP_BASE=(scp -o ControlMaster=auto -o ControlPersist=600 -o ControlPath="${CONTROL_PATH}")
+usage() {
+  cat <<'EOF'
+Usage:
+  ./deploy-trading --commit <sha> --dry-run [--deploy-config]
+  ./deploy-trading --commit <sha> --no-restart [--deploy-config]
+  ./deploy-trading --restart-fleet
+  ./deploy-trading --rollback <deployment-id> [--restart-fleet]
 
-for file in "${FILES[@]}"; do
-  if [[ ! -f "$SCRIPT_DIR/$file" ]]; then
-    echo "Missing required file: $SCRIPT_DIR/$file" >&2
-    exit 1
-  fi
-done
-for file in "${CONFIG_FILES[@]}"; do
-  if [[ ! -f "$SCRIPT_DIR/$file" ]]; then
-    echo "Missing required file: $SCRIPT_DIR/$file" >&2
-    exit 1
-  fi
-done
-
-cleanup() {
-  "${SSH_BASE[@]}" -O exit "${USER_NAME}@${HOST}" >/dev/null 2>&1 || true
+Options:
+  --commit <sha>             Git commit to deploy from a clean detached worktree.
+  --dry-run                  Show planned payload and validation without remote changes.
+  --no-restart               Deploy code without restarting services.
+  --deploy-config            Replace remote production config from the requested commit.
+  --deploy-services          Replace remote systemd service unit files.
+  --restart-fleet            Restart only trading-fleet-live.service.
+  --restart-mission-control  Restart only mission-control.service.
+  --rollback <deployment-id> Restore files from /root/deploy-backups/<deployment-id>.
+  --host <host>              Override deploy host.
+  --user <user>              Override deploy user.
+  --remote-dir <path>        Override remote directory.
+EOF
 }
-trap cleanup EXIT
 
-echo "Uploading files to ${USER_NAME}@${HOST}:${REMOTE_DIR}"
-if [[ "${INCLUDE_ENV}" == "1" ]]; then
-  echo "Including local .env in deploy because DEPLOY_WITH_ENV=1"
-else
-  echo "Skipping local .env; remote environment file will be left unchanged"
-fi
-"${SSH_BASE[@]}" "${USER_NAME}@${HOST}" "mkdir -p ${REMOTE_DIR}/configs ${REMOTE_DIR}/artifacts/live"
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
 
-SOURCE_FILES=()
-for file in "${FILES[@]}"; do
-  SOURCE_FILES+=("$SCRIPT_DIR/$file")
-done
+quote() {
+  printf "%q" "$1"
+}
 
-"${SCP_BASE[@]}" "${SOURCE_FILES[@]}" "${USER_NAME}@${HOST}:${REMOTE_DIR}/"
-"${SCP_BASE[@]}" "${SCRIPT_DIR}/configs/traders.live.example.json" "${USER_NAME}@${HOST}:${REMOTE_DIR}/configs/"
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --commit)
+        [[ $# -ge 2 ]] || die "--commit requires a value"
+        COMMIT_ARG="$2"
+        shift 2
+        ;;
+      --rollback)
+        [[ $# -ge 2 ]] || die "--rollback requires a deployment ID"
+        ROLLBACK_ID="$2"
+        ROLLBACK_REQUESTED=1
+        shift 2
+        ;;
+      --dry-run)
+        DRY_RUN=1
+        shift
+        ;;
+      --no-restart)
+        shift
+        ;;
+      --deploy-config)
+        DEPLOY_CONFIG=1
+        shift
+        ;;
+      --deploy-services)
+        DEPLOY_SERVICES=1
+        shift
+        ;;
+      --restart-fleet)
+        RESTART_FLEET=1
+        shift
+        ;;
+      --restart-mission-control)
+        RESTART_MISSION=1
+        shift
+        ;;
+      --host)
+        [[ $# -ge 2 ]] || die "--host requires a value"
+        HOST="$2"
+        shift 2
+        ;;
+      --user)
+        [[ $# -ge 2 ]] || die "--user requires a value"
+        USER_NAME="$2"
+        shift 2
+        ;;
+      --remote-dir)
+        [[ $# -ge 2 ]] || die "--remote-dir requires a value"
+        REMOTE_DIR="$2"
+        shift 2
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown argument: $1"
+        ;;
+    esac
+  done
+}
 
-echo "Installing production fleet services on ${HOST}"
-"${SSH_BASE[@]}" -t "${USER_NAME}@${HOST}" "bash -lc '
+warn_if_dirty_worktree() {
+  if [[ -n "$(git status --porcelain)" ]]; then
+    echo "NOTICE: caller working tree is dirty; deployment payload will still come only from the requested clean commit." >&2
+  fi
+}
+
+validate_deployment_id() {
+  local value="$1"
+  if [[ ! "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+    die "invalid deployment ID: ${value:-<empty>}"
+  fi
+  case "$value" in
+    "."|".."|*/*|*\\*)
+      die "invalid deployment ID: ${value:-<empty>}"
+      ;;
+  esac
+}
+
+validate_remote_dir() {
+  [[ "$REMOTE_DIR" == /* ]] || die "--remote-dir must be an absolute POSIX path"
+  case "$REMOTE_DIR" in
+    *$'\n'*|*$'\r'*|*$'\t'*|*"'"*|*'"'*|*'\'*|*'`'*|*'$'*|*';'*|*'&'*|*'|'*|*'<'*|*'>'*|*'('*|*')'*|*'{'*|*'}'*)
+      die "--remote-dir contains unsafe characters"
+      ;;
+  esac
+}
+
+resolve_commit() {
+  local requested="$1"
+  [[ -n "$requested" ]] || die "--commit is required for deployment"
+  git rev-parse --verify "${requested}^{commit}" 2>/dev/null || die "invalid commit: ${requested}"
+}
+
+sha256_file() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    sha256sum "$1" | awk '{print $1}'
+  fi
+}
+
+create_clean_worktree() {
+  local commit="$1"
+  WORKTREE_PARENT="$(mktemp -d "${TMPDIR:-/tmp}/deploy-trading.XXXXXX")"
+  CLEAN_SOURCE="${WORKTREE_PARENT}/source"
+  git worktree add --detach --quiet "$CLEAN_SOURCE" "$commit"
+  if [[ -n "$(git -C "$CLEAN_SOURCE" status --porcelain)" ]]; then
+    die "temporary commit source is not clean"
+  fi
+}
+
+cleanup_clean_worktree() {
+  if [[ -n "${CLEAN_SOURCE:-}" && -d "$CLEAN_SOURCE" ]]; then
+    git worktree remove --force "$CLEAN_SOURCE" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${WORKTREE_PARENT:-}" && -d "$WORKTREE_PARENT" ]]; then
+    rm -rf "$WORKTREE_PARENT"
+  fi
+}
+
+cleanup_local_resources() {
+  if [[ -n "${LOCAL_RELEASE_DIR:-}" && -d "$LOCAL_RELEASE_DIR" ]]; then
+    rm -rf "$LOCAL_RELEASE_DIR"
+  fi
+}
+
+cleanup_all() {
+  cleanup_clean_worktree
+  cleanup_local_resources
+}
+
+require_payload_exists() {
+  local source_dir="$1"
+  local path
+  for path in "${RUNTIME_FILES[@]}" "${PACKAGE_DIRS[@]}"; do
+    [[ -e "${source_dir}/${path}" ]] || die "required payload path missing from commit source: ${path}"
+  done
+  if [[ "$DEPLOY_SERVICES" == "1" ]]; then
+    for path in "${SERVICE_FILES[@]}"; do
+      [[ -e "${source_dir}/${path}" ]] || die "required service file missing from commit source: ${path}"
+    done
+  fi
+  if [[ "$DEPLOY_CONFIG" == "1" ]]; then
+    [[ -f "${source_dir}/${CONFIG_FILE}" ]] || die "requested config is missing from commit source: ${CONFIG_FILE}"
+  fi
+}
+
+print_payload() {
+  local path
+  echo "Payload includes:"
+  for path in "${RUNTIME_FILES[@]}" "${PACKAGE_DIRS[@]}"; do
+    echo "  ${path}"
+  done
+  if [[ "$DEPLOY_SERVICES" == "1" ]]; then
+    for path in "${SERVICE_FILES[@]}"; do
+      echo "  ${path}"
+    done
+  else
+    echo "  service files preserved remotely (use --deploy-services to replace)"
+  fi
+  if [[ "$DEPLOY_CONFIG" == "1" ]]; then
+    echo "  ${CONFIG_FILE}"
+  fi
+  echo
+  echo "Payload excludes:"
+  for path in "${EXCLUDED_PATHS[@]}"; do
+    echo "  ${path}"
+  done
+  echo "  validated_renko_backtest.cpp (not required by fleet_runner.py, services, or runtime imports)"
+  echo
+}
+
+print_payload_hashes() {
+  local source_dir="$1"
+  local path
+  echo "Payload source hashes from resolved commit:"
+  for path in "${RUNTIME_FILES[@]}"; do
+    echo "  ${path} $(sha256_file "${source_dir}/${path}")"
+  done
+  if [[ "$DEPLOY_SERVICES" == "1" ]]; then
+    for path in "${SERVICE_FILES[@]}"; do
+      echo "  ${path} $(sha256_file "${source_dir}/${path}")"
+    done
+  fi
+  for path in "${PACKAGE_DIRS[@]}"; do
+    (
+      cd "$source_dir"
+      find "$path" -type f -print | LC_ALL=C sort | while read -r file; do
+        printf '%s  %s\n' "$(sha256_file "$file")" "$file"
+      done | sha256_file /dev/stdin
+    ) | awk -v p="$path" '{print "  " p "/ " $1}'
+  done
+  if [[ "$DEPLOY_CONFIG" == "1" ]]; then
+    echo "  ${CONFIG_FILE} $(sha256_file "${source_dir}/${CONFIG_FILE}")"
+  fi
+  echo
+}
+
+deployment_id_for() {
+  local commit="$1"
+  python3 - "$commit" "$$" <<'PY'
+import sys
+from datetime import datetime, timezone
+commit = sys.argv[1]
+pid = int(sys.argv[2])
+stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+print(f"{stamp}-{commit[:12]}-{pid:x}")
+PY
+}
+
+remote_target() {
+  echo "${USER_NAME}@${HOST}"
+}
+
+ssh_base() {
+  ssh -o ControlMaster=auto -o ControlPersist=600 -o ControlPath="/tmp/deploy-trading-%r@%h:%p" "$@"
+}
+
+scp_base() {
+  scp -o ControlMaster=auto -o ControlPersist=600 -o ControlPath="/tmp/deploy-trading-%r@%h:%p" "$@"
+}
+
+dry_run_commit() {
+  local commit="$1"
+  local deployment_id="$2"
+  local config_policy="preserve_remote"
+  [[ "$DEPLOY_CONFIG" == "1" ]] && config_policy="replace_from_commit"
+
+  cat <<EOF
+DRY RUN ONLY - no SSH, SCP, remote filesystem, service, or network changes will be made.
+Requested commit: ${COMMIT_ARG}
+Resolved commit: ${commit}
+Clean source path: ${CLEAN_SOURCE}
+Clean source status: clean
+Dirty caller worktree: $(if [[ -n "$(git status --porcelain)" ]]; then echo "yes - ignored for payload"; else echo "no"; fi)
+Remote destination: $(remote_target):${REMOTE_DIR}
+Deployment ID: ${deployment_id}
+Remote staging directory: ${REMOTE_DIR}/.deploy-staging/${deployment_id}
+Remote backup directory: /root/deploy-backups/${deployment_id}
+Config policy: ${config_policy}
+Service file policy: $(if [[ "$DEPLOY_SERVICES" == "1" ]]; then echo "replace_from_commit"; else echo "preserve_remote"; fi)
+Config path used by service: ${REMOTE_DIR}/configs/traders.live.example.json
+Services restarted by this command: none
+
+EOF
+  print_payload
+  print_payload_hashes "$CLEAN_SOURCE"
+  cat <<EOF
+Validation commands:
+  cd ${REMOTE_DIR}/.deploy-staging/${deployment_id}
+  source ${REMOTE_DIR}/venv/bin/activate
+  python -m py_compile alpaca_trader.py trading_events.py renko_builder.py strategy_engine.py execution_engine.py fleet_runner.py monitoring_app.py
+  python -c 'import shared.config.trader_config; import silver.market.one_second_sampler; import silver.evidence.logger; import silver.evidence.shadow_sampler; import fleet_runner'
+  python - /path/to/config.json <<'PY'  # fixed Python source; config path passed as argv in real validation
+  import json
+  import sys
+  from pathlib import Path
+  from shared.config.trader_config import build_strategy_config
+  data = json.loads(Path(sys.argv[1]).read_text())
+  for trader in data.get("traders", []):
+      if isinstance(trader, dict) and trader.get("enabled", False):
+          build_strategy_config(trader)
+  print("enabled trader config validation OK")
+  PY
+  python fleet_runner.py --help
+
+Proof of commit-source isolation:
+  payload source is ${CLEAN_SOURCE}
+  caller working tree files are not copied
+  unstaged local fleet_runner.py/renko_builder.py/config/validated_renko_backtest.cpp changes are excluded unless present in ${commit}
+  fleet_runner.py hash above is from the clean commit source, not the caller working tree
+EOF
+}
+
+make_local_release() {
+  local source_dir="$1"
+  local release_dir="$2"
+  mkdir -p "$release_dir"
+  local path
+  for path in "${RUNTIME_FILES[@]}"; do
+    install -m 0644 "${source_dir}/${path}" "${release_dir}/${path}"
+  done
+  for path in "${PACKAGE_DIRS[@]}"; do
+    cp -a "${source_dir}/${path}" "${release_dir}/${path}"
+  done
+  if [[ "$DEPLOY_SERVICES" == "1" ]]; then
+    for path in "${SERVICE_FILES[@]}"; do
+      install -m 0644 "${source_dir}/${path}" "${release_dir}/${path}"
+    done
+  fi
+  if [[ "$DEPLOY_CONFIG" == "1" ]]; then
+    mkdir -p "${release_dir}/configs"
+    install -m 0644 "${source_dir}/${CONFIG_FILE}" "${release_dir}/${CONFIG_FILE}"
+  fi
+}
+
+remote_validation_script() {
+  local staging_dir="$1"
+  local config_path="$2"
+  cat <<EOF
 set -euo pipefail
-cd ${REMOTE_DIR}
-
-if [[ ! -d venv ]]; then
-  python3 -m venv venv
-fi
-
-source venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+cd $(quote "$staging_dir")
+test -f fleet_runner.py
+test -d shared
+test -d silver
+test -f requirements.txt
+source $(quote "$REMOTE_DIR")/venv/bin/activate
 python -m py_compile alpaca_trader.py trading_events.py renko_builder.py strategy_engine.py execution_engine.py fleet_runner.py monitoring_app.py
+python - <<'PY'
+import shared.config.trader_config
+import silver.market.one_second_sampler
+import silver.evidence.logger
+import silver.evidence.shadow_sampler
+import fleet_runner
+PY
+python - "$config_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+from shared.config.trader_config import build_strategy_config
+config_path = Path(sys.argv[1])
+data = json.loads(config_path.read_text())
+for trader in data.get("traders", []):
+    if isinstance(trader, dict) and trader.get("enabled", False):
+        build_strategy_config(trader)
+print("enabled trader config validation OK")
+PY
+python fleet_runner.py --help >/dev/null
+EOF
+}
 
+deploy_commit() {
+  local commit="$1"
+  local deployment_id="$2"
+  local target staging_dir backup_dir manifest_file config_policy config_hash requirements_hash
+  target="$(remote_target)"
+  staging_dir="${REMOTE_DIR}/.deploy-staging/${deployment_id}"
+  backup_dir="/root/deploy-backups/${deployment_id}"
+  LOCAL_RELEASE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/deploy-release.XXXXXX")"
+  manifest_file="${LOCAL_RELEASE_DIR}/DEPLOYED_VERSION.json"
+  config_policy="preserve_remote"
+  [[ "$DEPLOY_CONFIG" == "1" ]] && config_policy="replace_from_commit"
+  requirements_hash="$(sha256_file "${CLEAN_SOURCE}/requirements.txt")"
+  config_hash=""
+  if [[ "$DEPLOY_CONFIG" == "1" ]]; then
+    config_hash="$(sha256_file "${CLEAN_SOURCE}/${CONFIG_FILE}")"
+  fi
+
+  make_local_release "$CLEAN_SOURCE" "$LOCAL_RELEASE_DIR"
+
+  python3 - "$manifest_file" "$deployment_id" "$commit" "$SOURCE_REPOSITORY" "$requirements_hash" "$config_policy" "$config_hash" "$backup_dir" "$DEPLOY_CONFIG" "$DEPLOY_SERVICES" "${RUNTIME_FILES[@]}" --packages "${PACKAGE_DIRS[@]}" --services "${SERVICE_FILES[@]}" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+manifest_path = sys.argv[1]
+deployment_id = sys.argv[2]
+commit = sys.argv[3]
+source_repository = sys.argv[4]
+requirements_hash = sys.argv[5]
+config_policy = sys.argv[6]
+config_hash = sys.argv[7] or None
+backup_dir = sys.argv[8]
+deploy_config = bool(int(sys.argv[9]))
+deploy_services = bool(int(sys.argv[10]))
+packages_separator = sys.argv.index("--packages", 11)
+services_separator = sys.argv.index("--services", packages_separator + 1)
+runtime_files = sys.argv[11:packages_separator]
+package_dirs = sys.argv[packages_separator + 1:services_separator]
+service_files = sys.argv[services_separator + 1:]
+manifest = {
+    "deployment_id": deployment_id,
+    "git_commit": commit,
+    "deployed_at": datetime.now(timezone.utc).isoformat(),
+    "source_repository": source_repository,
+    "payload_groups": {
+        "runtime_files": runtime_files,
+        "package_dirs": package_dirs,
+        "service_files": service_files if deploy_services else [],
+        "service_files_deployed": deploy_services,
+        "config_deployed": deploy_config,
+        "validated_renko_backtest_cpp": "excluded_not_runtime_required",
+    },
+    "requirements_hash": requirements_hash,
+    "config_policy": config_policy,
+    "config_hash": config_hash,
+    "backup_id": deployment_id,
+    "backup_path": backup_dir,
+    "validation_status": "pending",
+    "fleet_restart_status": "not_requested",
+    "mission_control_restart_status": "not_requested",
+}
+with open(manifest_path, "w", encoding="utf-8") as handle:
+    json.dump(manifest, handle, indent=2, sort_keys=True)
+    handle.write("\\n")
+PY
+
+  echo "Uploading release ${deployment_id} to ${target}:${staging_dir}"
+  ssh_base "$target" "rm -rf $(quote "$staging_dir") && mkdir -p $(quote "$staging_dir") $(quote "$backup_dir")"
+  scp_base -r "${LOCAL_RELEASE_DIR}/." "${target}:${staging_dir}/"
+
+  local validation_config="${REMOTE_DIR}/configs/traders.live.example.json"
+  if [[ "$DEPLOY_CONFIG" == "1" ]]; then
+    validation_config="${staging_dir}/${CONFIG_FILE}"
+  fi
+
+  echo "Validating staged release without live execution"
+  ssh_base "$target" "bash -lc $(quote "$(remote_validation_script "$staging_dir" "$validation_config")")"
+
+  echo "Backing up replaced runtime files to ${backup_dir}"
+  ssh_base "$target" "bash -lc $(quote "$(remote_backup_script "$deployment_id" "$commit" "$backup_dir")")"
+
+  echo "Promoting staged runtime files"
+  ssh_base "$target" "bash -lc $(quote "$(remote_promote_script "$deployment_id" "$staging_dir")")"
+
+  echo "Writing deployment manifest"
+  ssh_base "$target" "python3 - $(quote "${REMOTE_DIR}/DEPLOYED_VERSION.json") $(quote "${staging_dir}/DEPLOYED_VERSION.json") <<'PY'
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+data = json.loads(path.read_text()) if path.exists() else {}
+staged = json.loads(Path(sys.argv[2]).read_text())
+staged['validation_status'] = 'passed'
+path.write_text(json.dumps(staged, indent=2, sort_keys=True) + '\\n')
+PY"
+
+  echo "Cleaning promoted old runtime siblings after durable manifest"
+  ssh_base "$target" "bash -lc $(quote "$(remote_cleanup_old_script "$deployment_id")")"
+
+  cleanup_local_resources
+  echo "Deploy complete without service restart. Use ./deploy-trading --restart-fleet after separate approval."
+}
+
+remote_backup_script() {
+  local deployment_id="$1"
+  local requested_commit="$2"
+  local backup_dir="$3"
+  cat <<EOF
+set -euo pipefail
+cd $(quote "$REMOTE_DIR")
+mkdir -p $(quote "$backup_dir") $(quote "$backup_dir")/configs
+files=(${RUNTIME_FILES[*]@Q})
+dirs=(${PACKAGE_DIRS[*]@Q})
+service_files=()
+if [[ "$DEPLOY_SERVICES" == "1" ]]; then
+  service_files=(${SERVICE_FILES[*]@Q})
+fi
+backed_up=()
+for f in "\${files[@]}"; do
+  if [[ -e "\$f" ]]; then
+    cp -a "\$f" $(quote "$backup_dir")/
+    backed_up+=("\$f")
+  fi
+done
+for d in "\${dirs[@]}"; do
+  if [[ -d "\$d" ]]; then
+    cp -a "\$d" $(quote "$backup_dir")/
+    backed_up+=("\$d/")
+  fi
+done
+for f in "\${service_files[@]}"; do
+  if [[ -e "\$f" ]]; then
+    cp -a "\$f" $(quote "$backup_dir")/
+    backed_up+=("\$f")
+  fi
+done
+config_included=false
+if [[ "$DEPLOY_CONFIG" == "1" && -f "$CONFIG_FILE" ]]; then
+  cp -a "$CONFIG_FILE" $(quote "$backup_dir")/configs/
+  backed_up+=("$CONFIG_FILE")
+  config_included=true
+fi
+prior_commit=null
+if [[ -f DEPLOYED_VERSION.json ]]; then
+  prior_commit=\$(python3 - <<'PY'
+import json
+try:
+    print(json.load(open("DEPLOYED_VERSION.json")).get("git_commit") or "null")
+except Exception:
+    print("null")
+PY
+)
+fi
+fleet_state="\$(systemctl is-active "$FLEET_SERVICE" 2>/dev/null || true)"
+mission_state="\$(systemctl is-active "$MISSION_SERVICE" 2>/dev/null || true)"
+python3 - "$backup_dir/backup_metadata.json" "$deployment_id" "\$prior_commit" "$requested_commit" "\$config_included" "\$fleet_state" "\$mission_state" "\${backed_up[@]}" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+path = sys.argv[1]
+deployment_id = sys.argv[2]
+prior_commit = None if sys.argv[3] == "null" else sys.argv[3]
+requested_commit = sys.argv[4]
+config_included = sys.argv[5] == "true"
+fleet_state = sys.argv[6]
+mission_state = sys.argv[7]
+files_backed_up = sys.argv[8:]
+metadata = {
+    "deployment_id": deployment_id,
+    "prior_deployment_commit": prior_commit,
+    "requested_commit": requested_commit,
+    "timestamp": datetime.now(timezone.utc).isoformat(),
+    "files_backed_up": files_backed_up,
+    "config_included": config_included,
+    "service_states_before_deployment": {
+        "fleet": fleet_state,
+        "mission_control": mission_state,
+    },
+}
+open(path, "w", encoding="utf-8").write(json.dumps(metadata, indent=2, sort_keys=True) + "\\n")
+PY
+EOF
+}
+
+remote_service_promotion_script() {
+  if [[ "$DEPLOY_SERVICES" != "1" ]]; then
+    return
+  fi
+  cat <<EOF
+for f in ${SERVICE_FILES[*]@Q}; do
+  activate_file "\$f"
+done
 install -m 0644 mission-control.service /etc/systemd/system/mission-control.service
 install -m 0644 trading-fleet-live.service /etc/systemd/system/trading-fleet-live.service
 systemctl daemon-reload
-systemctl enable mission-control.service
-systemctl disable trading-server.service 2>/dev/null || true
-systemctl stop trading-server.service 2>/dev/null || true
+EOF
+}
 
-systemctl restart mission-control.service
-
-sleep 5
-if ! systemctl is-active --quiet mission-control.service; then
-  echo
-  echo "Service failed to stay active: mission-control.service"
-  systemctl status mission-control.service --no-pager || true
-  journalctl -u mission-control.service -n 50 --no-pager || true
-  exit 1
-fi
-
-if ! curl --fail --silent http://127.0.0.1:8080/ >/dev/null; then
-  echo
-  echo "Mission-control health check failed"
-  systemctl status mission-control.service --no-pager || true
-  journalctl -u mission-control.service -n 50 --no-pager || true
-  exit 1
-fi
-systemctl --no-pager --lines=5 status mission-control.service
-
-if [[ "${DEPLOY_START_FLEET:-0}" == "1" ]]; then
-  systemctl enable trading-fleet-live.service
-  systemctl restart trading-fleet-live.service
-  sleep 5
-  if ! systemctl is-active --quiet trading-fleet-live.service; then
-    echo
-    echo \"Service failed to stay active: trading-fleet-live.service\"
-    systemctl status trading-fleet-live.service --no-pager || true
-    journalctl -u trading-fleet-live.service -n 80 --no-pager || true
-    exit 1
+remote_promote_script() {
+  local deployment_id="$1"
+  local staging_dir="$2"
+  cat <<EOF
+set -euo pipefail
+cd $(quote "$REMOTE_DIR")
+test -d $(quote "$staging_dir")/shared
+test -d $(quote "$staging_dir")/silver
+mkdir -p configs
+txn_kind=()
+txn_name=()
+  txn_old=()
+  txn_new=()
+  txn_had_active=()
+  txn_state=()
+set_txn_state() {
+  txn_state[\$1]="\$2"
+}
+restore_txn() {
+  set +e
+  local idx="\$1"
+  local kind="\${txn_kind[\$idx]}"
+  local name="\${txn_name[\$idx]}"
+  local old="\${txn_old[\$idx]}"
+  local new="\${txn_new[\$idx]}"
+  local had_active="\${txn_had_active[\$idx]}"
+  local state="\${txn_state[\$idx]}"
+  if [[ "\$state" == "restored" ]]; then
+    return 0
   fi
-  systemctl --no-pager --lines=5 status trading-fleet-live.service
-else
-  echo \"trading-fleet-live.service installed but not started. Set DEPLOY_START_FLEET=1 to start it during deploy.\"
+  if [[ "\$kind" == "dir" ]]; then
+    if [[ "\$state" == "activated" && -d "\$name" ]]; then
+      rm -rf "\$name"
+    fi
+    if [[ "\$had_active" == "1" && -d "\$old" ]]; then
+      rm -rf "\$name"
+      mv "\$old" "\$name"
+    elif [[ "\$had_active" == "0" && "\$state" == "activated" ]]; then
+      rm -rf "\$name"
+    fi
+    rm -rf "\$new"
+  else
+    if [[ "\$state" == "activated" && -e "\$name" ]]; then
+      rm -f "\$name"
+    fi
+    if [[ "\$had_active" == "1" && -e "\$old" ]]; then
+      rm -f "\$name"
+      mv "\$old" "\$name"
+    elif [[ "\$had_active" == "0" && "\$state" == "activated" ]]; then
+      rm -f "\$name"
+    fi
+    rm -f "\$new"
+  fi
+  set_txn_state "\$idx" "restored"
+  set -e
+  return 0
+}
+restore_promoted() {
+  set +e
+  local idx
+  for ((idx=\${#txn_kind[@]} - 1; idx >= 0; idx--)); do
+    restore_txn "\$idx"
+  done
+  exit 1
+}
+trap restore_promoted ERR
+activate_dir() {
+  local name="\$1"
+  local new="\${name}.__new__.$deployment_id"
+  local old="\${name}.__old__.$deployment_id"
+  local had_active=0
+  local idx
+  rm -rf "\$new" "\$old"
+  if ! cp -a $(quote "$staging_dir")/"\$name" "\$new"; then
+    return 1
+  fi
+  if [[ ! -d "\$new" ]]; then
+    rm -rf "\$new"
+    return 1
+  fi
+  if [[ -e "\$name" ]]; then
+    had_active=1
+  fi
+  txn_kind+=("dir")
+  txn_name+=("\$name")
+  txn_old+=("\$old")
+  txn_new+=("\$new")
+  txn_had_active+=("\$had_active")
+  txn_state+=("prepared")
+  idx=\$((\${#txn_kind[@]} - 1))
+  if [[ -e "\$name" ]]; then
+    if ! mv "\$name" "\$old"; then
+      rm -rf "\$new"
+      set_txn_state "\$idx" "restored"
+      return 1
+    fi
+    set_txn_state "\$idx" "old_moved"
+  fi
+  if [[ "\${DEPLOY_TEST_FAIL_ACTIVATE_AFTER_OLD_MOVED:-}" == "\$name" ]]; then
+    rm -rf "\$new"
+    restore_txn "\$idx"
+    return 1
+  fi
+  if ! mv "\$new" "\$name"; then
+    restore_txn "\$idx"
+    return 1
+  fi
+  set_txn_state "\$idx" "activated"
+}
+activate_file() {
+  local name="\$1"
+  local new="\${name}.__new__.$deployment_id"
+  local old="\${name}.__old__.$deployment_id"
+  local had_active=0
+  local idx
+  mkdir -p "\$(dirname "\$name")"
+  rm -f "\$new" "\$old"
+  if ! cp -a $(quote "$staging_dir")/"\$name" "\$new"; then
+    return 1
+  fi
+  if [[ ! -f "\$new" ]]; then
+    rm -f "\$new"
+    return 1
+  fi
+  if [[ -e "\$name" ]]; then
+    had_active=1
+  fi
+  txn_kind+=("file")
+  txn_name+=("\$name")
+  txn_old+=("\$old")
+  txn_new+=("\$new")
+  txn_had_active+=("\$had_active")
+  txn_state+=("prepared")
+  idx=\$((\${#txn_kind[@]} - 1))
+  if [[ -e "\$name" ]]; then
+    if ! mv "\$name" "\$old"; then
+      rm -f "\$new"
+      set_txn_state "\$idx" "restored"
+      return 1
+    fi
+    set_txn_state "\$idx" "old_moved"
+  fi
+  if [[ "\${DEPLOY_TEST_FAIL_ACTIVATE_AFTER_OLD_MOVED:-}" == "\$name" ]]; then
+    rm -f "\$new"
+    restore_txn "\$idx"
+    return 1
+  fi
+  if ! mv "\$new" "\$name"; then
+    restore_txn "\$idx"
+    return 1
+  fi
+  set_txn_state "\$idx" "activated"
+}
+for d in ${PACKAGE_DIRS[*]@Q}; do
+  activate_dir "\$d"
+done
+for f in ${RUNTIME_FILES[*]@Q}; do
+  activate_file "\$f"
+done
+if [[ "$DEPLOY_CONFIG" == "1" ]]; then
+  activate_file "$CONFIG_FILE"
 fi
-'"
+$(remote_service_promotion_script)
+trap - ERR
+echo $(quote "$deployment_id") > .last_deployment_id
+EOF
+}
 
-echo
-echo "Mission-control was verified from inside the droplet."
-echo
-echo "Deploy complete."
+remote_cleanup_old_script() {
+  local deployment_id="$1"
+  cat <<EOF
+set -euo pipefail
+cd $(quote "$REMOTE_DIR")
+for d in ${PACKAGE_DIRS[*]@Q}; do
+  rm -rf "\${d}.__old__.$deployment_id"
+done
+for f in ${RUNTIME_FILES[*]@Q}; do
+  rm -f "\${f}.__old__.$deployment_id"
+done
+if [[ "$DEPLOY_CONFIG" == "1" ]]; then
+  rm -f "$CONFIG_FILE.__old__.$deployment_id"
+fi
+if [[ "$DEPLOY_SERVICES" == "1" ]]; then
+  for f in ${SERVICE_FILES[*]@Q}; do
+    rm -f "\${f}.__old__.$deployment_id"
+  done
+fi
+EOF
+}
+
+restart_fleet_only() {
+  local target
+  target="$(remote_target)"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "DRY RUN ONLY - would restart ${FLEET_SERVICE} on ${target}"
+    return
+  fi
+  ssh_base "$target" "systemctl restart $(quote "$FLEET_SERVICE") && systemctl is-active $(quote "$FLEET_SERVICE")"
+}
+
+restart_mission_only() {
+  local target
+  target="$(remote_target)"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "DRY RUN ONLY - would restart ${MISSION_SERVICE} on ${target}"
+    return
+  fi
+  ssh_base "$target" "systemctl restart $(quote "$MISSION_SERVICE") && systemctl is-active $(quote "$MISSION_SERVICE")"
+}
+
+rollback_deployment() {
+  local deployment_id="$1"
+  local target backup_dir
+  validate_deployment_id "$deployment_id"
+  target="$(remote_target)"
+  backup_dir="/root/deploy-backups/${deployment_id}"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    cat <<EOF
+DRY RUN ONLY - no remote changes will be made.
+Rollback deployment ID: ${deployment_id}
+Backup path: ${backup_dir}
+Would restore backed-up runtime files, shared/, silver/, service files, requirements.txt.
+Would restore config only if ${backup_dir}/configs/${CONFIG_FILE##*/} exists.
+Would preserve artifacts, venv, evidence, logs, and state.
+Would run non-trading validation after restoration.
+Fleet restart requested: ${RESTART_FLEET}
+Mission-control restart requested: ${RESTART_MISSION}
+EOF
+    return
+  fi
+  ssh_base "$target" "bash -lc $(quote "$(remote_rollback_script "$deployment_id" "$backup_dir")")"
+  if [[ "$RESTART_FLEET" == "1" ]]; then
+    restart_fleet_only
+  fi
+  if [[ "$RESTART_MISSION" == "1" ]]; then
+    restart_mission_only
+  fi
+}
+
+remote_rollback_script() {
+  local deployment_id="$1"
+  local backup_dir="$2"
+  cat <<EOF
+set -euo pipefail
+test -d $(quote "$backup_dir")
+cd $(quote "$REMOTE_DIR")
+txn_kind=()
+txn_name=()
+txn_old=()
+txn_new=()
+txn_had_active=()
+txn_state=()
+set_txn_state() {
+  txn_state[\$1]="\$2"
+}
+restore_txn() {
+  set +e
+  local idx="\$1"
+  local kind="\${txn_kind[\$idx]}"
+  local name="\${txn_name[\$idx]}"
+  local old="\${txn_old[\$idx]}"
+  local new="\${txn_new[\$idx]}"
+  local had_active="\${txn_had_active[\$idx]}"
+  local state="\${txn_state[\$idx]}"
+  if [[ "\$state" == "restored" ]]; then
+    return 0
+  fi
+  if [[ "\$kind" == "dir" ]]; then
+    if [[ "\$state" == "activated" && -d "\$name" ]]; then
+      rm -rf "\$name"
+    fi
+    if [[ "\$had_active" == "1" && -d "\$old" ]]; then
+      rm -rf "\$name"
+      mv "\$old" "\$name"
+    elif [[ "\$had_active" == "0" && "\$state" == "activated" ]]; then
+      rm -rf "\$name"
+    fi
+    rm -rf "\$new"
+  else
+    if [[ "\$state" == "activated" && -e "\$name" ]]; then
+      rm -f "\$name"
+    fi
+    if [[ "\$had_active" == "1" && -e "\$old" ]]; then
+      rm -f "\$name"
+      mv "\$old" "\$name"
+    elif [[ "\$had_active" == "0" && "\$state" == "activated" ]]; then
+      rm -f "\$name"
+    fi
+    rm -f "\$new"
+  fi
+  set_txn_state "\$idx" "restored"
+  set -e
+  return 0
+}
+restore_rollback() {
+  set +e
+  local idx
+  for ((idx=\${#txn_kind[@]} - 1; idx >= 0; idx--)); do
+    restore_txn "\$idx"
+  done
+  exit 1
+}
+trap restore_rollback ERR
+activate_backup_dir() {
+  local name="\$1"
+  local backup_path=$(quote "$backup_dir")/"\$name"
+  local new="\${name}.__rollback_new__.$deployment_id"
+  local old="\${name}.__rollback_old__.$deployment_id"
+  local had_active=0
+  local idx
+  if [[ ! -d "\$backup_path" ]]; then
+    return 0
+  fi
+  rm -rf "\$new" "\$old"
+  if [[ "\${DEPLOY_TEST_FAIL_ROLLBACK_COPY:-}" == "\$name" ]]; then
+    return 1
+  fi
+  if ! cp -a "\$backup_path" "\$new"; then
+    return 1
+  fi
+  if [[ ! -d "\$new" ]]; then
+    rm -rf "\$new"
+    return 1
+  fi
+  if [[ -e "\$name" ]]; then
+    had_active=1
+  fi
+  txn_kind+=("dir")
+  txn_name+=("\$name")
+  txn_old+=("\$old")
+  txn_new+=("\$new")
+  txn_had_active+=("\$had_active")
+  txn_state+=("prepared")
+  idx=\$((\${#txn_kind[@]} - 1))
+  if [[ -e "\$name" ]]; then
+    if ! mv "\$name" "\$old"; then
+      rm -rf "\$new"
+      set_txn_state "\$idx" "restored"
+      return 1
+    fi
+    set_txn_state "\$idx" "old_moved"
+  fi
+  if [[ "\${DEPLOY_TEST_FAIL_ROLLBACK_AFTER_OLD_MOVED:-}" == "\$name" ]]; then
+    rm -rf "\$new"
+    restore_txn "\$idx"
+    return 1
+  fi
+  if ! mv "\$new" "\$name"; then
+    restore_txn "\$idx"
+    return 1
+  fi
+  set_txn_state "\$idx" "activated"
+}
+activate_backup_file() {
+  local name="\$1"
+  local backup_path=$(quote "$backup_dir")/"\$name"
+  local new="\${name}.__rollback_new__.$deployment_id"
+  local old="\${name}.__rollback_old__.$deployment_id"
+  local had_active=0
+  local idx
+  if [[ ! -e "\$backup_path" ]]; then
+    return 0
+  fi
+  mkdir -p "\$(dirname "\$name")"
+  rm -f "\$new" "\$old"
+  if [[ "\${DEPLOY_TEST_FAIL_ROLLBACK_COPY:-}" == "\$name" ]]; then
+    return 1
+  fi
+  if ! cp -a "\$backup_path" "\$new"; then
+    return 1
+  fi
+  if [[ ! -f "\$new" ]]; then
+    rm -f "\$new"
+    return 1
+  fi
+  if [[ -e "\$name" ]]; then
+    had_active=1
+  fi
+  txn_kind+=("file")
+  txn_name+=("\$name")
+  txn_old+=("\$old")
+  txn_new+=("\$new")
+  txn_had_active+=("\$had_active")
+  txn_state+=("prepared")
+  idx=\$((\${#txn_kind[@]} - 1))
+  if [[ -e "\$name" ]]; then
+    if ! mv "\$name" "\$old"; then
+      rm -f "\$new"
+      set_txn_state "\$idx" "restored"
+      return 1
+    fi
+    set_txn_state "\$idx" "old_moved"
+  fi
+  if [[ "\${DEPLOY_TEST_FAIL_ROLLBACK_AFTER_OLD_MOVED:-}" == "\$name" ]]; then
+    rm -f "\$new"
+    restore_txn "\$idx"
+    return 1
+  fi
+  if ! mv "\$new" "\$name"; then
+    restore_txn "\$idx"
+    return 1
+  fi
+  set_txn_state "\$idx" "activated"
+}
+for d in ${PACKAGE_DIRS[*]@Q}; do
+  activate_backup_dir "\$d"
+done
+for f in ${RUNTIME_FILES[*]@Q}; do
+  activate_backup_file "\$f"
+done
+if [[ -f $(quote "$backup_dir")/configs/${CONFIG_FILE##*/} ]]; then
+  mkdir -p configs
+  activate_backup_file "$CONFIG_FILE"
+fi
+service_files_restored=false
+for f in ${SERVICE_FILES[*]@Q}; do
+  if [[ -f $(quote "$backup_dir")/"\$f" ]]; then
+    activate_backup_file "\$f"
+    install -m 0644 "\$f" /etc/systemd/system/"\$f"
+    service_files_restored=true
+  fi
+done
+if [[ "\$service_files_restored" == "true" ]]; then
+  systemctl daemon-reload
+fi
+source venv/bin/activate
+python -m py_compile alpaca_trader.py trading_events.py renko_builder.py strategy_engine.py execution_engine.py fleet_runner.py monitoring_app.py
+python - <<'PY'
+import shared.config.trader_config
+import silver.market.one_second_sampler
+import silver.evidence.logger
+import silver.evidence.shadow_sampler
+import fleet_runner
+PY
+python fleet_runner.py --help >/dev/null
+python3 - "$deployment_id" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+path = Path("DEPLOYED_VERSION.json")
+data = json.loads(path.read_text()) if path.exists() else {}
+data["rollback_status"] = {"deployment_id": sys.argv[1], "rolled_back_at": datetime.now(timezone.utc).isoformat(), "validation_status": "passed", "fleet_restart_status": "not_requested", "mission_control_restart_status": "not_requested"}
+path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\\n")
+PY
+trap - ERR
+for d in ${PACKAGE_DIRS[*]@Q}; do
+  rm -rf "\${d}.__rollback_old__.$deployment_id"
+done
+for f in ${RUNTIME_FILES[*]@Q}; do
+  rm -f "\${f}.__rollback_old__.$deployment_id"
+done
+if [[ -f configs/${CONFIG_FILE##*/} ]]; then
+  rm -f "$CONFIG_FILE.__rollback_old__.$deployment_id"
+fi
+for f in ${SERVICE_FILES[*]@Q}; do
+  rm -f "\${f}.__rollback_old__.$deployment_id"
+done
+EOF
+}
+
+if [[ "${DEPLOY_TRADING_INTERNAL_COMMAND:-}" == "promote-script" ]]; then
+  parse_args
+  validate_remote_dir
+  validate_deployment_id "${1:-}"
+  remote_promote_script "$1" "${2:-}"
+  exit 0
+elif [[ "${DEPLOY_TRADING_INTERNAL_COMMAND:-}" == "rollback-script" ]]; then
+  parse_args
+  validate_remote_dir
+  validate_deployment_id "${1:-}"
+  remote_rollback_script "$1" "${2:-}"
+  exit 0
+elif [[ "${DEPLOY_TRADING_INTERNAL_COMMAND:-}" == "cleanup-old-script" ]]; then
+  parse_args
+  validate_remote_dir
+  validate_deployment_id "${1:-}"
+  remote_cleanup_old_script "$1"
+  exit 0
+fi
+
+main() {
+  parse_args "$@"
+  validate_remote_dir
+  if [[ -n "$COMMIT_ARG" && "$ROLLBACK_REQUESTED" == "1" ]]; then
+    die "--commit and --rollback are mutually exclusive"
+  fi
+  if [[ -n "$COMMIT_ARG" && "$RESTART_FLEET" == "1" ]]; then
+    die "deploy and restart are separate; run --restart-fleet after deployment"
+  fi
+  if [[ -n "$COMMIT_ARG" && "$RESTART_MISSION" == "1" ]]; then
+    die "deploy and mission-control restart are separate"
+  fi
+  if [[ -z "$COMMIT_ARG" && "$ROLLBACK_REQUESTED" == "0" && "$RESTART_FLEET" == "0" && "$RESTART_MISSION" == "0" ]]; then
+    usage
+    die "choose --commit, --rollback, --restart-fleet, or --restart-mission-control"
+  fi
+
+  if [[ -n "$COMMIT_ARG" ]]; then
+    warn_if_dirty_worktree
+    local full_sha deployment_id
+    full_sha="$(resolve_commit "$COMMIT_ARG")"
+    trap cleanup_all EXIT
+    create_clean_worktree "$full_sha"
+    require_payload_exists "$CLEAN_SOURCE"
+    deployment_id="$(deployment_id_for "$full_sha")"
+    validate_deployment_id "$deployment_id"
+    if [[ "$DRY_RUN" == "1" ]]; then
+      dry_run_commit "$full_sha" "$deployment_id"
+      return
+    fi
+    deploy_commit "$full_sha" "$deployment_id"
+    return
+  fi
+
+  if [[ "$ROLLBACK_REQUESTED" == "1" ]]; then
+    rollback_deployment "$ROLLBACK_ID"
+    return
+  fi
+
+  if [[ "$RESTART_FLEET" == "1" ]]; then
+    restart_fleet_only
+  fi
+  if [[ "$RESTART_MISSION" == "1" ]]; then
+    restart_mission_only
+  fi
+}
+
+main "$@"
