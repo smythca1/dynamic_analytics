@@ -441,6 +441,7 @@ deploy_commit() {
 
   python3 - "$manifest_file" "$deployment_id" "$commit" "$SOURCE_REPOSITORY" "$requirements_hash" "$config_policy" "$config_hash" "$backup_dir" "$DEPLOY_CONFIG" "$DEPLOY_SERVICES" "${RUNTIME_FILES[@]}" --packages "${PACKAGE_DIRS[@]}" --services "${SERVICE_FILES[@]}" <<'PY'
 import json
+import os
 import sys
 from datetime import datetime, timezone
 manifest_path = sys.argv[1]
@@ -459,8 +460,8 @@ runtime_files = sys.argv[11:packages_separator]
 package_dirs = sys.argv[packages_separator + 1:services_separator]
 service_files = sys.argv[services_separator + 1:]
 manifest = {
-    "deployment_id": deployment_id,
-    "git_commit": commit,
+    "deployment_id": os.environ.get("DEPLOY_TEST_MANIFEST_DEPLOYMENT_ID_OVERRIDE", deployment_id),
+    "git_commit": os.environ.get("DEPLOY_TEST_MANIFEST_COMMIT_OVERRIDE", commit),
     "deployed_at": datetime.now(timezone.utc).isoformat(),
     "source_repository": source_repository,
     "payload_groups": {
@@ -476,14 +477,17 @@ manifest = {
     "config_hash": config_hash,
     "backup_id": deployment_id,
     "backup_path": backup_dir,
-    "validation_status": "pending",
+    "validation_status": os.environ.get("DEPLOY_TEST_MANIFEST_STATUS_OVERRIDE", "generated"),
     "fleet_restart_status": "not_requested",
     "mission_control_restart_status": "not_requested",
 }
 with open(manifest_path, "w", encoding="utf-8") as handle:
     json.dump(manifest, handle, indent=2, sort_keys=True)
-    handle.write("\\n")
+    handle.write("\n")
+    if os.environ.get("DEPLOY_TEST_LITERAL_MANIFEST_SUFFIX") == "1":
+        handle.write("\\n")
 PY
+  validate_local_manifest "$manifest_file" "$deployment_id" "$commit" "generated"
 
   echo "Uploading release ${deployment_id} to ${target}:${staging_dir}"
   ssh_base "$target" "rm -rf $(quote "$staging_dir") && mkdir -p $(quote "$staging_dir") $(quote "$backup_dir")"
@@ -497,6 +501,9 @@ PY
   echo "Validating staged release without live execution"
   ssh_base "$target" "bash -lc $(quote "$(remote_validation_script "$staging_dir" "$validation_config")")"
 
+  echo "Validating deployment manifest before promotion"
+  ssh_base "$target" "bash -lc $(quote "$(remote_mark_manifest_validated_script "$deployment_id" "$commit" "${staging_dir}/DEPLOYED_VERSION.json")")"
+
   echo "Backing up replaced runtime files to ${backup_dir}"
   ssh_base "$target" "bash -lc $(quote "$(remote_backup_script "$deployment_id" "$commit" "$backup_dir")")"
 
@@ -504,22 +511,160 @@ PY
   ssh_base "$target" "bash -lc $(quote "$(remote_promote_script "$deployment_id" "$staging_dir")")"
 
   echo "Writing deployment manifest"
-  ssh_base "$target" "python3 - $(quote "${REMOTE_DIR}/DEPLOYED_VERSION.json") $(quote "${staging_dir}/DEPLOYED_VERSION.json") <<'PY'
-import json
-import sys
-from pathlib import Path
-path = Path(sys.argv[1])
-data = json.loads(path.read_text()) if path.exists() else {}
-staged = json.loads(Path(sys.argv[2]).read_text())
-staged['validation_status'] = 'passed'
-path.write_text(json.dumps(staged, indent=2, sort_keys=True) + '\\n')
-PY"
+  if ! ssh_base "$target" "bash -lc $(quote "$(remote_install_manifest_script "$deployment_id" "$commit" "${staging_dir}/DEPLOYED_VERSION.json" "${REMOTE_DIR}/DEPLOYED_VERSION.json")")"; then
+    echo "INCOMPLETE_DEPLOYMENT: runtime promotion completed but DEPLOYED_VERSION.json was not installed." >&2
+    echo "INCOMPLETE_DEPLOYMENT deployment_id=${deployment_id}" >&2
+    echo "Recovery options: rerun the same commit with --no-restart after fixing deployment, or rollback ${deployment_id} without restart after separate approval." >&2
+    return 1
+  fi
 
   echo "Cleaning promoted old runtime siblings after durable manifest"
   ssh_base "$target" "bash -lc $(quote "$(remote_cleanup_old_script "$deployment_id")")"
 
   cleanup_local_resources
   echo "Deploy complete without service restart. Use ./deploy-trading --restart-fleet after separate approval."
+}
+
+validate_local_manifest() {
+  local manifest_file="$1"
+  local deployment_id="$2"
+  local commit="$3"
+  local expected_status="$4"
+  python3 - "$manifest_file" "$deployment_id" "$commit" "$expected_status" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+deployment_id = sys.argv[2]
+commit = sys.argv[3]
+expected_status = sys.argv[4]
+
+with path.open("r", encoding="utf-8") as handle:
+    data = json.load(handle)
+
+required = {
+    "deployment_id",
+    "git_commit",
+    "deployed_at",
+    "source_repository",
+    "payload_groups",
+    "requirements_hash",
+    "config_policy",
+    "backup_id",
+    "backup_path",
+    "validation_status",
+}
+missing = sorted(required.difference(data))
+if missing:
+    raise SystemExit(f"manifest missing required fields: {missing}")
+if data["deployment_id"] != deployment_id:
+    raise SystemExit("manifest deployment_id mismatch")
+if data["git_commit"] != commit:
+    raise SystemExit("manifest git_commit mismatch")
+if data["validation_status"] != expected_status:
+    raise SystemExit("manifest validation_status mismatch")
+PY
+}
+
+remote_manifest_python() {
+  cat <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+REQUIRED = {
+    "deployment_id",
+    "git_commit",
+    "deployed_at",
+    "source_repository",
+    "payload_groups",
+    "requirements_hash",
+    "config_policy",
+    "backup_id",
+    "backup_path",
+    "validation_status",
+}
+
+def load_manifest(path: Path) -> dict:
+    text = path.read_text(encoding="utf-8")
+    data = json.loads(text)
+    missing = sorted(REQUIRED.difference(data))
+    if missing:
+        raise SystemExit(f"manifest missing required fields: {missing}")
+    return data
+
+def write_manifest(path: Path, data: dict) -> None:
+    tmp = path.with_name(f"{path.name}.__tmp__.{data['deployment_id']}")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    reparsed = load_manifest(tmp)
+    if reparsed != data:
+        raise SystemExit("manifest write verification mismatch")
+    os.replace(tmp, path)
+
+mode = sys.argv[1]
+deployment_id = sys.argv[2]
+commit = sys.argv[3]
+
+if mode == "mark_validated":
+    manifest_path = Path(sys.argv[4])
+    data = load_manifest(manifest_path)
+    if data["deployment_id"] != deployment_id:
+        raise SystemExit("manifest deployment_id mismatch")
+    if data["git_commit"] != commit:
+        raise SystemExit("manifest git_commit mismatch")
+    if data["validation_status"] not in {"generated", "passed"}:
+        raise SystemExit("manifest validation_status is not pre-promotion successful")
+    data["validation_status"] = "passed"
+    write_manifest(manifest_path, data)
+elif mode == "install_passed":
+    staged_manifest = Path(sys.argv[4])
+    final_manifest = Path(sys.argv[5])
+    data = load_manifest(staged_manifest)
+    if data["deployment_id"] != deployment_id:
+        raise SystemExit("manifest deployment_id mismatch")
+    if data["git_commit"] != commit:
+        raise SystemExit("manifest git_commit mismatch")
+    if data["validation_status"] != "passed":
+        raise SystemExit("manifest was not validated before promotion")
+    final_manifest.parent.mkdir(parents=True, exist_ok=True)
+    write_manifest(final_manifest, data)
+    (final_manifest.parent / ".last_successful_deployment_id").write_text(deployment_id + "\n", encoding="utf-8")
+    (final_manifest.parent / ".last_deployment_id").write_text(deployment_id + "\n", encoding="utf-8")
+else:
+    raise SystemExit(f"unknown manifest mode: {mode}")
+PY
+}
+
+remote_mark_manifest_validated_script() {
+  local deployment_id="$1"
+  local commit="$2"
+  local manifest_path="$3"
+  cat <<EOF
+set -euo pipefail
+python3 - mark_validated $(quote "$deployment_id") $(quote "$commit") $(quote "$manifest_path") <<'PY'
+$(remote_manifest_python)
+PY
+EOF
+}
+
+remote_install_manifest_script() {
+  local deployment_id="$1"
+  local commit="$2"
+  local staged_manifest="$3"
+  local final_manifest="$4"
+  cat <<EOF
+set -euo pipefail
+if [[ "\${DEPLOY_TEST_FAIL_FINAL_MANIFEST_WRITE:-0}" == "1" ]]; then
+  exit 45
+fi
+python3 - install_passed $(quote "$deployment_id") $(quote "$commit") $(quote "$staged_manifest") $(quote "$final_manifest") <<'PY'
+$(remote_manifest_python)
+PY
+EOF
 }
 
 remote_backup_script() {
@@ -598,7 +743,7 @@ metadata = {
         "mission_control": mission_state,
     },
 }
-open(path, "w", encoding="utf-8").write(json.dumps(metadata, indent=2, sort_keys=True) + "\\n")
+open(path, "w", encoding="utf-8").write(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
 PY
 EOF
 }
@@ -781,6 +926,7 @@ if [[ "$DEPLOY_CONFIG" == "1" ]]; then
 fi
 $(remote_service_promotion_script)
 trap - ERR
+echo $(quote "$deployment_id") > .last_attempted_deployment_id
 echo $(quote "$deployment_id") > .last_deployment_id
 EOF
 }
@@ -1060,7 +1206,7 @@ from pathlib import Path
 path = Path("DEPLOYED_VERSION.json")
 data = json.loads(path.read_text()) if path.exists() else {}
 data["rollback_status"] = {"deployment_id": sys.argv[1], "rolled_back_at": datetime.now(timezone.utc).isoformat(), "validation_status": "passed", "fleet_restart_status": "not_requested", "mission_control_restart_status": "not_requested"}
-path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\\n")
+path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 PY
 trap - ERR
 for d in ${PACKAGE_DIRS[*]@Q}; do
@@ -1095,6 +1241,18 @@ elif [[ "${DEPLOY_TRADING_INTERNAL_COMMAND:-}" == "cleanup-old-script" ]]; then
   validate_remote_dir
   validate_deployment_id "${1:-}"
   remote_cleanup_old_script "$1"
+  exit 0
+elif [[ "${DEPLOY_TRADING_INTERNAL_COMMAND:-}" == "mark-manifest-validated-script" ]]; then
+  parse_args
+  validate_remote_dir
+  validate_deployment_id "${1:-}"
+  remote_mark_manifest_validated_script "$1" "${2:-}" "${3:-}"
+  exit 0
+elif [[ "${DEPLOY_TRADING_INTERNAL_COMMAND:-}" == "install-manifest-script" ]]; then
+  parse_args
+  validate_remote_dir
+  validate_deployment_id "${1:-}"
+  remote_install_manifest_script "$1" "${2:-}" "${3:-}" "${4:-}"
   exit 0
 fi
 

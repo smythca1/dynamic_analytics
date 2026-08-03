@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 
@@ -277,8 +278,8 @@ class DeployTradingTests(unittest.TestCase):
         self.assertNotIn("Path('${REMOTE_DIR}", script)
         self.assertNotIn("Path('${staging_dir}", script)
         self.assertNotIn('"deployment_id": "$deployment_id"', script)
-        self.assertIn("Path(sys.argv[1])", script)
-        self.assertIn("Path(sys.argv[2])", script)
+        self.assertIn("Path(sys.argv[4])", script)
+        self.assertIn("Path(sys.argv[5])", script)
         self.assertIn('"deployment_id": sys.argv[1]', script)
 
     def test_remote_python_source_is_stable_with_different_user_values(self) -> None:
@@ -289,8 +290,253 @@ class DeployTradingTests(unittest.TestCase):
 
     def test_manifest_uses_requested_commit_in_script(self) -> None:
         script = (self.repo / "deploy-trading").read_text()
-        self.assertIn('"git_commit": commit', script)
+        self.assertIn('"git_commit": os.environ.get("DEPLOY_TEST_MANIFEST_COMMIT_OVERRIDE", commit)', script)
         self.assertIn('"deployment_id": deployment_id', script)
+
+    def test_generated_manifest_contains_exactly_one_json_object(self) -> None:
+        fake_bin = self._fake_bin()
+        self._run("--commit", self.commit, "--no-restart", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+        manifest = fake_bin / "scp_payload/DEPLOYED_VERSION.json"
+        text = manifest.read_text(encoding="utf-8")
+        parsed = json.loads(text)
+        self.assertEqual(self.commit, parsed["git_commit"])
+        self.assertEqual(1, text.count('"git_commit"'))
+        self.assertFalse(text.endswith("\\n"))
+
+    def test_generated_manifest_parses_and_has_one_real_trailing_newline(self) -> None:
+        fake_bin = self._fake_bin()
+        self._run("--commit", self.commit, "--no-restart", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+        text = (fake_bin / "scp_payload/DEPLOYED_VERSION.json").read_text(encoding="utf-8")
+        self.assertEqual("\n", text[-1])
+        self.assertNotEqual("\n\n", text[-2:])
+        self.assertEqual("generated", json.loads(text)["validation_status"])
+
+    def test_literal_backslash_n_after_manifest_json_is_rejected(self) -> None:
+        fake_bin = self._fake_bin()
+        result = self._run(
+            "--commit",
+            self.commit,
+            "--no-restart",
+            check=False,
+            env={
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "DEPLOY_TEST_LITERAL_MANIFEST_SUFFIX": "1",
+            },
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((fake_bin / "ssh.log").exists())
+        self.assertFalse((fake_bin / "scp.log").exists())
+
+    def test_concatenated_manifest_json_objects_are_rejected(self) -> None:
+        runtime = self.root / "manifest-runtime"
+        runtime.mkdir()
+        manifest = runtime / "DEPLOYED_VERSION.json"
+        manifest.write_text(
+            json.dumps(self._manifest_dict("deploy-c", self.commit)) + "\n{}\n",
+            encoding="utf-8",
+        )
+        script = self._internal_script_args(
+            "mark-manifest-validated-script",
+            runtime,
+            "deploy-c",
+            self.commit,
+            manifest,
+        )
+        result = self._run_shell_script(script)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_required_manifest_fields_are_validated(self) -> None:
+        runtime = self.root / "manifest-required-runtime"
+        runtime.mkdir()
+        manifest = runtime / "DEPLOYED_VERSION.json"
+        data = self._manifest_dict("deploy-required", self.commit)
+        del data["payload_groups"]
+        manifest.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        script = self._internal_script_args(
+            "mark-manifest-validated-script",
+            runtime,
+            "deploy-required",
+            self.commit,
+            manifest,
+        )
+        result = self._run_shell_script(script)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("manifest missing required fields", result.stderr)
+
+    def test_staged_manifest_validation_marks_passed_before_promotion(self) -> None:
+        runtime = self.root / "manifest-pass-runtime"
+        runtime.mkdir()
+        manifest = runtime / "DEPLOYED_VERSION.json"
+        manifest.write_text(
+            json.dumps(self._manifest_dict("deploy-pass", self.commit), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        script = self._internal_script_args(
+            "mark-manifest-validated-script",
+            runtime,
+            "deploy-pass",
+            self.commit,
+            manifest,
+        )
+        result = self._run_shell_script(script)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual("passed", json.loads(manifest.read_text(encoding="utf-8"))["validation_status"])
+
+    def test_wrong_commit_in_manifest_fails_before_upload_or_promotion(self) -> None:
+        fake_bin = self._fake_bin()
+        result = self._run(
+            "--commit",
+            self.commit,
+            "--no-restart",
+            check=False,
+            env={
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "DEPLOY_TEST_MANIFEST_COMMIT_OVERRIDE": "badbadbadbadbadbadbadbadbadbadbadbadbadb",
+            },
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((fake_bin / "ssh.log").exists())
+        self.assertFalse((fake_bin / "scp.log").exists())
+
+    def test_wrong_deployment_id_in_manifest_fails_before_upload_or_promotion(self) -> None:
+        fake_bin = self._fake_bin()
+        result = self._run(
+            "--commit",
+            self.commit,
+            "--no-restart",
+            check=False,
+            env={
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "DEPLOY_TEST_MANIFEST_DEPLOYMENT_ID_OVERRIDE": "wrong-id",
+            },
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((fake_bin / "ssh.log").exists())
+        self.assertFalse((fake_bin / "scp.log").exists())
+
+    def test_manifest_generation_failure_prevents_promotion(self) -> None:
+        fake_bin = self._fake_bin()
+        result = self._run(
+            "--commit",
+            self.commit,
+            "--no-restart",
+            check=False,
+            env={
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "DEPLOY_TEST_MANIFEST_STATUS_OVERRIDE": "not_valid",
+            },
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Promoting staged runtime files", result.stdout)
+        self.assertFalse((fake_bin / "ssh.log").exists())
+
+    def test_final_manifest_install_is_atomic_and_updates_success_marker(self) -> None:
+        runtime = self.root / "install-runtime"
+        runtime.mkdir()
+        staged = runtime / "staged.json"
+        final = runtime / "DEPLOYED_VERSION.json"
+        data = self._manifest_dict("deploy-install", self.commit)
+        data["validation_status"] = "passed"
+        staged.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        script = self._internal_script_args(
+            "install-manifest-script",
+            runtime,
+            "deploy-install",
+            self.commit,
+            staged,
+            final,
+        )
+        result = self._run_shell_script(script)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(list(runtime.glob("DEPLOYED_VERSION.json.__tmp__.*")))
+        installed = json.loads(final.read_text(encoding="utf-8"))
+        self.assertEqual("passed", installed["validation_status"])
+        self.assertEqual(json.loads(staged.read_text(encoding="utf-8")), installed)
+        self.assertEqual("deploy-install", (runtime / ".last_successful_deployment_id").read_text(encoding="utf-8").strip())
+
+    def test_final_manifest_write_failure_reports_incomplete_and_no_success_marker(self) -> None:
+        fake_bin = self._fake_bin()
+        result = self._run(
+            "--commit",
+            self.commit,
+            "--no-restart",
+            check=False,
+            env={
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "DEPLOY_TEST_FAIL_SSH_CONTAINS": "DEPLOY_TEST_FAIL_FINAL_MANIFEST_WRITE",
+            },
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("INCOMPLETE_DEPLOYMENT", result.stderr)
+        self.assertNotIn("Cleaning promoted old runtime siblings", result.stdout)
+
+    def test_final_manifest_write_failure_does_not_restart_services(self) -> None:
+        fake_bin = self._fake_bin()
+        result = self._run(
+            "--commit",
+            self.commit,
+            "--no-restart",
+            check=False,
+            env={
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "DEPLOY_TEST_FAIL_SSH_CONTAINS": "DEPLOY_TEST_FAIL_FINAL_MANIFEST_WRITE",
+            },
+        )
+        self.assertNotEqual(result.returncode, 0)
+        ssh_log = (fake_bin / "ssh.log").read_text(encoding="utf-8")
+        self.assertNotIn("systemctl restart", ssh_log)
+
+    def test_old_siblings_remain_after_incomplete_deployment(self) -> None:
+        runtime, staging = self._runtime_and_staging()
+        promote = self._internal_script("promote-script", runtime, "deploy-incomplete", staging)
+        self.assertEqual(self._run_shell_script(promote).returncode, 0)
+        self.assertTrue((runtime / "shared.__old__.deploy-incomplete").exists())
+        self.assertTrue((runtime / "fleet_runner.py.__old__.deploy-incomplete").exists())
+        self.assertFalse((runtime / ".last_successful_deployment_id").exists())
+
+    def test_last_attempted_records_promotion_attempt(self) -> None:
+        runtime, staging = self._runtime_and_staging()
+        promote = self._internal_script("promote-script", runtime, "deploy-attempted", staging)
+        self.assertEqual(self._run_shell_script(promote).returncode, 0)
+        self.assertEqual("deploy-attempted", (runtime / ".last_attempted_deployment_id").read_text(encoding="utf-8").strip())
+
+    def test_last_successful_deployment_id_updates_only_after_manifest_success(self) -> None:
+        runtime, staging = self._runtime_and_staging()
+        promote = self._internal_script("promote-script", runtime, "deploy-marker", staging)
+        self.assertEqual(self._run_shell_script(promote).returncode, 0)
+        self.assertFalse((runtime / ".last_successful_deployment_id").exists())
+        staged = runtime / "staged-marker.json"
+        final = runtime / "DEPLOYED_VERSION.json"
+        data = self._manifest_dict("deploy-marker", self.commit)
+        data["validation_status"] = "passed"
+        staged.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        install = self._internal_script_args("install-manifest-script", runtime, "deploy-marker", self.commit, staged, final)
+        self.assertEqual(self._run_shell_script(install).returncode, 0)
+        self.assertEqual("deploy-marker", (runtime / ".last_successful_deployment_id").read_text(encoding="utf-8").strip())
+
+    def test_rerun_after_incomplete_deployment_uses_new_id_and_preserves_prior_failed_artifacts(self) -> None:
+        runtime, staging = self._runtime_and_staging()
+        first = self._internal_script("promote-script", runtime, "deploy-old", staging)
+        self.assertEqual(self._run_shell_script(first).returncode, 0)
+        self.assertTrue((runtime / "shared.__old__.deploy-old").exists())
+
+        second_staging = self.root / "staging-rerun"
+        second_staging.mkdir()
+        self._write_runtime_payload(second_staging, "rerun")
+        second = self._internal_script("promote-script", runtime, "deploy-new", second_staging)
+        self.assertEqual(self._run_shell_script(second).returncode, 0)
+
+        staged = runtime / "staged-new.json"
+        final = runtime / "DEPLOYED_VERSION.json"
+        data = self._manifest_dict("deploy-new", self.commit)
+        data["validation_status"] = "passed"
+        staged.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        install = self._internal_script_args("install-manifest-script", runtime, "deploy-new", self.commit, staged, final)
+        self.assertEqual(self._run_shell_script(install).returncode, 0)
+
+        self.assertEqual("rerun-shared", self._marker(runtime / "shared"))
+        self.assertEqual("deploy-new", (runtime / ".last_successful_deployment_id").read_text(encoding="utf-8").strip())
+        self.assertTrue((runtime / "shared.__old__.deploy-old").exists())
 
     def test_validation_excludes_execute_real(self) -> None:
         result = self._run("--commit", self.commit, "--dry-run")
@@ -452,8 +698,10 @@ class DeployTradingTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("Uploading release", result.stdout)
         self.assertIn("Validating staged release", result.stdout)
+        self.assertIn("Validating deployment manifest before promotion", result.stdout)
         self.assertIn("Backing up replaced runtime files", result.stdout)
         self.assertIn("Promoting staged runtime files", result.stdout)
+        self.assertLess(result.stdout.index("Validating deployment manifest before promotion"), result.stdout.index("Promoting staged runtime files"))
         ssh_log = (fake_bin / "ssh.log").read_text(encoding="utf-8")
         scp_log = (fake_bin / "scp.log").read_text(encoding="utf-8")
         self.assertIn("py_compile", ssh_log)
@@ -752,8 +1000,11 @@ class DeployTradingTests(unittest.TestCase):
         args = [deployment_id]
         if payload is not None:
             args.append(str(payload))
+        return self._internal_script_args(command, runtime, *args)
+
+    def _internal_script_args(self, command: str, runtime: Path, *args: object) -> str:
         result = self._run(
-            *args,
+            *(str(arg) for arg in args),
             env={
                 "DEPLOY_TRADING_INTERNAL_COMMAND": command,
                 "DEPLOY_REMOTE_DIR": str(runtime),
@@ -833,6 +1084,29 @@ class DeployTradingTests(unittest.TestCase):
     def _sha256(self, path: Path) -> str:
         result = subprocess.run(["shasum", "-a", "256", str(path)], text=True, capture_output=True, check=True)
         return result.stdout.split()[0]
+
+    def _manifest_dict(self, deployment_id: str, commit: str) -> dict[str, object]:
+        return {
+            "backup_id": deployment_id,
+            "backup_path": f"/root/deploy-backups/{deployment_id}",
+            "config_hash": None,
+            "config_policy": "preserve_remote",
+            "deployed_at": "2026-08-03T00:00:00+00:00",
+            "deployment_id": deployment_id,
+            "fleet_restart_status": "not_requested",
+            "git_commit": commit,
+            "mission_control_restart_status": "not_requested",
+            "payload_groups": {
+                "config_deployed": False,
+                "package_dirs": ["shared", "silver"],
+                "runtime_files": ["fleet_runner.py"],
+                "service_files": [],
+                "service_files_deployed": False,
+            },
+            "requirements_hash": "abc123",
+            "source_repository": "test-repo",
+            "validation_status": "generated",
+        }
 
 
 if __name__ == "__main__":
