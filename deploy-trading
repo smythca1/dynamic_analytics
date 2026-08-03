@@ -8,7 +8,7 @@ FLEET_SERVICE="${DEPLOY_FLEET_SERVICE:-trading-fleet-live.service}"
 MISSION_SERVICE="${DEPLOY_MISSION_SERVICE:-mission-control.service}"
 SOURCE_REPOSITORY="${DEPLOY_SOURCE_REPOSITORY:-$(basename "$(pwd)")}"
 CLEAN_SOURCE=""
-WORKTREE_PARENT=""
+SOURCE_PARENT=""
 LOCAL_RELEASE_DIR=""
 
 RUNTIME_FILES=(
@@ -66,7 +66,7 @@ Usage:
   ./deploy-trading --rollback <deployment-id> [--restart-fleet]
 
 Options:
-  --commit <sha>             Git commit to deploy from a clean detached worktree.
+  --commit <sha>             Git commit to deploy from an extracted clean archive.
   --dry-run                  Show planned payload and validation without remote changes.
   --no-restart               Deploy code without restarting services.
   --deploy-config            Replace remote production config from the requested commit.
@@ -193,22 +193,18 @@ sha256_file() {
   fi
 }
 
-create_clean_worktree() {
+create_clean_commit_source() {
   local commit="$1"
-  WORKTREE_PARENT="$(mktemp -d "${TMPDIR:-/tmp}/deploy-trading.XXXXXX")"
-  CLEAN_SOURCE="${WORKTREE_PARENT}/source"
-  git worktree add --detach --quiet "$CLEAN_SOURCE" "$commit"
-  if [[ -n "$(git -C "$CLEAN_SOURCE" status --porcelain)" ]]; then
-    die "temporary commit source is not clean"
-  fi
+  SOURCE_PARENT="$(mktemp -d "${TMPDIR:-/tmp}/deploy-trading.XXXXXX")"
+  CLEAN_SOURCE="${SOURCE_PARENT}/source"
+  mkdir -p "$CLEAN_SOURCE"
+  git archive --format=tar "$commit" | tar -x -f - -C "$CLEAN_SOURCE"
+  [[ -f "${CLEAN_SOURCE}/deploy-trading" ]] || die "commit archive extraction did not produce expected repository files"
 }
 
-cleanup_clean_worktree() {
-  if [[ -n "${CLEAN_SOURCE:-}" && -d "$CLEAN_SOURCE" ]]; then
-    git worktree remove --force "$CLEAN_SOURCE" >/dev/null 2>&1 || true
-  fi
-  if [[ -n "${WORKTREE_PARENT:-}" && -d "$WORKTREE_PARENT" ]]; then
-    rm -rf "$WORKTREE_PARENT"
+cleanup_commit_source() {
+  if [[ -n "${SOURCE_PARENT:-}" && -d "$SOURCE_PARENT" ]]; then
+    rm -rf "$SOURCE_PARENT"
   fi
 }
 
@@ -219,7 +215,7 @@ cleanup_local_resources() {
 }
 
 cleanup_all() {
-  cleanup_clean_worktree
+  cleanup_commit_source
   cleanup_local_resources
 }
 
@@ -324,8 +320,9 @@ dry_run_commit() {
 DRY RUN ONLY - no SSH, SCP, remote filesystem, service, or network changes will be made.
 Requested commit: ${COMMIT_ARG}
 Resolved commit: ${commit}
-Clean source path: ${CLEAN_SOURCE}
-Clean source status: clean
+Source materialization: git archive
+Extracted source path: ${CLEAN_SOURCE}
+Commit source verification: required files present
 Dirty caller worktree: $(if [[ -n "$(git status --porcelain)" ]]; then echo "yes - ignored for payload"; else echo "no"; fi)
 Remote destination: $(remote_target):${REMOTE_DIR}
 Deployment ID: ${deployment_id}
@@ -359,7 +356,7 @@ Validation commands:
   python fleet_runner.py --help
 
 Proof of commit-source isolation:
-  payload source is ${CLEAN_SOURCE}
+  payload source is the extracted clean commit archive at ${CLEAN_SOURCE}
   caller working tree files are not copied
   unstaged local fleet_runner.py/renko_builder.py/config/validated_renko_backtest.cpp changes are excluded unless present in ${commit}
   fleet_runner.py hash above is from the clean commit source, not the caller working tree
@@ -1123,7 +1120,7 @@ main() {
     local full_sha deployment_id
     full_sha="$(resolve_commit "$COMMIT_ARG")"
     trap cleanup_all EXIT
-    create_clean_worktree "$full_sha"
+    create_clean_commit_source "$full_sha"
     require_payload_exists "$CLEAN_SOURCE"
     deployment_id="$(deployment_id_for "$full_sha")"
     validate_deployment_id "$deployment_id"

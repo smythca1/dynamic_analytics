@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -95,6 +96,26 @@ class DeployTradingTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid commit", result.stderr)
 
+    def test_invalid_commit_fails_before_archive_creation(self) -> None:
+        fake_bin = self._fake_git_bin(
+            "printf '%s\\n' \"$*\" >> \"$DEPLOY_TEST_GIT_LOG\"\n"
+            "if [[ \"$1\" == \"rev-parse\" ]]; then exit 44; fi\n"
+        )
+        log = self.root / "git-invalid.log"
+        result = self._run(
+            "--commit",
+            "bad-commit",
+            "--dry-run",
+            check=False,
+            env={
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "DEPLOY_TEST_GIT_LOG": str(log),
+            },
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid commit", result.stderr)
+        self.assertNotIn("archive", log.read_text(encoding="utf-8"))
+
     def test_dirty_working_tree_cannot_affect_payload(self) -> None:
         committed_hash = self._sha256(self.repo / "fleet_runner.py")
         self._write("fleet_runner.py", "event = runtime.execution.execute(intent)\nexecution_status_failed\n")
@@ -103,11 +124,25 @@ class DeployTradingTests(unittest.TestCase):
         self.assertIn(f"fleet_runner.py {committed_hash}", result.stdout)
         self.assertNotIn("execution_status_failed", result.stdout)
 
-    def test_temporary_source_is_clean_and_cleaned_up_on_success(self) -> None:
+    def test_clean_source_extraction_uses_git_archive_and_cleans_up_on_success(self) -> None:
         result = self._run("--commit", self.commit, "--dry-run")
-        self.assertIn("Clean source status: clean", result.stdout)
-        source_path = self._extract_clean_source_path(result.stdout)
+        self.assertIn("Source materialization: git archive", result.stdout)
+        self.assertIn("Commit source verification: required files present", result.stdout)
+        source_path = self._extract_commit_source_path(result.stdout)
         self.assertFalse(source_path.exists())
+
+    def test_archive_source_works_when_git_worktrees_is_not_writable(self) -> None:
+        fake_bin = self._fake_git_bin(
+            "if [[ \"$1\" == \"worktree\" ]]; then exit 44; fi\n"
+        )
+        result = self._run(
+            "--commit",
+            self.commit,
+            "--dry-run",
+            env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Source materialization: git archive", result.stdout)
 
     def test_shared_and_silver_are_included(self) -> None:
         result = self._run("--commit", self.commit, "--dry-run")
@@ -286,30 +321,20 @@ class DeployTradingTests(unittest.TestCase):
         self.assertFalse((fake_bin / "ssh.log").exists())
         self.assertFalse((fake_bin / "scp.log").exists())
 
-    def test_temporary_worktree_cleanup_occurs_on_failure(self) -> None:
+    def test_missing_required_committed_file_fails_locally(self) -> None:
         self._git("rm", "-r", "silver")
         self._git("commit", "-m", "remove silver")
         bad_commit = self._git("rev-parse", "HEAD").stdout.strip()
         result = self._run("--commit", bad_commit, "--dry-run", check=False)
         self.assertNotEqual(result.returncode, 0)
-        worktrees = self._git("worktree", "list").stdout
-        self.assertNotIn("deploy-trading.", worktrees)
+        self.assertIn("required payload path missing from commit source: silver", result.stderr)
 
-    def test_worktree_parent_cleanup_when_worktree_add_fails(self) -> None:
-        fake_bin = self.root / "fake-git-bin"
-        fake_bin.mkdir()
-        git = fake_bin / "git"
-        git.write_text(
-            "#!/usr/bin/env bash\n"
-            "if [[ \"$1\" == \"status\" ]]; then exit 0; fi\n"
+    def test_temporary_archive_source_cleanup_on_archive_failure(self) -> None:
+        fake_bin = self._fake_git_bin(
             "if [[ \"$1\" == \"rev-parse\" ]]; then echo 0123456789abcdef0123456789abcdef01234567; exit 0; fi\n"
-            "if [[ \"$1\" == \"worktree\" && \"$2\" == \"add\" ]]; then exit 44; fi\n"
-            "if [[ \"$1\" == \"worktree\" && \"$2\" == \"remove\" ]]; then exit 0; fi\n"
-            "exec /usr/bin/git \"$@\"\n",
-            encoding="utf-8",
+            "if [[ \"$1\" == \"archive\" ]]; then exit 44; fi\n"
         )
-        git.chmod(git.stat().st_mode | stat.S_IXUSR)
-        tmpdir = self.root / "worktree-tmp"
+        tmpdir = self.root / "archive-tmp"
         tmpdir.mkdir()
         result = self._run(
             "--commit",
@@ -320,6 +345,24 @@ class DeployTradingTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual([], list(tmpdir.glob("deploy-trading.*")))
+
+    def test_no_ssh_or_scp_when_source_extraction_fails(self) -> None:
+        fake_bin = self._fake_bin()
+        self._fake_git_bin(
+            "if [[ \"$1\" == \"rev-parse\" ]]; then echo 0123456789abcdef0123456789abcdef01234567; exit 0; fi\n"
+            "if [[ \"$1\" == \"archive\" ]]; then exit 44; fi\n",
+            root=fake_bin,
+        )
+        result = self._run(
+            "--commit",
+            "abc123",
+            "--no-restart",
+            check=False,
+            env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((fake_bin / "ssh.log").exists())
+        self.assertFalse((fake_bin / "scp.log").exists())
 
     def test_local_temporary_resources_cleanup_after_upload_failure(self) -> None:
         fake_bin = self._fake_bin()
@@ -611,6 +654,14 @@ class DeployTradingTests(unittest.TestCase):
         self.assertIn("committed", deployed_fleet)
         self.assertNotIn("execution_status_should_not_deploy", deployed_fleet)
 
+    def test_extracted_fleet_runner_matches_git_show_for_requested_commit(self) -> None:
+        self._write("fleet_runner.py", "dirty execution_status_should_not_deploy\n")
+        fake_bin = self._fake_bin()
+        self._run("--commit", self.commit, "--no-restart", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+        deployed_fleet = (fake_bin / "scp_payload/fleet_runner.py").read_text(encoding="utf-8")
+        committed_fleet = self._git("show", f"{self.commit}:fleet_runner.py").stdout
+        self.assertEqual(committed_fleet, deployed_fleet)
+
     def test_shell_quoting_handles_paths_and_commit_args_safely(self) -> None:
         result = self._run("--commit", self.commit, "--dry-run", "--remote-dir", "/root/path with space")
         self.assertIn("Remote destination: root@157.230.54.46:/root/path with space", result.stdout)
@@ -647,10 +698,25 @@ class DeployTradingTests(unittest.TestCase):
         block = output.split("Payload includes:", 1)[1].split("Payload excludes:", 1)[0]
         return {line.strip() for line in block.splitlines() if line.strip()}
 
-    def _extract_clean_source_path(self, output: str) -> Path:
-        match = re.search(r"Clean source path: (.+)", output)
+    def _extract_commit_source_path(self, output: str) -> Path:
+        match = re.search(r"Extracted source path: (.+)", output)
         self.assertIsNotNone(match)
         return Path(match.group(1).strip())
+
+    def _fake_git_bin(self, git_prefix_script: str, root: Path | None = None) -> Path:
+        fake_bin = root if root is not None else self.root / f"fake-git-bin-{len(list(self.root.glob('fake-git-bin-*')))}"
+        fake_bin.mkdir(exist_ok=True)
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+        git = fake_bin / "git"
+        git.write_text(
+            "#!/usr/bin/env bash\n"
+            f"{git_prefix_script}"
+            f"exec {shlex.quote(real_git)} \"$@\"\n",
+            encoding="utf-8",
+        )
+        git.chmod(git.stat().st_mode | stat.S_IXUSR)
+        return fake_bin
 
     def _fake_bin(self) -> Path:
         fake_bin = self.root / "fake-bin"
