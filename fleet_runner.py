@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 import ssl
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from datetime import date, timedelta
 
 import certifi
@@ -18,6 +20,14 @@ from dotenv import load_dotenv
 
 from alpaca_trader import load_alpaca_credentials
 from execution_engine import AlpacaExecutionEngine, JsonlEventLog, ShadowExecutionEngine
+from shared.config.trader_config import (
+    as_float,
+    build_strategy_config,
+    normalize_renko_source,
+)
+from silver.evidence import EvidenceLogger
+from silver.evidence.models import EvidenceCheckpoint, UNKNOWN
+from silver.evidence.shadow_sampler import EvidenceShadowSampler, ShadowSamplerSettings
 from strategy_engine import MeanReversionStrategyConfig, MeanReversionStrategyEngine, RenkoStrategyConfig, RenkoStrategyEngine
 from trading_events import MarketTick, OrderIntent, Signal, dataclass_to_jsonable, is_price_forming_trade
 
@@ -48,9 +58,13 @@ class TraderRuntime:
     execution: AlpacaExecutionEngine | ShadowExecutionEngine
     log: JsonlEventLog
     renko_source: str = "ticks"
+    evidence: EvidenceLogger | None = None
+    shadow_sampler: EvidenceShadowSampler | None = None
+    config_hash: str | None = None
 
 
 _PENDING_1S_CLOSE_TICKS: dict[str, tuple[pd.Timestamp, MarketTick]] = {}
+_PRODUCTION_OBSERVATION_SEQUENCES: dict[tuple[str, str], int] = {}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -64,6 +78,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-persist-ticks", action="store_true", help="Disable raw tick archive writes.")
     parser.add_argument("--reconnect-delay", type=float, default=5.0)
     parser.add_argument("--log-ticks", action="store_true")
+    parser.add_argument("--evidence-enabled", action="store_true", help="Enable append-only parity evidence logging.")
+    parser.add_argument("--evidence-output", help="Evidence JSONL output path. Defaults to artifacts/live/evidence/<session>.jsonl.")
+    parser.add_argument("--evidence-session-id", help="Stable evidence session identifier for deterministic process-scope lineage.")
+    parser.add_argument("--evidence-buffer-records", type=int, default=100, help="Maximum bounded evidence buffer size.")
+    parser.add_argument("--evidence-flush-every", type=int, default=1, help="Flush evidence after this many buffered records.")
+    parser.add_argument("--shadow-sampler-enabled", action="store_true", help="Enable canonical sampler shadow evidence. Requires evidence mode.")
     return parser
 
 
@@ -73,22 +93,6 @@ def load_config(path: str | Path) -> dict[str, Any]:
     if not isinstance(config.get("traders"), list):
         raise ValueError("Fleet config must contain a top-level traders array.")
     return config
-
-
-def as_float(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def normalize_renko_source(value: Any) -> str:
-    raw = str(value or "ticks").lower().strip().replace("-", "_")
-    if raw in {"tick", "ticks", "raw_ticks"}:
-        return "ticks"
-    if raw in {"1s", "1s_close", "one_second_close", "second_close"}:
-        return "1s_close"
-    raise ValueError(f"Unsupported renko_source: {value}")
 
 
 def tick_second_bucket(timestamp: pd.Timestamp) -> pd.Timestamp:
@@ -199,6 +203,181 @@ def archive_engine_state(root: Path, runtime: TraderRuntime, reason: str) -> Non
         "engine": runtime.engine.snapshot(),
     }
     write_json_atomic(state_snapshot_path(root, runtime.trader_id), payload)
+    safe_evidence_call(runtime, "state_checkpoint", lambda: record_evidence_checkpoint(runtime, reason=reason, checkpoint_timestamp=payload["saved_at"]))
+
+
+def evidence_enabled(args: argparse.Namespace) -> bool:
+    if bool(getattr(args, "evidence_enabled", False)):
+        return True
+    return str(os.environ.get("FLEET_EVIDENCE_ENABLED", "")).lower() in {"1", "true", "yes", "on"}
+
+
+def shadow_sampler_requested(args: argparse.Namespace) -> bool:
+    if bool(getattr(args, "shadow_sampler_enabled", False)):
+        return True
+    return str(os.environ.get("FLEET_SHADOW_SAMPLER_ENABLED", "")).lower() in {"1", "true", "yes", "on"}
+
+
+def visible_evidence_warning(message: str) -> None:
+    print(f"[evidence] {message}", file=sys.stderr)
+
+
+def build_evidence_logger(args: argparse.Namespace) -> EvidenceLogger:
+    if not evidence_enabled(args):
+        return EvidenceLogger.disabled()
+    from silver.evidence.logger import EvidenceLoggerSettings
+
+    session_id = getattr(args, "evidence_session_id", None) or os.environ.get("FLEET_EVIDENCE_SESSION_ID")
+    output_path = getattr(args, "evidence_output", None) or os.environ.get("FLEET_EVIDENCE_OUTPUT")
+    if not session_id:
+        visible_evidence_warning("evidence disabled: missing explicit FLEET_EVIDENCE_SESSION_ID or --evidence-session-id")
+        return EvidenceLogger.disabled()
+    if not output_path:
+        visible_evidence_warning("evidence disabled: missing explicit FLEET_EVIDENCE_OUTPUT or --evidence-output")
+        return EvidenceLogger.disabled()
+    return EvidenceLogger(
+        EvidenceLoggerSettings(
+            enabled=True,
+            output_path=output_path,
+            session_id=session_id,
+            process_id=os.environ.get("FLEET_EVIDENCE_PROCESS_ID") or str(os.getpid()),
+            max_buffer_records=int(getattr(args, "evidence_buffer_records", 100)),
+            flush_every_records=int(getattr(args, "evidence_flush_every", 1)),
+        )
+    )
+
+
+def build_shadow_sampler(args: argparse.Namespace, evidence_logger: EvidenceLogger) -> EvidenceShadowSampler | None:
+    if not shadow_sampler_requested(args):
+        return None
+    if not evidence_logger.enabled:
+        visible_evidence_warning("shadow sampler disabled: evidence logging is not enabled")
+        return None
+    if not evidence_logger.settings.session_id:
+        visible_evidence_warning("shadow sampler disabled: missing evidence session ID")
+        return None
+    if not evidence_logger.settings.output_path:
+        visible_evidence_warning("shadow sampler disabled: missing evidence output path")
+        return None
+    return EvidenceShadowSampler(
+        ShadowSamplerSettings(
+            enabled=True,
+            session_id=evidence_logger.settings.session_id,
+            process_id=evidence_logger.settings.process_id,
+        )
+    )
+
+
+def production_sampler_checkpoint(runtime: TraderRuntime) -> dict[str, Any]:
+    if runtime.renko_source != "1s_close":
+        return {
+            "production_source_mode": runtime.renko_source,
+            "pending_state": UNKNOWN,
+            "unknown_fields": ["pending_second_bucket", "pending_trade"],
+        }
+    pending = _PENDING_1S_CLOSE_TICKS.get(runtime.trader_id)
+    if pending is None:
+        return {
+            "production_source_mode": runtime.renko_source,
+            "pending_second_bucket": None,
+            "pending_price": None,
+            "pending_sip_timestamp": None,
+            "pending_trade_id": None,
+            "unknown_fields": ["source_record_id"],
+        }
+    pending_bucket, pending_tick = pending
+    return {
+        "production_source_mode": runtime.renko_source,
+        "pending_second_bucket": pending_bucket.isoformat(),
+        "pending_price": pending_tick.price,
+        "pending_sip_timestamp": pending_tick.timestamp.isoformat(),
+        "pending_trade_id": pending_tick.trade_id or None,
+        "unknown_fields": ["source_record_id"],
+    }
+
+
+def safe_evidence_call(runtime: TraderRuntime, operation_name: str, callback: Callable[[], Any]) -> Any:
+    if runtime.evidence is None or not runtime.evidence.enabled:
+        return None
+    try:
+        return callback()
+    except Exception as exc:
+        try:
+            runtime.evidence.record_failure(f"evidence {operation_name} failed; trading continues: {exc}")
+        except Exception as diagnostic_exc:
+            runtime.evidence.safe_visible_diagnostic(f"evidence {operation_name} failed and diagnostic failed; trading continues: {diagnostic_exc}")
+        return None
+
+
+def record_evidence_checkpoint(runtime: TraderRuntime, *, reason: str, checkpoint_timestamp: Any) -> None:
+    if runtime.evidence is None or not runtime.evidence.enabled:
+        return
+    snapshot = runtime.engine.snapshot()
+    renko = snapshot.get("renko") if isinstance(snapshot, dict) else {}
+    trade = snapshot.get("trade") if isinstance(snapshot, dict) else {}
+    position = trade.get("position") if isinstance(trade, dict) else None
+    completeness: list[str] = []
+    if not isinstance(renko, dict):
+        renko = {}
+        completeness.append("renko_state_missing")
+    if position is None:
+        completeness.append("strategy_position_state_missing")
+    completeness.extend(["broker_confirmed_quantity_unknown", "accounting_state_unknown"])
+    production_sampler_state = production_sampler_checkpoint(runtime)
+    shadow_sampler_state = runtime.shadow_sampler.checkpoint(trader_id=runtime.trader_id, symbol=runtime.symbol) if runtime.shadow_sampler else None
+    if shadow_sampler_state is None:
+        completeness.append("shadow_sampler_state_unavailable")
+    checkpoint = EvidenceCheckpoint(
+        checkpoint_timestamp=str(checkpoint_timestamp),
+        trader_id=runtime.trader_id,
+        symbol=runtime.symbol,
+        configuration_hash=runtime.config_hash,
+        renko_anchor_mode=renko.get("anchor_mode"),
+        renko_anchor_price=renko.get("anchor_price"),
+        last_renko_close=renko.get("last_brick_close"),
+        run_direction=renko.get("run_dir"),
+        run_length=renko.get("run_len"),
+        strategy_position_state=position if isinstance(position, dict) else None,
+        broker_confirmed_quantity=UNKNOWN,
+        accounting_quantity=UNKNOWN,
+        accounting_basis_status=UNKNOWN,
+        pending_order_identifiers=[],
+        force_flat_state={"reason": reason, "force_flat_dates": trade.get("force_flat_dates", []) if isinstance(trade, dict) else []},
+        production_sampler_state=production_sampler_state,
+        shadow_sampler_state=shadow_sampler_state,
+        component_versions={
+            "renko": "production.RenkoStrategyEngine",
+            "evidence": "production_parity_evidence.v1",
+        },
+        completeness=completeness,
+        unknown_fields=production_sampler_state.get("unknown_fields", []) + ["broker_confirmed_quantity", "accounting_quantity", "accounting_basis_status"],
+    )
+    safe_evidence_call(runtime, "checkpoint_record", lambda: runtime.evidence.record_checkpoint(checkpoint))
+    safe_evidence_call(
+        runtime,
+        "production_sampler_checkpoint",
+        lambda: runtime.evidence.record_production_sampler_checkpoint(trader_id=runtime.trader_id, symbol=runtime.symbol, checkpoint=production_sampler_state),
+    )
+    if shadow_sampler_state is not None:
+        safe_evidence_call(
+            runtime,
+            "shadow_sampler_checkpoint",
+            lambda: runtime.evidence.record_shadow_sampler_checkpoint(trader_id=runtime.trader_id, symbol=runtime.symbol, checkpoint=shadow_sampler_state),
+        )
+
+
+def evidence_after_direction(signal: Signal) -> str | None:
+    if signal.signal_type == "exit":
+        return "flat"
+    return signal.side
+
+
+def evidence_before_direction(trade_snapshot: dict[str, Any]) -> str:
+    trade = trade_snapshot.get("trade") if isinstance(trade_snapshot, dict) else {}
+    position = trade.get("position") if isinstance(trade, dict) else None
+    if isinstance(position, dict) and position.get("side"):
+        return str(position["side"])
+    return "flat"
 
 
 def restore_engine_state(root: Path, trader_id: str, engine: RenkoStrategyEngine) -> tuple[bool, str | None]:
@@ -518,86 +697,6 @@ def broker_force_flat_if_due(
     return True
 
 
-def build_strategy_config(trader: dict[str, Any]) -> RenkoStrategyConfig | MeanReversionStrategyConfig:
-    strategy = trader.get("strategy") if isinstance(trader.get("strategy"), dict) else {}
-    session = trader.get("session") if isinstance(trader.get("session"), dict) else {}
-    sizing = trader.get("sizing") if isinstance(trader.get("sizing"), dict) else {}
-
-    strategy_type = str(strategy.get("type") or "renko_tp_sl")
-    if strategy_type not in {"renko_tp_sl", "renko_psar", "renko_reversal", "chop_mean_reversion"}:
-        raise ValueError(f"{trader.get('id')}: unsupported strategy type {strategy_type}.")
-
-    qty = as_float(sizing.get("qty"), default=0.0) or None
-    notional = as_float(sizing.get("notional"), default=0.0) or None
-    exit_management = str(strategy.get("exit_management") or "strategy").lower().strip()
-    if exit_management == "oco":
-        if qty is None:
-            raise ValueError(f"{trader.get('id')}: oco exit_management requires whole-share qty sizing.")
-        if abs(qty - round(qty)) > 1e-9:
-            raise ValueError(
-                f"{trader.get('id')}: Alpaca OCO does not support fractional qty sizing ({qty:g})."
-            )
-    if strategy_type == "chop_mean_reversion":
-        return MeanReversionStrategyConfig(
-            trader_id=str(trader["id"]),
-            symbol=str(trader["symbol"]).upper(),
-            window_seconds=int(strategy["window_seconds"]),
-            entry_z=float(strategy["entry_z"]),
-            exit_z=float(strategy.get("exit_z", 0.10)),
-            stop_z=float(strategy["stop_z"]),
-            efficiency_max=float(strategy["efficiency_max"]),
-            trend_exit_efficiency=float(strategy["trend_exit_efficiency"]),
-            max_hold_seconds=int(strategy["max_hold_seconds"]),
-            allow_short=bool(strategy.get("allow_short", True)),
-            strategy_name=str(trader.get("strategy_name") or trader["id"]),
-            order_type=str(strategy.get("order_type") or "market").lower().strip(),
-            qty=qty,
-            notional=notional,
-            timezone=str(session.get("timezone") or "America/New_York"),
-            entry_start=session.get("entry_start"),
-            entry_end=session.get("entry_end"),
-            force_flat=session.get("force_flat"),
-            active_start_date=session.get("active_start_date"),
-            active_end_date=session.get("active_end_date"),
-            allow_overnight=bool(session.get("allow_overnight", False)),
-        )
-    return RenkoStrategyConfig(
-        trader_id=str(trader["id"]),
-        symbol=str(trader["symbol"]).upper(),
-        strategy_type=strategy_type,  # type: ignore[arg-type]
-        brick_size=float(strategy["brick_size"]),
-        entry_bricks=int(strategy["entry_bricks"]),
-        take_profit_bricks=int(strategy["take_profit_bricks"]) if strategy.get("take_profit_bricks") else None,
-        stop_loss_bricks=int(strategy["stop_loss_bricks"]) if strategy.get("stop_loss_bricks") else None,
-        psar_initial_stop_bricks=int(strategy["psar_initial_stop_bricks"])
-        if strategy.get("psar_initial_stop_bricks")
-        else None,
-        psar_af_step=float(strategy["psar_af_step"]) if strategy.get("psar_af_step") else None,
-        psar_af_max=float(strategy["psar_af_max"]) if strategy.get("psar_af_max") else None,
-        allow_short=bool(strategy.get("allow_short", True)),
-        strategy_name=str(trader.get("strategy_name") or trader["id"]),
-        order_type=str(strategy.get("order_type") or "market").lower().strip(),
-        exit_management=exit_management,
-        stop_loss_order_type=str(strategy.get("stop_loss_order_type") or "stop_market").lower().strip(),
-        stop_limit_offset_pct=float(strategy.get("stop_limit_offset_pct") or 0.0),
-        qty=qty,
-        notional=notional,
-        renko_anchor_mode=str(strategy.get("renko_anchor_mode") or strategy.get("anchor_mode") or "first_price"),
-        renko_anchor_price=float(strategy["renko_anchor_price"])
-        if strategy.get("renko_anchor_price") is not None
-        else float(strategy["anchor_price"])
-        if strategy.get("anchor_price") is not None
-        else None,
-        timezone=str(session.get("timezone") or "America/New_York"),
-        entry_start=session.get("entry_start"),
-        entry_end=session.get("entry_end"),
-        force_flat=session.get("force_flat"),
-        active_start_date=session.get("active_start_date"),
-        active_end_date=session.get("active_end_date"),
-        allow_overnight=bool(session.get("allow_overnight", False)),
-    )
-
-
 def behavior_profile_block_reason(trader: dict[str, Any]) -> str | None:
     profile = trader.get("profile") if isinstance(trader.get("profile"), dict) else {}
     risk = trader.get("risk") if isinstance(trader.get("risk"), dict) else {}
@@ -617,6 +716,8 @@ def behavior_profile_block_reason(trader: dict[str, Any]) -> str | None:
 
 def build_runtimes(config: dict[str, Any], args: argparse.Namespace) -> list[TraderRuntime]:
     runtimes: list[TraderRuntime] = []
+    evidence_logger = build_evidence_logger(args)
+    shadow_sampler = build_shadow_sampler(args, evidence_logger)
     for trader in config["traders"]:
         if not isinstance(trader, dict):
             continue
@@ -682,6 +783,8 @@ def build_runtimes(config: dict[str, Any], args: argparse.Namespace) -> list[Tra
             engine=engine,
             execution=execution,
             log=log,
+            evidence=evidence_logger,
+            shadow_sampler=shadow_sampler,
         )
         runtime.log.write(
             "trader_configured",
@@ -702,6 +805,20 @@ def build_runtimes(config: dict[str, Any], args: argparse.Namespace) -> list[Tra
                 "state_path": restored_path,
             },
         )
+        if runtime.evidence is not None and runtime.evidence.enabled:
+            safe_evidence_call(
+                runtime,
+                "runtime_summary",
+                lambda: runtime.evidence.record_runtime_summary(
+                    trader_id=runtime.trader_id,
+                    symbol=runtime.symbol,
+                    summary={
+                        "evidence_enabled": True,
+                        "shadow_sampler_enabled": runtime.shadow_sampler is not None and runtime.shadow_sampler.enabled,
+                        "production_source_mode": runtime.renko_source,
+                    },
+                ),
+            )
         if behavior_block_reason:
             runtime.log.write(
                 "behavior_profile_block",
@@ -721,6 +838,61 @@ def build_runtimes(config: dict[str, Any], args: argparse.Namespace) -> list[Tra
         reconcile_engine_with_broker(archive_root(args), runtime)
         runtimes.append(runtime)
     return runtimes
+
+
+def next_production_observation_sequence(runtime: TraderRuntime) -> int:
+    key = (runtime.trader_id, runtime.symbol)
+    sequence = _PRODUCTION_OBSERVATION_SEQUENCES.get(key, 0) + 1
+    _PRODUCTION_OBSERVATION_SEQUENCES[key] = sequence
+    return sequence
+
+
+def record_shadow_for_eligible_tick(runtime: TraderRuntime, tick: MarketTick) -> None:
+    if runtime.evidence is None or not runtime.evidence.enabled or runtime.shadow_sampler is None:
+        return
+    try:
+        result = runtime.shadow_sampler.process_tick(trader_id=runtime.trader_id, tick=tick)
+        for observation in result.observations:
+            runtime.evidence.record_shadow_observation(
+                trader_id=runtime.trader_id,
+                symbol=runtime.symbol,
+                sequence=int(observation["sequence"]),
+                observation_bucket_timestamp=observation["observation_bucket_timestamp"],
+                close_price=observation["close_price"],
+                source_record_id=observation.get("source_record_id"),
+                broker_trade_id=observation.get("broker_trade_id"),
+                source_trade_timestamp=observation.get("source_trade_timestamp"),
+                triggering_source_record_id=observation.get("triggering_source_record_id"),
+                triggering_trade_timestamp=observation.get("triggering_trade_timestamp"),
+            )
+        for diagnostic in result.diagnostics:
+            runtime.evidence.record_shadow_sampler_diagnostic(
+                trader_id=runtime.trader_id,
+                symbol=runtime.symbol,
+                diagnostic_type=str(diagnostic.get("diagnostic_type")),
+                message=str(diagnostic.get("message")),
+                source_record_id=diagnostic.get("source_record_id"),
+            )
+    except Exception as exc:
+        if runtime.shadow_sampler is not None:
+            runtime.shadow_sampler.counters.failures += 1
+        object.__setattr__(runtime, "shadow_sampler", None)
+        runtime.evidence.safe_visible_diagnostic(f"shadow sampler disabled after failure for {runtime.trader_id}/{runtime.symbol}: {exc}")
+
+
+def flush_evidence(runtimes: list[TraderRuntime]) -> None:
+    seen: set[int] = set()
+    for runtime in runtimes:
+        if runtime.evidence is None:
+            continue
+        marker = id(runtime.evidence)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        try:
+            runtime.evidence.flush()
+        except Exception as exc:
+            runtime.evidence.record_failure(f"evidence flush failed; trading continues: {exc}")
 
 
 def group_runtimes(runtimes: list[TraderRuntime]) -> dict[tuple[str, str], list[TraderRuntime]]:
@@ -887,6 +1059,7 @@ async def run_market_stream(
                         if not is_price_forming_trade(tick):
                             continue
                         for runtime in by_symbol.get(tick.symbol, []):
+                            record_shadow_for_eligible_tick(runtime, tick)
                             if args.log_ticks:
                                 payload = dataclass_to_jsonable(tick)
                                 payload["trader_id"] = runtime.trader_id
@@ -906,13 +1079,77 @@ async def run_market_stream(
                                 continue
 
                             for source_tick in source_ticks:
+                                if runtime.evidence is not None and runtime.evidence.enabled:
+                                    production_sequence = next_production_observation_sequence(runtime)
+                                    safe_evidence_call(
+                                        runtime,
+                                        "production_observation",
+                                        lambda: runtime.evidence.record_production_observation(
+                                            trader_id=runtime.trader_id,
+                                            symbol=runtime.symbol,
+                                            sequence=production_sequence,
+                                            observation_bucket_timestamp=source_tick.timestamp,
+                                            close_price=source_tick.price,
+                                            production_source_mode=runtime.renko_source,
+                                        ),
+                                    )
+                                    safe_evidence_call(
+                                        runtime,
+                                        "observation",
+                                        lambda: runtime.evidence.record_observation(
+                                            trader_id=runtime.trader_id,
+                                            symbol=runtime.symbol,
+                                            observation_bucket_timestamp=source_tick.timestamp,
+                                            close_price=source_tick.price,
+                                            source_trade_identity=source_tick.trade_id or None,
+                                            source_trade_timestamp=source_tick.timestamp if runtime.renko_source == "ticks" else UNKNOWN,
+                                            triggering_trade_identity=tick.trade_id or None,
+                                            triggering_trade_timestamp=tick.timestamp,
+                                        ),
+                                    )
                                 trade_snapshot = runtime.engine.trade_state_snapshot()
                                 renko_bricks, actions = runtime.engine.on_tick(source_tick)
                                 for brick in renko_bricks:
+                                    if runtime.evidence is not None and runtime.evidence.enabled:
+                                        safe_evidence_call(
+                                            runtime,
+                                            "renko_brick",
+                                            lambda: runtime.evidence.record_renko_brick(
+                                                trader_id=runtime.trader_id,
+                                                symbol=runtime.symbol,
+                                                brick=brick,
+                                                source_observation_bucket_timestamp=source_tick.timestamp,
+                                            ),
+                                        )
                                     brick_payload = dataclass_to_jsonable(brick)
                                     runtime.log.write("renko_brick", brick_payload)
                                     archive_renko_brick(root, runtime, brick_payload)
                                 for signal, intent in actions:
+                                    if runtime.evidence is not None and runtime.evidence.enabled:
+                                        source_brick_timestamp = renko_bricks[-1].timestamp if renko_bricks else UNKNOWN
+                                        signal_sequence = safe_evidence_call(
+                                            runtime,
+                                            "strategy_signal",
+                                            lambda: runtime.evidence.record_signal(
+                                                trader_id=runtime.trader_id,
+                                                symbol=runtime.symbol,
+                                                signal=signal,
+                                                intent=intent,
+                                                source_brick_timestamp=source_brick_timestamp,
+                                            ),
+                                        )
+                                        safe_evidence_call(
+                                            runtime,
+                                            "position_direction",
+                                            lambda: runtime.evidence.record_position_direction(
+                                                trader_id=runtime.trader_id,
+                                                symbol=runtime.symbol,
+                                                logical_transition_timestamp=signal.timestamp,
+                                                before_direction=evidence_before_direction(trade_snapshot),
+                                                after_direction=evidence_after_direction(signal),
+                                                triggering_signal_sequence=signal_sequence,
+                                            ),
+                                        )
                                     if not handle_action(runtime, signal, intent):
                                         runtime.engine.restore_trade_state(trade_snapshot)
                                         reconcile_engine_with_broker(root, runtime)
@@ -922,6 +1159,7 @@ async def run_market_stream(
                                 else:
                                     archive_engine_state(root, runtime, reason=runtime.renko_source)
         except asyncio.CancelledError:
+            flush_evidence(runtimes)
             raise
         except Exception as exc:
             for runtime in runtimes:
