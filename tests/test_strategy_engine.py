@@ -14,8 +14,10 @@ from fleet_runner import (
     broker_force_flat_if_due,
     build_strategy_config,
     group_runtimes,
+    migrate_renko_brick_change_state,
     renko_source_ticks,
     reconcile_engine_with_broker,
+    should_block_for_risk,
 )
 from execution_engine import AlpacaExecutionEngine
 from scripts.live_signal_parity import iter_source_ticks
@@ -26,7 +28,7 @@ from strategy_engine import (
     RenkoStrategyConfig,
     RenkoStrategyEngine,
 )
-from trading_events import MarketTick, PositionState, is_price_forming_trade
+from trading_events import MarketTick, OrderIntent, PositionState, Signal, is_price_forming_trade
 
 
 class MemoryLog:
@@ -56,6 +58,25 @@ class FakePositionTrader:
         }
 
 
+class FakeMigrationTrader:
+    def __init__(self, position=None, latest_price=None, latest_error=None):
+        self.position = position
+        self.latest_price = latest_price
+        self.latest_error = latest_error
+        self.orders = []
+        self.fills = []
+
+    def _get_position(self, symbol):
+        return self.position
+
+    def get_latest_trade_price(self, symbol, feed=None):
+        if self.latest_error is not None:
+            raise self.latest_error
+        if self.latest_price is None:
+            raise RuntimeError("missing latest price")
+        return self.latest_price, "2026-08-05T14:00:00Z"
+
+
 def live_config_trader(trader_id: str) -> dict:
     config = json.loads(Path("configs/traders.live.example.json").read_text(encoding="utf-8"))
     return next(trader for trader in config["traders"] if trader["id"] == trader_id)
@@ -65,6 +86,79 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
     def setUp(self):
         _BROKER_FORCE_FLAT_DATES.clear()
         _PENDING_1S_CLOSE_TICKS.clear()
+
+    def migration_runtime(
+        self,
+        *,
+        symbol="AAPL",
+        target_qty=8,
+        new_brick=2.161965,
+        position=None,
+        latest_price=None,
+        latest_error=None,
+    ):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id=f"camatron_{symbol.lower()}_migration_test",
+                symbol=symbol,
+                strategy_type="renko_reversal",
+                brick_size=new_brick,
+                entry_bricks=1,
+                qty=target_qty,
+                renko_anchor_mode="grid",
+                renko_anchor_price=0.0,
+                allow_overnight=True,
+            )
+        )
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader = FakeMigrationTrader(position=position, latest_price=latest_price, latest_error=latest_error)
+        execution.log = None
+        return TraderRuntime(
+            trader_id=engine.config.trader_id,
+            symbol=symbol,
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=3500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=MemoryLog(),
+            config_hash=f"new-{symbol.lower()}",
+        )
+
+    def incompatible_state_payload(self, *, symbol="AAPL", old_brick=1.3443, position_qty=1):
+        return {
+            "configuration_hash": f"old-{symbol.lower()}",
+            "configured_quantity": position_qty,
+            "engine": {
+                "trader_id": f"camatron_{symbol.lower()}_migration_test",
+                "symbol": symbol,
+                "strategy_type": "renko_reversal",
+                "strategy_name": f"{symbol.lower()}_test",
+                "renko": {
+                    "brick_size": old_brick,
+                    "last_brick_close": 100,
+                    "run_dir": 1,
+                    "run_len": 1,
+                    "processed_bricks": 1,
+                    "anchor_mode": "grid",
+                    "anchor_price": 0.0,
+                },
+                "trade": {
+                    "position": {
+                        "symbol": symbol,
+                        "side": "long",
+                        "entry_time": "2026-08-04T14:00:00Z",
+                        "entry_price": 100,
+                        "qty": position_qty,
+                    },
+                    "force_flat_dates": [],
+                },
+            },
+        }
 
     def test_one_second_renko_source_emits_completed_second_close(self):
         runtime = TraderRuntime(
@@ -300,16 +394,40 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
         self.assertTrue(trader["enabled"])
         self.assertTrue(trader["execution_enabled"])
         self.assertEqual(trader["symbol"], "AAPL")
-        self.assertEqual(trader["sizing"]["qty"], 1)
+        self.assertEqual(trader["sizing"]["qty"], 8)
+        self.assertEqual(trader["risk"]["max_position_notional"], 3500)
         self.assertTrue(trader["session"]["allow_overnight"])
 
         config = build_strategy_config(trader)
 
         self.assertEqual(config.strategy_type, "renko_reversal")
         self.assertEqual(config.symbol, "AAPL")
-        self.assertEqual(config.brick_size, 1.3443)
+        self.assertEqual(config.brick_size, 2.161965)
         self.assertEqual(config.entry_bricks, 1)
-        self.assertEqual(config.qty, 1)
+        self.assertEqual(config.qty, 8)
+        self.assertEqual(config.take_profit_bricks, None)
+        self.assertEqual(config.stop_loss_bricks, None)
+        self.assertTrue(config.allow_overnight)
+
+    def test_live_config_nvda_reversal_is_enabled_and_parseable(self):
+        trader = live_config_trader("camatron_nvda_1s_renko_1p149851_e1_reversal_1sh_20260701_live")
+
+        self.assertTrue(trader["enabled"])
+        self.assertTrue(trader["execution_enabled"])
+        self.assertEqual(trader["symbol"], "NVDA")
+        self.assertEqual(trader["sizing"]["qty"], 11)
+        self.assertEqual(trader["risk"]["max_position_notional"], 3500)
+        self.assertTrue(trader["session"]["allow_overnight"])
+
+        config = build_strategy_config(trader)
+
+        self.assertEqual(config.strategy_type, "renko_reversal")
+        self.assertEqual(config.symbol, "NVDA")
+        self.assertEqual(config.brick_size, 0.8841015)
+        self.assertEqual(config.entry_bricks, 1)
+        self.assertEqual(config.qty, 11)
+        self.assertEqual(config.take_profit_bricks, None)
+        self.assertEqual(config.stop_loss_bricks, None)
         self.assertTrue(config.allow_overnight)
 
     def test_live_config_tsla_reversal_is_enabled_and_parseable(self):
@@ -318,16 +436,19 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
         self.assertTrue(trader["enabled"])
         self.assertTrue(trader["execution_enabled"])
         self.assertEqual(trader["symbol"], "TSLA")
-        self.assertEqual(trader["sizing"]["qty"], 1)
+        self.assertEqual(trader["sizing"]["qty"], 7)
+        self.assertEqual(trader["risk"]["max_position_notional"], 3500)
         self.assertTrue(trader["session"]["allow_overnight"])
 
         config = build_strategy_config(trader)
 
         self.assertEqual(config.strategy_type, "renko_reversal")
         self.assertEqual(config.symbol, "TSLA")
-        self.assertEqual(config.brick_size, 2.31165)
+        self.assertEqual(config.brick_size, 1.62183)
         self.assertEqual(config.entry_bricks, 1)
-        self.assertEqual(config.qty, 1)
+        self.assertEqual(config.qty, 7)
+        self.assertEqual(config.take_profit_bricks, None)
+        self.assertEqual(config.stop_loss_bricks, None)
         self.assertTrue(config.allow_overnight)
 
     def test_renko_reversal_emits_one_share_reversal_intent(self):
@@ -445,6 +566,244 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
         )
 
         self.assertEqual(actions, [])
+
+    def test_brick_size_migration_rejects_old_renko_state_and_preserves_broker_position(self):
+        broker_position = {
+            "symbol": "AAPL",
+            "side": "long",
+            "qty": "1",
+            "qty_available": "1",
+            "avg_entry_price": "305.00",
+            "current_price": "311.34",
+        }
+        runtime = self.migration_runtime(position=broker_position)
+        payload = self.incompatible_state_payload()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state" / f"{runtime.trader_id}.json"
+            evidence_path = migrate_renko_brick_change_state(
+                Path(temp_dir),
+                runtime,
+                state_payload=payload,
+                state_snapshot=payload["engine"],
+                state_path=state_path,
+                restore_error="Snapshot brick_size does not match strategy config.",
+            )
+
+            evidence = json.loads(Path(evidence_path).read_text(encoding="utf-8"))
+
+        self.assertEqual(evidence["policy"], "RESET_RENKO_ON_BRICK_CHANGE_PRESERVE_POSITION_V1")
+        self.assertEqual(evidence["previous_brick_size"], 1.3443)
+        self.assertEqual(evidence["new_brick_size"], 2.161965)
+        self.assertEqual(evidence["previous_configured_quantity"], 1)
+        self.assertEqual(evidence["new_configured_quantity"], 8)
+        self.assertTrue(Path(evidence["rejected_renko_state_identifier"]).name.startswith(runtime.trader_id))
+        self.assertEqual(runtime.engine.renko_state.bricks, [])
+        self.assertEqual(runtime.engine.processed_bricks, 0)
+        self.assertEqual(runtime.engine.renko_state.run_dir, 0)
+        self.assertEqual(runtime.engine.renko_state.run_len, 0)
+        self.assertEqual(runtime.engine.trade_state_snapshot()["position"]["side"], "long")
+        self.assertEqual(runtime.engine.trade_state_snapshot()["position"]["qty"], 1.0)
+        self.assertEqual(runtime.execution.trader.orders, [])
+        self.assertEqual(runtime.execution.trader.fills, [])
+
+    def test_migration_requires_fresh_movement_after_bootstrap(self):
+        broker_position = {
+            "symbol": "AAPL",
+            "side": "long",
+            "qty": "1",
+            "avg_entry_price": "305.00",
+            "current_price": "100.00",
+        }
+        runtime = self.migration_runtime(position=broker_position, new_brick=2.0)
+        payload = self.incompatible_state_payload(old_brick=1.0)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            migrate_renko_brick_change_state(
+                Path(temp_dir),
+                runtime,
+                state_payload=payload,
+                state_snapshot=payload["engine"],
+                state_path=Path(temp_dir) / "state.json",
+                restore_error="Snapshot brick_size does not match strategy config.",
+            )
+
+        bricks, actions = runtime.engine.on_tick(MarketTick(pd.Timestamp("2026-08-05T14:00:01Z"), "AAPL", 101.0, 1))
+        self.assertEqual(bricks, [])
+        self.assertEqual(actions, [])
+
+        bricks, actions = runtime.engine.on_tick(MarketTick(pd.Timestamp("2026-08-05T14:00:02Z"), "AAPL", 102.0, 1))
+        self.assertEqual(len(bricks), 1)
+        self.assertEqual(actions, [])
+        self.assertEqual(runtime.engine.trade_state_snapshot()["position"]["qty"], 1.0)
+
+    def test_missing_bootstrap_price_fails_without_order_or_resize(self):
+        runtime = self.migration_runtime(position=None, latest_error=RuntimeError("no trade"))
+        payload = self.incompatible_state_payload()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(RuntimeError, "no trade"):
+                migrate_renko_brick_change_state(
+                    Path(temp_dir),
+                    runtime,
+                    state_payload=payload,
+                    state_snapshot=payload["engine"],
+                    state_path=Path(temp_dir) / "state.json",
+                    restore_error="Snapshot brick_size does not match strategy config.",
+                )
+
+        self.assertIsNone(runtime.engine.trade_state_snapshot()["position"])
+        self.assertEqual(runtime.execution.trader.orders, [])
+        self.assertEqual(runtime.execution.trader.fills, [])
+
+    def test_same_side_e1_signal_while_positioned_does_not_pyramid(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_aapl_same_side_test",
+                symbol="AAPL",
+                strategy_type="renko_reversal",
+                brick_size=2.161965,
+                entry_bricks=1,
+                qty=8,
+                allow_overnight=True,
+            )
+        )
+        engine.position = PositionState("AAPL", "long", pd.Timestamp("2026-08-05T14:00:00Z"), 311.34, 1)
+
+        actions = engine._on_brick_reversal(
+            {
+                "timestamp": pd.Timestamp("2026-08-05T14:01:00Z"),
+                "brick_close": 313.50,
+                "direction": 1,
+                "run_len": 1,
+            }
+        )
+
+        self.assertEqual(actions, [])
+        self.assertEqual(engine.trade_state_snapshot()["position"]["qty"], 1)
+
+    def test_approved_first_reversal_quantities_and_resulting_positions(self):
+        cases = [
+            ("AAPL", 8, 2.161965, 9, 16),
+            ("NVDA", 11, 0.8841015, 12, 22),
+            ("TSLA", 7, 1.62183, 8, 14),
+        ]
+        for symbol, target_qty, brick, first_sell_qty, buy_back_qty in cases:
+            with self.subTest(symbol=symbol):
+                engine = RenkoStrategyEngine(
+                    RenkoStrategyConfig(
+                        trader_id=f"camatron_{symbol.lower()}_reversal_test",
+                        symbol=symbol,
+                        strategy_type="renko_reversal",
+                        brick_size=brick,
+                        entry_bricks=1,
+                        qty=target_qty,
+                        allow_overnight=True,
+                    )
+                )
+                engine.position = PositionState(symbol, "long", pd.Timestamp("2026-08-05T14:00:00Z"), 100, 1)
+                actions = engine._on_brick_reversal(
+                    {
+                        "timestamp": pd.Timestamp("2026-08-05T14:01:00Z"),
+                        "brick_close": 100 - brick,
+                        "direction": -1,
+                        "run_len": 1,
+                    }
+                )
+                self.assertEqual(len(actions), 1)
+                signal, intent = actions[0]
+                self.assertEqual(signal.side, "short")
+                self.assertEqual(intent.side, "sell")
+                self.assertEqual(intent.qty, first_sell_qty)
+                self.assertEqual(intent.target_qty, target_qty)
+                self.assertEqual(engine.trade_state_snapshot()["position"]["side"], "short")
+                self.assertEqual(engine.trade_state_snapshot()["position"]["qty"], target_qty)
+
+                actions = engine._on_brick_reversal(
+                    {
+                        "timestamp": pd.Timestamp("2026-08-05T14:02:00Z"),
+                        "brick_close": 100,
+                        "direction": 1,
+                        "run_len": 1,
+                    }
+                )
+                self.assertEqual(len(actions), 1)
+                signal, intent = actions[0]
+                self.assertEqual(signal.side, "long")
+                self.assertEqual(intent.side, "buy")
+                self.assertEqual(intent.qty, buy_back_qty)
+                self.assertEqual(intent.target_qty, target_qty)
+                self.assertEqual(engine.trade_state_snapshot()["position"]["side"], "long")
+                self.assertEqual(engine.trade_state_snapshot()["position"]["qty"], target_qty)
+
+    def test_old_risk_caps_reject_and_updated_caps_allow_approved_quantities(self):
+        signal = Signal(
+            signal_id="risk-aapl",
+            signal_type="entry",
+            timestamp=pd.Timestamp("2026-08-05T14:00:00Z"),
+            symbol="AAPL",
+            side="long",
+            broker_side="buy",
+            price=311.34,
+            reason="long_entry_e1",
+            strategy="risk",
+            trader_id="risk",
+        )
+        target_intent = OrderIntent(
+            client_order_id="risk-target",
+            timestamp=signal.timestamp,
+            symbol="AAPL",
+            side="buy",
+            signal_type="entry",
+            order_type="market",
+            strategy="risk",
+            reason="long_entry_e1",
+            qty=8,
+            trader_id="risk",
+        )
+        reversal_intent = OrderIntent(
+            client_order_id="risk-reversal",
+            timestamp=signal.timestamp,
+            symbol="AAPL",
+            side="sell",
+            signal_type="entry",
+            order_type="market",
+            strategy="risk",
+            reason="short_entry_e1_reversal",
+            qty=9,
+            target_qty=8,
+            trader_id="risk",
+        )
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="risk",
+                symbol="AAPL",
+                strategy_type="renko_reversal",
+                brick_size=2.161965,
+                entry_bricks=1,
+                qty=8,
+            )
+        )
+        runtime_old = TraderRuntime(
+            trader_id="risk",
+            symbol="AAPL",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=False,
+            max_position_notional=1000,
+            max_daily_loss=0,
+            engine=engine,
+            execution=object(),
+            log=MemoryLog(),
+        )
+        runtime_new = TraderRuntime(**{**runtime_old.__dict__, "max_position_notional": 3500})
+
+        self.assertEqual(should_block_for_risk(runtime_old, signal, target_intent), "entry_notional_exceeds_limit_1000")
+        self.assertEqual(should_block_for_risk(runtime_old, signal, reversal_intent), "entry_notional_exceeds_limit_1000")
+        self.assertIsNone(should_block_for_risk(runtime_new, signal, target_intent))
+        self.assertIsNone(should_block_for_risk(runtime_new, signal, reversal_intent))
 
     def test_fleet_strategy_config_reads_order_type(self):
         config = build_strategy_config(

@@ -17,7 +17,7 @@
         "selection_note": "User-requested Camatron live deployment of AAPL 1S Renko E1 reversal strategy using best isolated June 2026 brick size.",
         "renko_logic": "1s_close_tradingview_style_reversal",
         "strategy_logic": "pure_e1_reversal_hold_overnight",
-        "brick_size": 1.3443,
+        "brick_size": 2.161965,
         "renko_brick_pct": 0.465,
         "ltp_reference": 289.09,
         "entry_bricks": 1,
@@ -30,7 +30,7 @@
         "backtest_max_drawdown_pct": 5.36,
         "backtest_win_rate_pct": 37.1,
         "backtest_profit_factor": 2.43,
-        "live_qty": 1
+        "live_qty": 8
       },
       "data": {
         "feed": "sip",
@@ -38,7 +38,7 @@
       },
       "strategy": {
         "type": "renko_reversal",
-        "brick_size": 1.3443,
+        "brick_size": 2.161965,
         "renko_anchor_mode": "grid",
         "renko_anchor_price": 0.0,
         "entry_bricks": 1,
@@ -57,11 +57,11 @@
       },
       "sizing": {
         "type": "qty",
-        "qty": 1
+        "qty": 8
       },
       "risk": {
         "max_daily_loss": 250,
-        "max_position_notional": 1000
+        "max_position_notional": 3500
       },
       "warm_start": {
         "enabled": false,
@@ -84,7 +84,7 @@
         "selection_note": "User-requested Camatron live deployment of NVDA 1S Renko E1 reversal strategy using the best neighbor-stable June 2026 brick size.",
         "renko_logic": "1s_close_tradingview_style_reversal",
         "strategy_logic": "pure_e1_reversal_hold_overnight",
-        "brick_size": 1.149851,
+        "brick_size": 0.8841015,
         "renko_brick_pct": 0.59,
         "ltp_reference": 194.89,
         "entry_bricks": 1,
@@ -99,7 +99,7 @@
         "backtest_profit_factor": 1.50,
         "backtest_neighbor_avg_return_pct": 15.79,
         "backtest_neighbor_profitability_pct": 100.0,
-        "live_qty": 1
+        "live_qty": 11
       },
       "data": {
         "feed": "sip",
@@ -107,7 +107,7 @@
       },
       "strategy": {
         "type": "renko_reversal",
-        "brick_size": 1.149851,
+        "brick_size": 0.8841015,
         "renko_anchor_mode": "grid",
         "renko_anchor_price": 0.0,
         "entry_bricks": 1,
@@ -126,11 +126,11 @@
       },
       "sizing": {
         "type": "qty",
-        "qty": 1
+        "qty": 11
       },
       "risk": {
         "max_daily_loss": 250,
-        "max_position_notional": 1000
+        "max_position_notional": 3500
       },
       "warm_start": {
         "enabled": false,
@@ -153,7 +153,7 @@
         "selection_note": "User-requested Camatron live deployment of TSLA 1S Renko E1 reversal strategy using a June top candidate that validated positively on July 1-9.",
         "renko_logic": "1s_close_tradingview_style_reversal",
         "strategy_logic": "pure_e1_reversal_hold_overnight",
-        "brick_size": 2.31165,
+        "brick_size": 1.62183,
         "renko_brick_pct": 0.55,
         "ltp_reference": 420.3,
         "entry_bricks": 1,
@@ -177,7 +177,7 @@
         "validation_max_drawdown_pct": 4.35,
         "validation_win_rate_pct": 37.5,
         "validation_profit_factor": 2.02,
-        "live_qty": 1
+        "live_qty": 7
       },
       "data": {
         "feed": "sip",
@@ -185,7 +185,7 @@
       },
       "strategy": {
         "type": "renko_reversal",
-        "brick_size": 2.31165,
+        "brick_size": 1.62183,
         "renko_anchor_mode": "grid",
         "renko_anchor_price": 0.0,
         "entry_bricks": 1,
@@ -204,11 +204,11 @@
       },
       "sizing": {
         "type": "qty",
-        "qty": 1
+        "qty": 7
       },
       "risk": {
         "max_daily_loss": 250,
-        "max_position_notional": 1000
+        "max_position_notional": 3500
       },
       "warm_start": {
         "enabled": false,

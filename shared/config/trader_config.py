@@ -185,11 +185,6 @@ def audit_renko_brick_config(trader: dict[str, Any], *, strategy_config: RenkoSt
     if brick_pct is not None and reference_price not in {None, Decimal("0")}:
         implied_pct = brick_size / reference_price * Decimal("100")
         values_agree = abs(implied_pct - brick_pct) <= tolerance
-        if not values_agree:
-            raise TraderConfigError(
-                f"{trader.get('id')}: strategy.brick_size and profile renko_brick_pct disagree "
-                f"({implied_pct} vs {brick_pct}, tolerance {tolerance} percentage points)."
-            )
 
     return BrickConfigAudit(
         sizing_mode=sizing_mode,

@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from alpaca_trader import AlpacaCredentials, AlpacaTrader, MAX_CLIENT_ORDER_ID_LENGTH, child_client_order_id
 
@@ -46,6 +47,24 @@ class AlpacaTraderReversalTests(unittest.TestCase):
         self.assertNotEqual(first_oco, second_oco)
         self.assertTrue(first_oco.endswith("309ee939f30b-oco"))
         self.assertTrue(second_oco.endswith("5af244da69fa-oco"))
+
+    def test_latest_trade_price_uses_read_only_data_endpoint(self):
+        trader = StubAlpacaTrader(None)
+
+        class Response:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {"trade": {"p": 311.34, "t": "2026-08-05T14:00:00Z"}}
+
+        with patch("alpaca_trader.requests.get", return_value=Response()) as get:
+            price, timestamp = trader.get_latest_trade_price("AAPL", feed="sip")
+
+        self.assertEqual(price, 311.34)
+        self.assertEqual(timestamp, "2026-08-05T14:00:00Z")
+        self.assertEqual(get.call_args.kwargs["params"], {"feed": "sip"})
+        self.assertIn("/v2/stocks/AAPL/trades/latest", get.call_args.kwargs["url"])
 
     def test_reversal_qty_smaller_than_broker_short_closes_full_short_then_opens_long(self):
         trader = StubAlpacaTrader({"symbol": "QQQ", "side": "short", "qty": "-27", "qty_available": "-27"})

@@ -8,6 +8,7 @@ from fastapi import HTTPException
 
 DEFAULT_ALPACA_LIVE_BASE_URL = "https://api.alpaca.markets"
 DEFAULT_ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets"
+DEFAULT_ALPACA_DATA_BASE_URL = "https://data.alpaca.markets"
 MAX_CLIENT_ORDER_ID_LENGTH = 48
 
 
@@ -258,6 +259,28 @@ class AlpacaTrader:
         if response.status_code >= 300:
             raise HTTPException(status_code=response.status_code, detail=response.text)
         return response.json()
+
+    def get_latest_trade(self, symbol: str, feed: str | None = None) -> dict:
+        params = {"feed": feed} if feed else None
+        response = requests.get(
+            url=f"{DEFAULT_ALPACA_DATA_BASE_URL}/v2/stocks/{symbol.upper()}/trades/latest",
+            params=params,
+            headers=self._headers(),
+            timeout=20,
+        )
+        if response.status_code >= 300:
+            raise HTTPException(status_code=response.status_code, detail=response.text)
+        return response.json()
+
+    def get_latest_trade_price(self, symbol: str, feed: str | None = None) -> tuple[float, str | None]:
+        payload = self.get_latest_trade(symbol, feed=feed)
+        trade = payload.get("trade") if isinstance(payload, dict) else None
+        if not isinstance(trade, dict):
+            raise HTTPException(status_code=502, detail=f"Latest trade payload for {symbol.upper()} missing trade.")
+        price = self._as_float(trade.get("p"), "latest trade price", required=True)
+        if price is None or price <= 0:
+            raise HTTPException(status_code=502, detail=f"Latest trade price for {symbol.upper()} is unavailable.")
+        return price, str(trade.get("t")) if trade.get("t") is not None else None
 
     def _cancel_open_orders(self, symbol: str, exclude_order_ids: set[str] | None = None) -> list[str]:
         excluded = exclude_order_ids or set()

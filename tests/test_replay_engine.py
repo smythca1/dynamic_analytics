@@ -6,9 +6,12 @@ import unittest
 from decimal import Decimal
 from pathlib import Path
 
+import pandas as pd
+
 from replay.bronze import build_bronze_metadata, write_bronze_metadata
 from replay.config_hash import replay_fingerprint, stable_config_hash
 from replay.engine import run_replay
+from replay.execution import NextObservationExecution
 from replay.historical_source import read_historical_source
 from replay.models import ReplayConfig
 from replay.parity import compare_logic_parity
@@ -20,8 +23,10 @@ from shared.config.trader_config import (
     build_strategy_config as canonical_build_strategy_config,
 )
 from silver.accounting import PositionState
+from silver.market import CanonicalObservation
 from silver.market import CanonicalOneSecondSipSampler
 from strategy_engine import RenkoStrategyConfig, RenkoStrategyEngine
+from trading_events import OrderIntent, Signal
 
 
 def write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -68,6 +73,48 @@ def strategy_dict(**overrides):
     payload = dict(config.__dict__)
     payload.update(overrides)
     return payload
+
+
+def observation(second: str, price: str = "100", sequence: int = 1) -> CanonicalObservation:
+    return CanonicalObservation(
+        observation_id=f"obs-{sequence}",
+        run_id="test-run",
+        symbol="TSLA",
+        second_bucket=second,
+        emitted_sequence=sequence,
+        close_price=Decimal(price),
+        source_eligible_trade_id=f"eligible-{sequence}",
+        source_sip_timestamp=second,
+        source_alpaca_trade_id=f"trade-{sequence}",
+    )
+
+
+def signal_and_intent(*, side: str, broker_side: str, reason: str) -> tuple[Signal, OrderIntent]:
+    signal = Signal(
+        signal_id=f"signal-{reason}",
+        signal_type="exit",
+        timestamp=pd.Timestamp("2026-07-20T13:31:00Z"),
+        symbol="TSLA",
+        side=side,
+        broker_side=broker_side,
+        price=100,
+        reason=reason,
+        strategy="test",
+        trader_id="replay_trader",
+    )
+    intent = OrderIntent(
+        client_order_id=f"intent-{reason}",
+        timestamp=signal.timestamp,
+        symbol="TSLA",
+        side=broker_side,
+        signal_type="exit",
+        order_type="market",
+        strategy="test",
+        reason=reason,
+        close_position=True,
+        trader_id="replay_trader",
+    )
+    return signal, intent
 
 
 def replay_config(source: Path, output: Path, *, run_id: str = "test-replay", output_level: str = "SUMMARY", **kwargs) -> ReplayConfig:
@@ -530,6 +577,41 @@ class ReplayEngineTests(unittest.TestCase):
         self.assertEqual([fill.leg for fill in reversal], ["close", "open"])
         self.assertEqual([fill.side for fill in reversal], ["sell", "sell_short"])
 
+    def test_close_position_long_tp_uses_actual_accounting_quantity(self) -> None:
+        execution = NextObservationExecution(run_id="close-long-tp", trader_id="replay_trader")
+        sig, intent = signal_and_intent(side="long", broker_side="sell", reason="take_profit_2_bricks")
+        position = PositionState(symbol="TSLA", side="long", qty=Decimal("7"), avg_entry_price=Decimal("100"))
+        order = execution.queue(signal=sig, intent=intent, observation=observation("2026-07-20T13:31:00Z", "100"), position=position)
+        bundles = execution.fill_pending(observation=observation("2026-07-20T13:31:01Z", "102", 2), position=position)
+        self.assertEqual(order.intent.qty, 7)
+        self.assertEqual(order.intent.target_qty, 0)
+        self.assertEqual(len(bundles), 1)
+        fill = bundles[0].fills[0]
+        self.assertEqual(fill.side, "sell")
+        self.assertEqual(fill.leg, "close")
+        self.assertEqual(fill.qty, Decimal("7"))
+        self.assertEqual(fill.reason, "take_profit_2_bricks")
+
+    def test_close_position_short_sl_uses_actual_accounting_quantity(self) -> None:
+        execution = NextObservationExecution(run_id="close-short-sl", trader_id="replay_trader")
+        sig, intent = signal_and_intent(side="short", broker_side="buy", reason="stop_loss_3_bricks")
+        position = PositionState(symbol="TSLA", side="short", qty=Decimal("5"), avg_entry_price=Decimal("100"))
+        execution.queue(signal=sig, intent=intent, observation=observation("2026-07-20T13:31:00Z", "100"), position=position)
+        bundles = execution.fill_pending(observation=observation("2026-07-20T13:31:01Z", "103", 2), position=position)
+        fill = bundles[0].fills[0]
+        self.assertEqual(fill.side, "buy")
+        self.assertEqual(fill.leg, "close")
+        self.assertEqual(fill.qty, Decimal("5"))
+        self.assertEqual(fill.reason, "stop_loss_3_bricks")
+
+    def test_close_position_exit_does_not_fill_on_same_observation(self) -> None:
+        execution = NextObservationExecution(run_id="same-obs-close", trader_id="replay_trader")
+        obs = observation("2026-07-20T13:31:00Z", "100")
+        sig, intent = signal_and_intent(side="long", broker_side="sell", reason="take_profit_1_bricks")
+        position = PositionState(symbol="TSLA", side="long", qty=Decimal("3"), avg_entry_price=Decimal("100"))
+        execution.queue(signal=sig, intent=intent, observation=obs, position=position)
+        self.assertEqual(execution.fill_pending(observation=obs, position=position), tuple())
+
     def test_fills_feed_canonical_accounting(self) -> None:
         result = self.run_signal_replay()
         self.assertEqual(len(result.ledgers.position_transitions), len(result.ledgers.simulated_fills))
@@ -619,7 +701,7 @@ class ReplayEngineTests(unittest.TestCase):
         )
         self.assertEqual(loaded.strategy_config.symbol, "TSLA")
         self.assertEqual(loaded.strategy_config.strategy_type, "renko_reversal")
-        self.assertEqual(loaded.strategy_config.brick_size, 2.31165)
+        self.assertEqual(loaded.strategy_config.brick_size, 1.62183)
         self.assertEqual(loaded.metadata["configured_renko_source"], "1s_close")
         self.assertEqual(loaded.brick_audit.sizing_mode, "BRICK_DOLLARS")
         self.assertEqual(loaded.brick_audit.authoritative_field, "strategy.brick_size")
@@ -657,7 +739,7 @@ class ReplayEngineTests(unittest.TestCase):
             "strategy": {"type": "renko_reversal", "brick_size": 2.5, "entry_bricks": 1},
             "sizing": {"qty": 1},
             "session": {"allow_overnight": True},
-            "profile": {"renko_brick_pct": 0.5, "ltp_reference": 500},
+            "profile": {"renko_brick_pct": 9.0, "ltp_reference": 500},
             "data": {"renko_source": "1s_close"},
         }
         config = canonical_build_strategy_config(trader)
@@ -665,6 +747,7 @@ class ReplayEngineTests(unittest.TestCase):
         self.assertEqual(config.brick_size, 2.5)
         self.assertEqual(audit.sizing_mode, "BRICK_DOLLARS")
         self.assertEqual(audit.authoritative_field, "strategy.brick_size")
+        self.assertFalse(audit.values_agree)
 
     def test_percentage_derived_brick_config(self) -> None:
         trader = {
@@ -681,14 +764,13 @@ class ReplayEngineTests(unittest.TestCase):
         self.assertEqual(audit.sizing_mode, "BRICK_PERCENT")
         self.assertEqual(audit.authoritative_field, "brick_pct + reference_price")
 
-    def test_ambiguous_dollar_percent_config_rejected(self) -> None:
+    def test_percentage_mode_rejects_disagreement_with_explicit_brick_size(self) -> None:
         trader = {
             "id": "bad",
             "symbol": "TSLA",
-            "strategy": {"type": "renko_reversal", "brick_size": 2.5, "entry_bricks": 1},
+            "strategy": {"type": "renko_reversal", "brick_sizing_mode": "BRICK_PERCENT", "brick_pct": 2, "reference_price": 100, "brick_size": 2.5, "entry_bricks": 1},
             "sizing": {"qty": 1},
             "session": {"allow_overnight": True},
-            "profile": {"renko_brick_pct": 9.0, "ltp_reference": 500},
         }
         config = canonical_build_strategy_config(trader)
         with self.assertRaises(TraderConfigError):
@@ -710,7 +792,7 @@ class ReplayEngineTests(unittest.TestCase):
                 production_config={**loaded.metadata, "production_config_hash": loaded.config_hash},
             )
         )
-        self.assertEqual(result.manifest["brick_configuration"]["effective_brick_size_dollars"], 2.31165)
+        self.assertEqual(result.manifest["brick_configuration"]["effective_brick_size_dollars"], 1.62183)
         self.assertEqual(result.manifest["strategy_configuration"]["source_config_path"], "configs/traders.live.example.json")
         self.assertEqual(result.manifest["strategy_configuration"]["production_config_hash"], loaded.config_hash)
 

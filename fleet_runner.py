@@ -9,6 +9,7 @@ import ssl
 import sys
 import time
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Callable
 from datetime import date, timedelta
@@ -23,8 +24,10 @@ from execution_engine import AlpacaExecutionEngine, JsonlEventLog, ShadowExecuti
 from shared.config.trader_config import (
     as_float,
     build_strategy_config,
+    load_production_renko_config,
     normalize_renko_source,
 )
+from renko_builder import RenkoBuildState, initial_renko_close
 from silver.evidence import EvidenceLogger
 from silver.evidence.models import EvidenceCheckpoint, UNKNOWN
 from silver.evidence.shadow_sampler import EvidenceShadowSampler, ShadowSamplerSettings
@@ -35,6 +38,7 @@ from trading_events import MarketTick, OrderIntent, Signal, dataclass_to_jsonabl
 DATA_STREAM_URL_TEMPLATE = "wss://stream.data.alpaca.markets/v2/{feed}"
 BROKER_MANAGED_RECONCILE_INTERVAL_SECONDS = 5.0
 BROKER_FORCE_FLAT_POLL_SECONDS = 0.5
+RENKO_BRICK_CHANGE_MIGRATION_POLICY = "RESET_RENKO_ON_BRICK_CHANGE_PRESERVE_POSITION_V1"
 _LAST_BROKER_MANAGED_RECONCILE: dict[str, float] = {}
 _BROKER_FORCE_FLAT_DATES: set[tuple[str, str, str, str]] = set()
 
@@ -61,6 +65,7 @@ class TraderRuntime:
     evidence: EvidenceLogger | None = None
     shadow_sampler: EvidenceShadowSampler | None = None
     config_hash: str | None = None
+    migration_evidence_path: str | None = None
 
 
 _PENDING_1S_CLOSE_TICKS: dict[str, tuple[pd.Timestamp, MarketTick]] = {}
@@ -191,6 +196,7 @@ def archive_renko_brick(root: Path, runtime: TraderRuntime, brick_payload: dict[
 
 
 def archive_engine_state(root: Path, runtime: TraderRuntime, reason: str) -> None:
+    strategy_config = getattr(runtime.engine, "config", None)
     payload = {
         "saved_at": pd.Timestamp.now(tz="UTC").isoformat(),
         "reason": reason,
@@ -200,6 +206,9 @@ def archive_engine_state(root: Path, runtime: TraderRuntime, reason: str) -> Non
         "credential_profile": runtime.credential_profile,
         "feed": runtime.feed,
         "execution_enabled": runtime.execution_enabled,
+        "configuration_hash": runtime.config_hash,
+        "configured_brick_size": getattr(strategy_config, "brick_size", None),
+        "configured_quantity": getattr(strategy_config, "qty", None),
         "engine": runtime.engine.snapshot(),
     }
     write_json_atomic(state_snapshot_path(root, runtime.trader_id), payload)
@@ -380,17 +389,209 @@ def evidence_before_direction(trade_snapshot: dict[str, Any]) -> str:
     return "flat"
 
 
-def restore_engine_state(root: Path, trader_id: str, engine: RenkoStrategyEngine) -> tuple[bool, str | None]:
+def load_state_snapshot_payload(root: Path, trader_id: str) -> tuple[Path, dict[str, Any] | None, dict[str, Any] | None, str | None]:
     path = state_snapshot_path(root, trader_id)
     if not path.exists():
-        return False, None
+        return path, None, None, None
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
     snapshot = payload.get("engine") if isinstance(payload, dict) else None
     if not isinstance(snapshot, dict):
-        return False, "state file missing engine snapshot"
+        return path, payload if isinstance(payload, dict) else None, None, "state file missing engine snapshot"
+    return path, payload, snapshot, None
+
+
+def restore_engine_state(root: Path, trader_id: str, engine: RenkoStrategyEngine) -> tuple[bool, str | None]:
+    path, _payload, snapshot, error = load_state_snapshot_payload(root, trader_id)
+    if snapshot is None and error is None:
+        return False, None
+    if error:
+        return False, error
     engine.restore_snapshot(snapshot)
     return True, str(path)
+
+
+def snapshot_brick_size(snapshot: dict[str, Any] | None) -> float | None:
+    renko = snapshot.get("renko") if isinstance(snapshot, dict) else None
+    if not isinstance(renko, dict) or renko.get("brick_size") is None:
+        return None
+    try:
+        return float(renko["brick_size"])
+    except (TypeError, ValueError):
+        return None
+
+
+def is_renko_brick_change(snapshot: dict[str, Any] | None, engine: RenkoStrategyEngine) -> bool:
+    old_brick = snapshot_brick_size(snapshot)
+    return old_brick is not None and abs(old_brick - float(engine.config.brick_size)) > 1e-9
+
+
+def quarantine_state_snapshot(root: Path, trader_id: str, payload: dict[str, Any], reason: str) -> str:
+    digest = sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+    path = root / "state" / "rejected" / f"{slug(trader_id)}_{digest}.json"
+    write_json_atomic(
+        path,
+        {
+            "rejected_at": pd.Timestamp.now(tz="UTC").isoformat(),
+            "trader_id": trader_id,
+            "policy": RENKO_BRICK_CHANGE_MIGRATION_POLICY,
+            "reason": reason,
+            "snapshot_hash": digest,
+            "original_state": payload,
+        },
+    )
+    return str(path)
+
+
+def broker_position_reference_price(runtime: TraderRuntime, broker_position: dict[str, Any] | None) -> tuple[float, str, str | None]:
+    if broker_position is not None:
+        current_price = as_float(broker_position.get("current_price"), default=0.0)
+        if current_price > 0:
+            return current_price, "broker_position.current_price", None
+    if not isinstance(runtime.execution, AlpacaExecutionEngine):
+        raise RuntimeError(f"{runtime.trader_id}: safe bootstrap price requires live Alpaca execution.")
+    latest_price, latest_timestamp = runtime.execution.trader.get_latest_trade_price(runtime.symbol, feed=runtime.feed)
+    return float(latest_price), "alpaca_latest_trade", latest_timestamp
+
+
+def broker_position_to_trade_state(
+    runtime: TraderRuntime,
+    broker_position: dict[str, Any] | None,
+    *,
+    timestamp: pd.Timestamp,
+    reference_price: float,
+    previous_trade_state: dict[str, Any] | None,
+) -> dict[str, Any]:
+    force_flat_dates = []
+    if isinstance(previous_trade_state, dict) and isinstance(previous_trade_state.get("force_flat_dates"), list):
+        force_flat_dates = previous_trade_state["force_flat_dates"]
+    if broker_position is None:
+        return {
+            "position": None,
+            "psar_sar": None,
+            "psar_ep": None,
+            "psar_af": None,
+            "force_flat_dates": force_flat_dates,
+        }
+    side = str(broker_position.get("side", "")).lower().strip()
+    if side not in {"long", "short"}:
+        raise RuntimeError(f"{runtime.trader_id}: broker position side is ambiguous: {broker_position!r}")
+    qty = abs(as_float(broker_position.get("qty"), default=0.0))
+    if qty <= 0:
+        raise RuntimeError(f"{runtime.trader_id}: broker position quantity is ambiguous: {broker_position!r}")
+    entry_price = as_float(broker_position.get("avg_entry_price"), default=0.0) or reference_price
+    return {
+        "position": {
+            "symbol": runtime.symbol,
+            "side": side,
+            "entry_time": timestamp.isoformat(),
+            "entry_price": float(entry_price),
+            "qty": float(qty),
+        },
+        "psar_sar": None,
+        "psar_ep": None,
+        "psar_af": None,
+        "force_flat_dates": force_flat_dates,
+    }
+
+
+def migration_evidence_path(root: Path, trader_id: str, timestamp: pd.Timestamp) -> Path:
+    stamp = timestamp.strftime("%Y%m%dT%H%M%SZ")
+    return root / "migrations" / f"{slug(trader_id)}_{stamp}.json"
+
+
+def update_migration_evidence_once(runtime: TraderRuntime, field: str, value: Any) -> None:
+    if runtime.migration_evidence_path is None or value is None:
+        return
+    path = Path(runtime.migration_evidence_path)
+    if not path.exists():
+        return
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get(field) is not None:
+        return
+    payload[field] = value.isoformat() if hasattr(value, "isoformat") else value
+    write_json_atomic(path, payload)
+
+
+def migrate_renko_brick_change_state(
+    root: Path,
+    runtime: TraderRuntime,
+    *,
+    state_payload: dict[str, Any],
+    state_snapshot: dict[str, Any],
+    state_path: Path,
+    restore_error: str,
+) -> str:
+    if not isinstance(runtime.execution, AlpacaExecutionEngine):
+        raise RuntimeError(f"{runtime.trader_id}: brick-size migration requires broker reconciliation.")
+    timestamp = pd.Timestamp.now(tz="UTC")
+    renko = state_snapshot.get("renko") if isinstance(state_snapshot, dict) else {}
+    trade = state_snapshot.get("trade") if isinstance(state_snapshot, dict) else {}
+    if not isinstance(renko, dict):
+        raise RuntimeError(f"{runtime.trader_id}: incompatible state is missing Renko details.")
+    old_brick_size = float(renko.get("brick_size"))
+    new_brick_size = float(runtime.engine.config.brick_size)
+    rejected_path = quarantine_state_snapshot(root, runtime.trader_id, state_payload, restore_error)
+    broker_before = runtime.execution.trader._get_position(runtime.symbol)
+    reference_price, reference_source, reference_timestamp = broker_position_reference_price(runtime, broker_before)
+
+    runtime.engine.renko_state = RenkoBuildState(
+        brick_size=new_brick_size,
+        anchor_mode=runtime.engine.config.renko_anchor_mode,
+        anchor_price=runtime.engine.config.renko_anchor_price,
+    )
+    runtime.engine.renko_state.last_brick_close = initial_renko_close(reference_price, runtime.engine.renko_state)
+    runtime.engine.renko_state.bricks.clear()
+    runtime.engine.renko_state.run_dir = 0
+    runtime.engine.renko_state.run_len = 0
+    runtime.engine.processed_bricks = 0
+
+    previous_trade_state = trade if isinstance(trade, dict) else None
+    runtime.engine.restore_trade_state(
+        broker_position_to_trade_state(
+            runtime,
+            broker_before,
+            timestamp=timestamp,
+            reference_price=reference_price,
+            previous_trade_state=previous_trade_state,
+        )
+    )
+    broker_after = runtime.execution.trader._get_position(runtime.symbol)
+    path = migration_evidence_path(root, runtime.trader_id, timestamp)
+    strategy_before = previous_trade_state.get("position") if isinstance(previous_trade_state, dict) else None
+    strategy_after = runtime.engine.trade_state_snapshot().get("position")
+    evidence = {
+        "policy": RENKO_BRICK_CHANGE_MIGRATION_POLICY,
+        "symbol": runtime.symbol,
+        "trader_id": runtime.trader_id,
+        "previous_config_hash": state_payload.get("configuration_hash") or state_payload.get("config_hash"),
+        "new_config_hash": runtime.config_hash,
+        "previous_brick_size": old_brick_size,
+        "new_brick_size": new_brick_size,
+        "previous_configured_quantity": state_payload.get("configured_quantity") or (strategy_before or {}).get("qty"),
+        "new_configured_quantity": runtime.engine.config.qty,
+        "broker_position_before_migration": broker_before,
+        "strategy_position_before_migration": strategy_before,
+        "rejected_renko_state_identifier": rejected_path,
+        "rejected_renko_state_source": str(state_path),
+        "rejected_renko_state_reason": restore_error,
+        "bootstrap_reference_price": reference_price,
+        "bootstrap_source": reference_source,
+        "bootstrap_source_timestamp": reference_timestamp,
+        "bootstrap_timestamp": timestamp.isoformat(),
+        "first_post_bootstrap_market_observation_timestamp": None,
+        "first_post_bootstrap_brick_timestamp": None,
+        "first_eligible_signal_timestamp": None,
+        "broker_position_after_migration": broker_after,
+        "strategy_position_after_migration": strategy_after,
+        "startup_orders": 0,
+        "startup_fills": 0,
+    }
+    write_json_atomic(path, evidence)
+    object.__setattr__(runtime, "migration_evidence_path", str(path))
+    runtime.log.write("renko_state_migrated", evidence)
+    archive_engine_state(root, runtime, reason="renko_brick_change_migration_bootstrap")
+    return str(path)
 
 
 def warm_start_runtime_from_archived_ticks(root: Path, runtime: TraderRuntime, days: int) -> int:
@@ -745,20 +946,6 @@ def build_runtimes(config: dict[str, Any], args: argparse.Namespace) -> list[Tra
             engine = MeanReversionStrategyEngine(strategy_config)
         else:
             engine = RenkoStrategyEngine(strategy_config)
-        try:
-            restored, restored_path = restore_engine_state(archive_root(args), trader_id, engine)
-        except Exception as exc:
-            restored = False
-            restored_path = None
-            log.write(
-                "state_restore_error",
-                {
-                    "trader_id": trader_id,
-                    "symbol": symbol,
-                    "error": str(exc),
-                },
-            )
-
         execution = (
             AlpacaExecutionEngine(
                 mode=mode,
@@ -769,6 +956,19 @@ def build_runtimes(config: dict[str, Any], args: argparse.Namespace) -> list[Tra
             if args.execute_real and execution_enabled
             else ShadowExecutionEngine(log=log)
         )
+        config_hash = None
+        if isinstance(strategy_config, RenkoStrategyConfig):
+            try:
+                config_hash = load_production_renko_config(args.config, trader_id).config_hash
+            except Exception as exc:
+                log.write(
+                    "config_hash_error",
+                    {
+                        "trader_id": trader_id,
+                        "symbol": symbol,
+                        "error": str(exc),
+                    },
+                )
         runtime = TraderRuntime(
             trader_id=trader_id,
             symbol=symbol,
@@ -785,7 +985,68 @@ def build_runtimes(config: dict[str, Any], args: argparse.Namespace) -> list[Tra
             log=log,
             evidence=evidence_logger,
             shadow_sampler=shadow_sampler,
+            config_hash=config_hash,
         )
+        root = archive_root(args)
+        restored = False
+        restored_path = None
+        state_path, state_payload, state_snapshot, state_error = load_state_snapshot_payload(root, trader_id)
+        if state_snapshot is None and state_error:
+            restored_path = state_error
+            log.write(
+                "state_restore_error",
+                {
+                    "trader_id": trader_id,
+                    "symbol": symbol,
+                    "error": state_error,
+                },
+            )
+        elif state_snapshot is not None:
+            try:
+                runtime.engine.restore_snapshot(state_snapshot)
+                restored = True
+                restored_path = str(state_path)
+            except Exception as exc:
+                restored_path = str(state_path)
+                error = str(exc)
+                if (
+                    isinstance(runtime.engine, RenkoStrategyEngine)
+                    and state_payload is not None
+                    and is_renko_brick_change(state_snapshot, runtime.engine)
+                ):
+                    try:
+                        migration_path = migrate_renko_brick_change_state(
+                            root,
+                            runtime,
+                            state_payload=state_payload,
+                            state_snapshot=state_snapshot,
+                            state_path=state_path,
+                            restore_error=error,
+                        )
+                        restored_path = migration_path
+                        restored = True
+                    except Exception as migration_exc:
+                        log.write(
+                            "renko_state_migration_error",
+                            {
+                                "trader_id": trader_id,
+                                "symbol": symbol,
+                                "policy": RENKO_BRICK_CHANGE_MIGRATION_POLICY,
+                                "state_path": str(state_path),
+                                "restore_error": error,
+                                "migration_error": str(migration_exc),
+                            },
+                        )
+                        raise
+                else:
+                    log.write(
+                        "state_restore_error",
+                        {
+                            "trader_id": trader_id,
+                            "symbol": symbol,
+                            "error": error,
+                        },
+                    )
         runtime.log.write(
             "trader_configured",
             {
@@ -803,6 +1064,8 @@ def build_runtimes(config: dict[str, Any], args: argparse.Namespace) -> list[Tra
                 "behavior_profile_block_reason": behavior_block_reason,
                 "state_restored": restored,
                 "state_path": restored_path,
+                "config_hash": runtime.config_hash,
+                "migration_evidence_path": runtime.migration_evidence_path,
             },
         )
         if runtime.evidence is not None and runtime.evidence.enabled:
@@ -1108,8 +1371,18 @@ async def run_market_stream(
                                         ),
                                     )
                                 trade_snapshot = runtime.engine.trade_state_snapshot()
+                                update_migration_evidence_once(
+                                    runtime,
+                                    "first_post_bootstrap_market_observation_timestamp",
+                                    source_tick.timestamp,
+                                )
                                 renko_bricks, actions = runtime.engine.on_tick(source_tick)
                                 for brick in renko_bricks:
+                                    update_migration_evidence_once(
+                                        runtime,
+                                        "first_post_bootstrap_brick_timestamp",
+                                        brick.timestamp,
+                                    )
                                     if runtime.evidence is not None and runtime.evidence.enabled:
                                         safe_evidence_call(
                                             runtime,
@@ -1125,6 +1398,11 @@ async def run_market_stream(
                                     runtime.log.write("renko_brick", brick_payload)
                                     archive_renko_brick(root, runtime, brick_payload)
                                 for signal, intent in actions:
+                                    update_migration_evidence_once(
+                                        runtime,
+                                        "first_eligible_signal_timestamp",
+                                        signal.timestamp,
+                                    )
                                     if runtime.evidence is not None and runtime.evidence.enabled:
                                         source_brick_timestamp = renko_bricks[-1].timestamp if renko_bricks else UNKNOWN
                                         signal_sequence = safe_evidence_call(
