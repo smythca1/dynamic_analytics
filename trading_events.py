@@ -135,6 +135,9 @@ class OrderIntent:
     stop_loss_offset: float | None = None
     close_position: bool = False
     trader_id: str | None = None
+    signal_id: str | None = None
+    lifecycle_state: str | None = None
+    account_namespace: str | None = None
 
 
 @dataclass(frozen=True)

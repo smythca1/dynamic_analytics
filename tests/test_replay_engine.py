@@ -592,6 +592,24 @@ class ReplayEngineTests(unittest.TestCase):
         self.assertEqual(fill.qty, Decimal("7"))
         self.assertEqual(fill.reason, "take_profit_2_bricks")
 
+    def test_close_position_long_sl_uses_actual_accounting_quantity_not_configured_target(self) -> None:
+        execution = NextObservationExecution(run_id="close-long-sl", trader_id="replay_trader")
+        sig, intent = signal_and_intent(side="long", broker_side="sell", reason="stop_loss_2_bricks")
+        intent = OrderIntent(
+            **{
+                **intent.__dict__,
+                "qty": 48,
+                "target_qty": 48,
+            }
+        )
+        position = PositionState(symbol="TSLA", side="long", qty=Decimal("11"), avg_entry_price=Decimal("100"))
+
+        order = execution.queue(signal=sig, intent=intent, observation=observation("2026-07-20T13:31:00Z", "100"), position=position)
+
+        self.assertIsNotNone(order)
+        self.assertEqual(order.intent.qty, 11)
+        self.assertEqual(order.intent.target_qty, 0)
+
     def test_close_position_short_sl_uses_actual_accounting_quantity(self) -> None:
         execution = NextObservationExecution(run_id="close-short-sl", trader_id="replay_trader")
         sig, intent = signal_and_intent(side="short", broker_side="buy", reason="stop_loss_3_bricks")
@@ -603,6 +621,34 @@ class ReplayEngineTests(unittest.TestCase):
         self.assertEqual(fill.leg, "close")
         self.assertEqual(fill.qty, Decimal("5"))
         self.assertEqual(fill.reason, "stop_loss_3_bricks")
+
+    def test_close_position_short_tp_uses_actual_accounting_quantity(self) -> None:
+        execution = NextObservationExecution(run_id="close-short-tp", trader_id="replay_trader")
+        sig, intent = signal_and_intent(side="short", broker_side="buy", reason="take_profit_1_bricks")
+        position = PositionState(symbol="TSLA", side="short", qty=Decimal("9"), avg_entry_price=Decimal("100"))
+        execution.queue(signal=sig, intent=intent, observation=observation("2026-07-20T13:31:00Z", "100"), position=position)
+
+        bundles = execution.fill_pending(observation=observation("2026-07-20T13:31:01Z", "99", 2), position=position)
+
+        fill = bundles[0].fills[0]
+        self.assertEqual(fill.side, "buy")
+        self.assertEqual(fill.leg, "close")
+        self.assertEqual(fill.qty, Decimal("9"))
+        self.assertEqual(fill.reason, "take_profit_1_bricks")
+
+    def test_stale_flat_close_does_not_queue_zero_quantity_order(self) -> None:
+        execution = NextObservationExecution(run_id="flat-close", trader_id="replay_trader")
+        sig, intent = signal_and_intent(side="long", broker_side="sell", reason="take_profit_1_bricks")
+
+        order = execution.queue(
+            signal=sig,
+            intent=intent,
+            observation=observation("2026-07-20T13:31:00Z", "100"),
+            position=PositionState.flat("TSLA"),
+        )
+
+        self.assertIsNone(order)
+        self.assertEqual(execution.pending_orders, tuple())
 
     def test_close_position_exit_does_not_fill_on_same_observation(self) -> None:
         execution = NextObservationExecution(run_id="same-obs-close", trader_id="replay_trader")

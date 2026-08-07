@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from hashlib import sha256
 
+from silver.execution import authoritative_position_from_accounting, resolve_close_intent
 from silver.accounting import NormalizedFill, PositionState
 from silver.market import CanonicalObservation
 from trading_events import OrderIntent, Signal
@@ -44,7 +45,27 @@ class NextObservationExecution:
     def pending_orders(self) -> tuple[SimulatedOrder, ...]:
         return tuple(self._pending)
 
-    def queue(self, *, signal: Signal, intent: OrderIntent, observation: CanonicalObservation) -> SimulatedOrder:
+    def queue(
+        self,
+        *,
+        signal: Signal,
+        intent: OrderIntent,
+        observation: CanonicalObservation,
+        position: PositionState | None = None,
+    ) -> SimulatedOrder | None:
+        if intent.close_position:
+            resolution = resolve_close_intent(
+                intent,
+                authoritative_position_from_accounting(position, symbol=intent.symbol),
+            )
+            if resolution.status == "already_flat":
+                return None
+            if not resolution.is_executable:
+                raise ValueError(f"Cannot resolve close intent: {resolution.reason}")
+            intent = resolution.executable_intent
+            if intent is None:
+                raise ValueError(f"Cannot resolve close intent: {resolution.reason}")
+
         self._order_sequence += 1
         qty = Decimal(str(intent.qty or intent.target_qty or 0))
         order_id = _stable_id(
@@ -98,6 +119,12 @@ class NextObservationExecution:
         if total_qty <= 0:
             return tuple()
         fills: list[NormalizedFill] = []
+        if order.intent.close_position:
+            if position.side == "long" and side == "sell":
+                return (self._fill(order, observation, side="sell", qty=min(position.qty, total_qty), leg="close"),)
+            if position.side == "short" and side == "buy":
+                return (self._fill(order, observation, side="buy", qty=min(position.qty, total_qty), leg="close"),)
+            return tuple()
         remaining = total_qty
         if position.side == "long" and side == "sell":
             close_qty = min(position.qty, remaining)

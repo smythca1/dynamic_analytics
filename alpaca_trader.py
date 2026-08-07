@@ -6,6 +6,9 @@ import time
 import requests
 from fastapi import HTTPException
 
+from silver.execution import authoritative_position_from_alpaca, resolve_close_intent
+from trading_events import OrderIntent
+
 DEFAULT_ALPACA_LIVE_BASE_URL = "https://api.alpaca.markets"
 DEFAULT_ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets"
 DEFAULT_ALPACA_DATA_BASE_URL = "https://data.alpaca.markets"
@@ -240,6 +243,12 @@ class AlpacaTrader:
 
     def get_positions(self) -> list[dict]:
         response = self._request("GET", "/v2/positions")
+        if response.status_code >= 300:
+            raise HTTPException(status_code=response.status_code, detail=response.text)
+        return response.json()
+
+    def get_asset(self, symbol: str) -> dict:
+        response = self._request("GET", f"/v2/assets/{symbol.upper()}")
         if response.status_code >= 300:
             raise HTTPException(status_code=response.status_code, detail=response.text)
         return response.json()
@@ -595,11 +604,46 @@ class AlpacaTrader:
         order_type = str(data.get("order_type", "market")).lower().strip()
         close_position = self._as_bool(data.get("close_position"))
         is_exit_action = action in {"tp", "sl", "close"} or (action == "sell" and close_position)
+        close_resolution_payload: dict[str, object] | None = None
 
         if is_exit_action:
             cancelled_order_ids = self._cancel_open_orders(symbol)
             position = self._get_position(symbol)
-            if position is None:
+            close_intent = OrderIntent(
+                client_order_id=str(client_order_id or ""),
+                timestamp=data.get("timestamp"),
+                symbol=str(symbol).upper(),
+                side=side,  # type: ignore[arg-type]
+                signal_type=str(data.get("signal_type") or "exit"),  # type: ignore[arg-type]
+                order_type=order_type,
+                strategy=str(data.get("strategy") or ""),
+                reason=str(reason or ""),
+                qty=self._as_float(data.get("qty"), "qty", required=False),
+                target_qty=self._as_float(
+                    data.get("target_qty") or data.get("final_qty") or data.get("desired_qty"),
+                    "target_qty",
+                    required=False,
+                ),
+                notional=self._as_float(data.get("notional"), "notional", required=False),
+                limit_price=limit_price,
+                close_position=True,
+                trader_id=str(data.get("trader_id")) if data.get("trader_id") else None,
+                signal_id=str(data.get("signal_id")) if data.get("signal_id") else None,
+                lifecycle_state=str(data.get("lifecycle_state")) if data.get("lifecycle_state") else None,
+                account_namespace=str(data.get("account_namespace")) if data.get("account_namespace") else None,
+            )
+            close_resolution = resolve_close_intent(
+                close_intent,
+                authoritative_position_from_alpaca(position, symbol=str(symbol)),
+            )
+            close_resolution_payload = {
+                "status": close_resolution.status,
+                "reason": close_resolution.reason,
+                "authoritative_position_source": close_resolution.authoritative_position.source,
+                "authoritative_position_side": close_resolution.authoritative_position.side,
+                "authoritative_position_qty": str(close_resolution.authoritative_position.qty),
+            }
+            if close_resolution.status == "already_flat":
                 return {
                     "status": "no open position",
                     "broker": "alpaca",
@@ -608,29 +652,42 @@ class AlpacaTrader:
                     "reason": reason,
                     "symbol": symbol,
                     "cancelled_order_ids": cancelled_order_ids,
+                    "close_resolution": close_resolution_payload,
                 }
+            if not close_resolution.is_executable or close_resolution.executable_intent is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "close_position_intent_unresolvable",
+                        "status": close_resolution.status,
+                        "reason": close_resolution.reason,
+                        "symbol": symbol,
+                        "requested_side": side,
+                        "authoritative_position": position,
+                    },
+                )
+            resolved_intent = close_resolution.executable_intent
+            position_qty = resolved_intent.qty
+            if position_qty is None or position_qty <= 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "close_position_resolved_zero_quantity",
+                        "status": close_resolution.status,
+                        "reason": close_resolution.reason,
+                        "symbol": symbol,
+                        "authoritative_position": position,
+                    },
+                )
 
-            position_qty = self._as_float(position.get("qty"), "position qty", required=True)
-            if position_qty is None or abs(position_qty) <= 0:
-                return {
-                    "status": "no open position",
-                    "broker": "alpaca",
-                    "mode": self.credentials.mode,
-                    "action": action,
-                    "reason": reason,
-                    "symbol": symbol,
-                    "cancelled_order_ids": cancelled_order_ids,
-                }
-
-            position_side = str(position.get("side", "")).lower().strip()
-            exit_side = "buy" if position_side == "short" else "sell"
+            exit_side = resolved_intent.side
             alpaca_order_type = "limit" if order_type == "limit" and limit_price is not None else "market"
 
             order = {
                 "symbol": symbol,
                 "side": exit_side,
                 "time_in_force": "day",
-                "qty": self._format_qty(abs(position_qty)),
+                "qty": self._format_qty(position_qty),
             }
 
             if alpaca_order_type == "limit":
@@ -716,7 +773,7 @@ class AlpacaTrader:
             close_position=close_position,
         )
 
-        return {
+        result = {
             "status": "order sent",
             "broker": "alpaca",
             "mode": self.credentials.mode,
@@ -725,3 +782,6 @@ class AlpacaTrader:
             "order": order,
             "response": order_response,
         }
+        if close_resolution_payload is not None:
+            result["close_resolution"] = close_resolution_payload
+        return result

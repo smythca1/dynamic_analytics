@@ -47,6 +47,9 @@ def build_strategy_config(trader: dict[str, Any]) -> RenkoStrategyConfig | MeanR
     if strategy_type not in {"renko_tp_sl", "renko_psar", "renko_reversal", "chop_mean_reversion"}:
         raise TraderConfigError(f"{trader.get('id')}: unsupported strategy type {strategy_type}.")
 
+    account_namespace = normalized_account_namespace(
+        trader.get("account_namespace") or trader.get("account_alias") or trader.get("credential_profile")
+    )
     qty = as_float(sizing.get("qty"), default=0.0) or None
     notional = as_float(sizing.get("notional"), default=0.0) or None
     exit_management = str(strategy.get("exit_management") or "strategy").lower().strip()
@@ -69,6 +72,7 @@ def build_strategy_config(trader: dict[str, Any]) -> RenkoStrategyConfig | MeanR
             max_hold_seconds=int(strategy["max_hold_seconds"]),
             allow_short=bool(strategy.get("allow_short", True)),
             strategy_name=str(trader.get("strategy_name") or trader["id"]),
+            account_namespace=account_namespace,
             order_type=str(strategy.get("order_type") or "market").lower().strip(),
             qty=qty,
             notional=notional,
@@ -95,6 +99,7 @@ def build_strategy_config(trader: dict[str, Any]) -> RenkoStrategyConfig | MeanR
         psar_af_max=float(strategy["psar_af_max"]) if strategy.get("psar_af_max") else None,
         allow_short=bool(strategy.get("allow_short", True)),
         strategy_name=str(trader.get("strategy_name") or trader["id"]),
+        account_namespace=account_namespace,
         order_type=str(strategy.get("order_type") or "market").lower().strip(),
         exit_management=exit_management,
         stop_loss_order_type=str(strategy.get("stop_loss_order_type") or "stop_market").lower().strip(),
@@ -241,6 +246,7 @@ def production_metadata(
         "selected_trader_id": trader_id,
         "strategy_type": strategy_config.strategy_type,
         "strategy_name": strategy_config.strategy_name,
+        "account_namespace": strategy_config.account_namespace,
         "configured_renko_source": normalize_renko_source(data_block.get("renko_source")),
         "brick_sizing_mode": brick_audit.sizing_mode,
         "authoritative_brick_field": brick_audit.authoritative_field,
@@ -278,6 +284,11 @@ def normalize_renko_source(value: Any) -> str:
     if raw in {"1s", "1s_close", "one_second_close", "second_close", "one_second_close"}:
         return "1s_close"
     raise TraderConfigError(f"Unsupported renko_source: {value}")
+
+
+def normalized_account_namespace(value: Any) -> str | None:
+    raw = str(value or "").strip().lower()
+    return raw or None
 
 
 def as_float(value: Any, default: float = 0.0) -> float:

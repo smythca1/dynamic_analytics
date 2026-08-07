@@ -9,6 +9,7 @@ import ssl
 import sys
 import time
 from dataclasses import dataclass
+from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Callable
@@ -21,6 +22,7 @@ from dotenv import load_dotenv
 
 from alpaca_trader import load_alpaca_credentials
 from execution_engine import AlpacaExecutionEngine, JsonlEventLog, ShadowExecutionEngine
+from silver.execution import authoritative_position_from_alpaca
 from shared.config.trader_config import (
     as_float,
     build_strategy_config,
@@ -31,7 +33,16 @@ from renko_builder import RenkoBuildState, initial_renko_close
 from silver.evidence import EvidenceLogger
 from silver.evidence.models import EvidenceCheckpoint, UNKNOWN
 from silver.evidence.shadow_sampler import EvidenceShadowSampler, ShadowSamplerSettings
-from strategy_engine import MeanReversionStrategyConfig, MeanReversionStrategyEngine, RenkoStrategyConfig, RenkoStrategyEngine
+from silver.market import LiveMarketEvent, LocalArchiveMarketDataTail, live_market_event_from_alpaca_message
+from strategy_engine import (
+    TP_SL_EXIT_LOCK_STATES,
+    TP_SL_LIFECYCLE_CLOSE_SUBMITTED,
+    TP_SL_LIFECYCLE_EXIT_PENDING,
+    MeanReversionStrategyConfig,
+    MeanReversionStrategyEngine,
+    RenkoStrategyConfig,
+    RenkoStrategyEngine,
+)
 from trading_events import MarketTick, OrderIntent, Signal, dataclass_to_jsonable, is_price_forming_trade
 
 
@@ -61,6 +72,10 @@ class TraderRuntime:
     engine: RenkoStrategyEngine | MeanReversionStrategyEngine
     execution: AlpacaExecutionEngine | ShadowExecutionEngine
     log: JsonlEventLog
+    account_namespace: str | None = None
+    expected_account_id: str | None = None
+    market_data_source: str = "alpaca"
+    market_data_profile: str | None = None
     renko_source: str = "ticks"
     evidence: EvidenceLogger | None = None
     shadow_sampler: EvidenceShadowSampler | None = None
@@ -70,6 +85,14 @@ class TraderRuntime:
 
 _PENDING_1S_CLOSE_TICKS: dict[str, tuple[pd.Timestamp, MarketTick]] = {}
 _PRODUCTION_OBSERVATION_SEQUENCES: dict[tuple[str, str], int] = {}
+TERMINAL_EXECUTION_FAILURE_STATUSES = {
+    "canceled",
+    "cancelled",
+    "expired",
+    "failed",
+    "rejected",
+    "suspended",
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -78,8 +101,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--execute-real", action="store_true", help="Submit Alpaca orders. Defaults to shadow mode.")
     parser.add_argument("--force-mode", choices=["paper", "live"], help="Override trader mode for the whole fleet.")
     parser.add_argument("--force-feed", choices=["iex", "sip", "delayed_sip", "boats", "overnight"], help="Override trader feed.")
+    parser.add_argument("--market-data-source", choices=["alpaca", "local_archive_tail"], help="Override market-data source for the whole fleet.")
+    parser.add_argument("--market-data-profile", help="Alpaca credential profile used only for Alpaca market-data authentication.")
+    parser.add_argument("--data-credential-profile", help="Deprecated alias for --market-data-profile.")
+    parser.add_argument("--local-market-poll-seconds", type=float, default=0.1, help="Poll interval for local archive-tail market data.")
+    parser.add_argument("--local-market-start-at-beginning", action="store_true", help="Replay existing local archive lines before tailing.")
     parser.add_argument("--log-output", help="Override all trader event logs.")
     parser.add_argument("--archive-root", default="artifacts/live", help="Root directory for tick, Renko, and state archives.")
+    parser.add_argument(
+        "--market-archive-root",
+        help="Read-only archive root for local_archive_tail market data. Defaults to --archive-root.",
+    )
     parser.add_argument("--no-persist-ticks", action="store_true", help="Disable raw tick archive writes.")
     parser.add_argument("--reconnect-delay", type=float, default=5.0)
     parser.add_argument("--log-ticks", action="store_true")
@@ -140,8 +172,32 @@ def archive_root(args: argparse.Namespace) -> Path:
     return Path(str(args.archive_root))
 
 
+def market_archive_root(args: argparse.Namespace) -> Path:
+    return Path(str(getattr(args, "market_archive_root", None) or args.archive_root))
+
+
 def slug(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "unknown"
+
+
+def normalize_optional_namespace(value: object) -> str | None:
+    raw = str(value or "").strip().lower()
+    return raw or None
+
+
+def normalize_market_data_source(value: object) -> str:
+    raw = str(value or "alpaca").strip().lower().replace("-", "_")
+    if raw in {"alpaca", "alpaca_sip", "alpaca_ws"}:
+        return "alpaca"
+    if raw in {"local_archive", "local_archive_tail", "archive_tail", "shared_camatron_sip"}:
+        return "local_archive_tail"
+    raise ValueError(f"Unsupported market_data_source: {value}")
+
+
+def cli_market_data_profile(args: argparse.Namespace) -> str | None:
+    return normalize_optional_namespace(
+        getattr(args, "market_data_profile", None) or getattr(args, "data_credential_profile", None)
+    )
 
 
 def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
@@ -175,10 +231,15 @@ def state_snapshot_path(root: Path, trader_id: str) -> Path:
     return root / "state" / f"{slug(trader_id)}.json"
 
 
-def archive_tick(root: Path, tick: MarketTick, mode: str, feed: str) -> None:
+def archive_tick(root: Path, tick: MarketTick, mode: str, feed: str, source_event: LiveMarketEvent | None = None) -> None:
     payload = dataclass_to_jsonable(tick)
     payload["mode"] = mode
     payload["feed"] = feed
+    if source_event is not None:
+        payload["source_record_id"] = source_event.source_record_id
+        payload["broker_trade_id"] = source_event.broker_trade_id
+        payload["source_sequence"] = source_event.source_sequence
+        payload["eligible"] = source_event.eligible
     payload["logged_at"] = pd.Timestamp.now(tz="UTC").isoformat()
     append_jsonl(tick_archive_path(root, tick), payload)
 
@@ -204,6 +265,9 @@ def archive_engine_state(root: Path, runtime: TraderRuntime, reason: str) -> Non
         "symbol": runtime.symbol,
         "mode": runtime.mode,
         "credential_profile": runtime.credential_profile,
+        "account_namespace": runtime.account_namespace,
+        "market_data_source": runtime.market_data_source,
+        "market_data_profile": runtime.market_data_profile,
         "feed": runtime.feed,
         "execution_enabled": runtime.execution_enabled,
         "configuration_hash": runtime.config_hash,
@@ -667,6 +731,78 @@ def warm_start_runtime_from_archived_ticks(root: Path, runtime: TraderRuntime, d
     return len(ticks)
 
 
+def is_renko_tp_sl_runtime(runtime: TraderRuntime) -> bool:
+    return isinstance(runtime.engine, RenkoStrategyEngine) and runtime.engine.config.strategy_type == "renko_tp_sl"
+
+
+def halt_runtime(root: Path, runtime: TraderRuntime, reason: str, payload: dict[str, Any] | None = None) -> None:
+    object.__setattr__(runtime, "enabled", False)
+    if hasattr(runtime.engine, "mark_reconciliation_unsafe"):
+        runtime.engine.mark_reconciliation_unsafe(reason)
+    runtime.log.write(
+        "critical_runtime_halt",
+        {
+            "trader_id": runtime.trader_id,
+            "symbol": runtime.symbol,
+            "reason": reason,
+            "payload": payload or {},
+            "timestamp": pd.Timestamp.now(tz="UTC").isoformat(),
+        },
+    )
+    archive_engine_state(root, runtime, reason=f"halt_{reason}")
+
+
+def _decimal_equal(left: Decimal, right: Decimal) -> bool:
+    return abs(left - right) <= Decimal("0.000001")
+
+
+def tp_sl_reconciliation_error(runtime: TraderRuntime, broker_position: dict[str, Any], engine_position: Any) -> dict[str, Any] | None:
+    authoritative = authoritative_position_from_alpaca(broker_position, symbol=runtime.symbol)
+    if authoritative.is_flat:
+        return {
+            "reason": "broker_position_quantity_invalid",
+            "broker_position": broker_position,
+            "authoritative_position": {
+                "source": authoritative.source,
+                "side": authoritative.side,
+                "qty": str(authoritative.qty),
+            },
+        }
+    configured_qty = getattr(runtime.engine.config, "qty", None)
+    if configured_qty is not None:
+        configured = Decimal(str(configured_qty))
+        if not _decimal_equal(authoritative.qty, configured):
+            return {
+                "reason": "broker_position_quantity_violates_tp_sl_invariant",
+                "broker_position": broker_position,
+                "broker_side": authoritative.side,
+                "broker_qty": str(authoritative.qty),
+                "configured_target_qty": str(configured),
+            }
+
+    lifecycle_state = str(getattr(runtime.engine, "tp_sl_lifecycle_state", ""))
+    if lifecycle_state in TP_SL_EXIT_LOCK_STATES:
+        return None
+    if isinstance(engine_position, dict):
+        engine_side = str(engine_position.get("side", "")).lower().strip()
+        engine_qty = Decimal(str(engine_position.get("qty") or 0))
+        if engine_side in {"long", "short"} and authoritative.side != engine_side:
+            return {
+                "reason": "broker_engine_side_mismatch",
+                "broker_position": broker_position,
+                "broker_side": authoritative.side,
+                "engine_position": engine_position,
+            }
+        if engine_qty > 0 and not _decimal_equal(authoritative.qty, abs(engine_qty)):
+            return {
+                "reason": "broker_engine_quantity_mismatch",
+                "broker_position": broker_position,
+                "broker_qty": str(authoritative.qty),
+                "engine_position": engine_position,
+            }
+    return None
+
+
 def reconcile_engine_with_broker(root: Path, runtime: TraderRuntime) -> None:
     if not isinstance(runtime.execution, AlpacaExecutionEngine):
         return
@@ -676,6 +812,44 @@ def reconcile_engine_with_broker(root: Path, runtime: TraderRuntime) -> None:
     engine_position = engine_trade.get("position")
 
     if broker_position is None and engine_position is not None:
+        if is_renko_tp_sl_runtime(runtime):
+            lifecycle_state = str(getattr(runtime.engine, "tp_sl_lifecycle_state", ""))
+            if lifecycle_state in TP_SL_EXIT_LOCK_STATES or getattr(runtime.engine, "pending_exit", None):
+                runtime.engine.mark_close_filled(
+                    timestamp=pd.Timestamp.now(tz="UTC"),
+                    reason=(getattr(runtime.engine, "pending_exit", {}) or {}).get("reason"),
+                    order_id=(getattr(runtime.engine, "pending_exit", {}) or {}).get("broker_order_id"),
+                    source="alpaca_reconciliation_broker_flat",
+                )
+                runtime.log.write(
+                    "state_reconciled",
+                    {
+                        "trader_id": runtime.trader_id,
+                        "symbol": runtime.symbol,
+                        "reason": "broker_flat_tp_sl_close_confirmed",
+                        "previous_trade_state": engine_trade,
+                    },
+                )
+                archive_engine_state(root, runtime, reason="broker_flat_tp_sl_close_confirmed")
+                return
+            runtime.log.write(
+                "state_reconcile_error",
+                {
+                    "trader_id": runtime.trader_id,
+                    "symbol": runtime.symbol,
+                    "reason": "broker_flat_engine_position_without_pending_close",
+                    "previous_trade_state": engine_trade,
+                },
+            )
+            halt_runtime(
+                root,
+                runtime,
+                "broker_flat_engine_position_without_pending_close",
+                {"previous_trade_state": engine_trade},
+            )
+            raise BrokerEngineStateMismatch(
+                f"{runtime.trader_id} engine has {runtime.symbol} position but broker is flat"
+            )
         runtime.engine.restore_trade_state(
             {
                 "position": None,
@@ -707,10 +881,34 @@ def reconcile_engine_with_broker(root: Path, runtime: TraderRuntime) -> None:
                 "broker_position": broker_position,
             },
         )
-        archive_engine_state(root, runtime, reason="broker_position_exists_engine_flat")
+        if is_renko_tp_sl_runtime(runtime):
+            halt_runtime(
+                root,
+                runtime,
+                "broker_position_exists_engine_flat",
+                {"broker_position": broker_position},
+            )
+        else:
+            archive_engine_state(root, runtime, reason="broker_position_exists_engine_flat")
         raise BrokerEngineStateMismatch(
             f"{runtime.trader_id} has broker {runtime.symbol} position but engine is flat"
         )
+
+    if broker_position is not None and is_renko_tp_sl_runtime(runtime):
+        error = tp_sl_reconciliation_error(runtime, broker_position, engine_position)
+        if error is not None:
+            runtime.log.write(
+                "state_reconcile_error",
+                {
+                    "trader_id": runtime.trader_id,
+                    "symbol": runtime.symbol,
+                    **error,
+                },
+            )
+            halt_runtime(root, runtime, str(error["reason"]), error)
+            raise BrokerEngineStateMismatch(
+                f"{runtime.trader_id} {runtime.symbol} reconciliation unsafe: {error['reason']}"
+            )
 
 
 def reconcile_broker_state_if_due(root: Path, runtime: TraderRuntime) -> None:
@@ -798,6 +996,8 @@ def broker_force_flat_if_due(
     current_date = runtime_force_flat_date(runtime, timestamp)
     if current_date is None:
         return False
+    if is_renko_tp_sl_runtime(runtime) and str(getattr(runtime.engine, "tp_sl_lifecycle_state", "")) in TP_SL_EXIT_LOCK_STATES:
+        return False
 
     key = force_flat_key(runtime, current_date)
     if key in _BROKER_FORCE_FLAT_DATES:
@@ -862,6 +1062,7 @@ def broker_force_flat_if_due(
         reason="session_force_flat",
         close_position=True,
         trader_id=runtime.trader_id,
+        account_namespace=runtime.account_namespace,
     )
 
     runtime.log.write(
@@ -878,8 +1079,9 @@ def broker_force_flat_if_due(
     )
     runtime.log.write("signal", dataclass_to_jsonable(signal))
     _BROKER_FORCE_FLAT_DATES.add(key)
+    engine_position_before = runtime.engine.trade_state_snapshot().get("position")
     try:
-        runtime.execution.execute(intent)
+        event = runtime.execution.execute(intent)
     except Exception as exc:
         _BROKER_FORCE_FLAT_DATES.discard(key)
         runtime.log.write(
@@ -894,7 +1096,20 @@ def broker_force_flat_if_due(
         )
         return False
 
-    mark_runtime_force_flat_state(root, runtime, current_date, reason=f"broker_force_flat_{source}")
+    if is_renko_tp_sl_runtime(runtime) and engine_position_before is not None:
+        status = str(getattr(event, "status", "") or "").lower()
+        if status in {"no open position", "already flat"}:
+            runtime.engine.mark_close_filled(
+                timestamp=getattr(event, "timestamp", None) or timestamp,
+                reason=intent.reason,
+                order_id=None,
+                source="broker_force_flat_already_flat",
+            )
+        else:
+            runtime.engine.mark_close_submitted(intent, response=getattr(event, "response", None))
+        archive_engine_state(root, runtime, reason=f"broker_force_flat_{source}")
+    else:
+        mark_runtime_force_flat_state(root, runtime, current_date, reason=f"broker_force_flat_{source}")
     return True
 
 
@@ -931,8 +1146,14 @@ def build_runtimes(config: dict[str, Any], args: argparse.Namespace) -> list[Tra
 
         mode = args.force_mode or str(trader.get("mode") or "paper").lower()
         credential_profile = trader.get("credential_profile")
+        account_namespace = normalize_optional_namespace(
+            trader.get("account_namespace") or trader.get("account_alias") or credential_profile
+        )
+        expected_account_id = str(trader.get("expected_account_id")) if trader.get("expected_account_id") else None
         data = trader.get("data") if isinstance(trader.get("data"), dict) else {}
         feed = args.force_feed or str(data.get("feed") or "iex").lower()
+        market_data_source = normalize_market_data_source(getattr(args, "market_data_source", None) or data.get("market_data_source"))
+        market_data_profile = cli_market_data_profile(args) or normalize_optional_namespace(data.get("market_data_profile"))
         renko_source = normalize_renko_source(data.get("renko_source"))
         log_path = args.log_output or trader.get("event_log") or "artifacts/live/fleet_events.jsonl"
         risk = trader.get("risk") if isinstance(trader.get("risk"), dict) else {}
@@ -950,6 +1171,8 @@ def build_runtimes(config: dict[str, Any], args: argparse.Namespace) -> list[Tra
             AlpacaExecutionEngine(
                 mode=mode,
                 credential_profile=credential_profile,
+                account_namespace=account_namespace,
+                expected_account_id=expected_account_id,
                 max_notional=max_position_notional,
                 log=log,
             )
@@ -974,6 +1197,10 @@ def build_runtimes(config: dict[str, Any], args: argparse.Namespace) -> list[Tra
             symbol=symbol,
             mode=mode,
             credential_profile=str(credential_profile) if credential_profile else None,
+            account_namespace=account_namespace,
+            expected_account_id=expected_account_id,
+            market_data_source=market_data_source,
+            market_data_profile=market_data_profile,
             feed=feed,
             renko_source=renko_source,
             enabled=bool(trader.get("enabled", True)) and behavior_block_reason is None,
@@ -1054,6 +1281,10 @@ def build_runtimes(config: dict[str, Any], args: argparse.Namespace) -> list[Tra
                 "symbol": runtime.symbol,
                 "mode": runtime.mode,
                 "credential_profile": runtime.credential_profile,
+                "account_namespace": runtime.account_namespace,
+                "expected_account_id_configured": bool(runtime.expected_account_id),
+                "market_data_source": runtime.market_data_source,
+                "market_data_profile": runtime.market_data_profile,
                 "feed": runtime.feed,
                 "renko_source": runtime.renko_source,
                 "enabled": runtime.enabled,
@@ -1079,6 +1310,9 @@ def build_runtimes(config: dict[str, Any], args: argparse.Namespace) -> list[Tra
                         "evidence_enabled": True,
                         "shadow_sampler_enabled": runtime.shadow_sampler is not None and runtime.shadow_sampler.enabled,
                         "production_source_mode": runtime.renko_source,
+                        "market_data_source": runtime.market_data_source,
+                        "market_data_profile": runtime.market_data_profile,
+                        "account_namespace": runtime.account_namespace,
                     },
                 ),
             )
@@ -1158,12 +1392,18 @@ def flush_evidence(runtimes: list[TraderRuntime]) -> None:
             runtime.evidence.record_failure(f"evidence flush failed; trading continues: {exc}")
 
 
-def group_runtimes(runtimes: list[TraderRuntime]) -> dict[tuple[str, str], list[TraderRuntime]]:
-    grouped: dict[tuple[str, str], list[TraderRuntime]] = {}
+def group_runtimes(runtimes: list[TraderRuntime]) -> dict[tuple[str, str, str, str], list[TraderRuntime]]:
+    grouped: dict[tuple[str, str, str, str], list[TraderRuntime]] = {}
     for runtime in runtimes:
         if not runtime.enabled:
             continue
-        grouped.setdefault((runtime.mode, runtime.feed), []).append(runtime)
+        key = (
+            runtime.market_data_source,
+            runtime.market_data_profile or "",
+            runtime.mode,
+            runtime.feed,
+        )
+        grouped.setdefault(key, []).append(runtime)
     return grouped
 
 
@@ -1174,8 +1414,23 @@ def decode_ws_payload(raw_message: str | bytes) -> Any:
 
 
 def should_block_for_risk(runtime: TraderRuntime, signal: Signal, intent: OrderIntent) -> str | None:
+    if not runtime.enabled:
+        return "runtime_disabled"
+    if bool(getattr(runtime.engine, "reconciliation_unsafe", False)):
+        return "reconciliation_unsafe"
+    if (
+        intent.close_position
+        and is_renko_tp_sl_runtime(runtime)
+        and str(getattr(runtime.engine, "tp_sl_lifecycle_state", "")) == TP_SL_LIFECYCLE_CLOSE_SUBMITTED
+    ):
+        return "tp_sl_close_already_submitted"
     if signal.signal_type != "entry":
         return None
+    if (
+        is_renko_tp_sl_runtime(runtime)
+        and str(getattr(runtime.engine, "tp_sl_lifecycle_state", "")) in TP_SL_EXIT_LOCK_STATES
+    ):
+        return "tp_sl_exit_pending"
     estimated_order_notional = intent.notional or ((intent.qty or 0.0) * signal.price)
     reason_text = str(signal.reason or "").lower()
     is_reversal = "reversal" in reason_text or "reverse" in reason_text
@@ -1197,6 +1452,28 @@ def should_block_for_risk(runtime: TraderRuntime, signal: Signal, intent: OrderI
             return f"buying_power_{available_buying_power:.2f}_below_notional_{estimated_order_notional:.2f}"
         if intent.side == "sell" and not bool(account.get("shorting_enabled")):
             return "account_shorting_disabled"
+        if intent.side == "sell":
+            asset = runtime.execution.trader.get_asset(runtime.symbol)
+            if not bool(asset.get("shortable")):
+                runtime.log.write(
+                    "short_entry_rejected",
+                    {
+                        "trader_id": runtime.trader_id,
+                        "symbol": runtime.symbol,
+                        "reason": "asset_not_shortable",
+                        "asset": {
+                            "symbol": asset.get("symbol"),
+                            "status": asset.get("status"),
+                            "tradable": asset.get("tradable"),
+                            "marginable": asset.get("marginable"),
+                            "shortable": asset.get("shortable"),
+                            "easy_to_borrow": asset.get("easy_to_borrow"),
+                        },
+                        "signal": dataclass_to_jsonable(signal),
+                        "intent": dataclass_to_jsonable(intent),
+                    },
+                )
+                return "asset_not_shortable"
         positions = runtime.execution.trader.get_positions()
         for position in positions:
             if str(position.get("symbol", "")).upper() != runtime.symbol:
@@ -1227,7 +1504,7 @@ def handle_action(runtime: TraderRuntime, signal: Signal, intent: OrderIntent) -
 
     runtime.log.write("signal", dataclass_to_jsonable(signal))
     try:
-        runtime.execution.execute(intent)
+        event = runtime.execution.execute(intent)
     except Exception as exc:
         runtime.log.write(
             "execution_error",
@@ -1240,23 +1517,261 @@ def handle_action(runtime: TraderRuntime, signal: Signal, intent: OrderIntent) -
             },
         )
         return False
+    status = str(getattr(event, "status", "") or "").lower()
+    if status in TERMINAL_EXECUTION_FAILURE_STATUSES:
+        runtime.log.write(
+            "execution_error",
+            {
+                "trader_id": runtime.trader_id,
+                "symbol": runtime.symbol,
+                "error": f"execution_status_{status}",
+                "signal": dataclass_to_jsonable(signal),
+                "intent": dataclass_to_jsonable(intent),
+                "execution_event": dataclass_to_jsonable(event),
+            },
+        )
+        return False
+    if intent.close_position and hasattr(runtime.engine, "mark_close_submitted"):
+        if status in {"no open position", "already flat"}:
+            runtime.engine.mark_close_filled(
+                timestamp=getattr(event, "timestamp", None),
+                reason=intent.reason,
+                order_id=None,
+                source="alpaca_already_flat",
+            )
+        else:
+            runtime.engine.mark_close_submitted(intent, response=getattr(event, "response", None))
     return True
 
 
+def should_isolate_runtime_failure(runtime: TraderRuntime) -> bool:
+    return normalize_optional_namespace(runtime.account_namespace) == "megatron" or runtime.market_data_source == "local_archive_tail"
+
+
+def process_market_tick_for_runtime(
+    *,
+    root: Path,
+    args: argparse.Namespace,
+    runtime: TraderRuntime,
+    tick: MarketTick,
+    source_event: LiveMarketEvent | None = None,
+) -> None:
+    try:
+        _process_market_tick_for_runtime(root=root, args=args, runtime=runtime, tick=tick, source_event=source_event)
+    except BrokerEngineStateMismatch:
+        if should_isolate_runtime_failure(runtime):
+            return
+        raise
+    except Exception as exc:
+        runtime.log.write(
+            "runtime_processing_error",
+            {
+                "trader_id": runtime.trader_id,
+                "symbol": runtime.symbol,
+                "account_namespace": runtime.account_namespace,
+                "market_data_source": runtime.market_data_source,
+                "error": str(exc),
+                "tick": dataclass_to_jsonable(tick),
+            },
+        )
+        if should_isolate_runtime_failure(runtime):
+            halt_runtime(
+                root,
+                runtime,
+                "runtime_processing_error",
+                {"error": str(exc), "tick": dataclass_to_jsonable(tick)},
+            )
+            return
+        raise
+
+
+def _process_market_tick_for_runtime(
+    *,
+    root: Path,
+    args: argparse.Namespace,
+    runtime: TraderRuntime,
+    tick: MarketTick,
+    source_event: LiveMarketEvent | None = None,
+) -> None:
+    if not runtime.enabled:
+        return
+    record_shadow_for_eligible_tick(runtime, tick)
+    if args.log_ticks:
+        payload = dataclass_to_jsonable(tick)
+        payload["trader_id"] = runtime.trader_id
+        if source_event is not None:
+            payload["source_record_id"] = source_event.source_record_id
+            payload["source_sequence"] = source_event.source_sequence
+            payload["eligible"] = source_event.eligible
+            payload["archive_path"] = source_event.archive_path
+        runtime.log.write("market_tick", payload)
+
+    broker_force_flat_if_due(
+        root,
+        runtime,
+        tick.timestamp,
+        price=tick.price,
+        source="tick",
+    )
+    reconcile_broker_state_if_due(root, runtime)
+    source_ticks = renko_source_ticks(runtime, tick)
+    if not source_ticks:
+        archive_engine_state(root, runtime, reason="tick")
+        return
+
+    for source_tick in source_ticks:
+        if runtime.evidence is not None and runtime.evidence.enabled:
+            production_sequence = next_production_observation_sequence(runtime)
+            safe_evidence_call(
+                runtime,
+                "production_observation",
+                lambda: runtime.evidence.record_production_observation(
+                    trader_id=runtime.trader_id,
+                    symbol=runtime.symbol,
+                    sequence=production_sequence,
+                    observation_bucket_timestamp=source_tick.timestamp,
+                    close_price=source_tick.price,
+                    production_source_mode=runtime.renko_source,
+                ),
+            )
+            source_trade_identity = source_event.source_record_id if source_event is not None else source_tick.trade_id or None
+            triggering_trade_identity = source_event.source_record_id if source_event is not None else tick.trade_id or None
+            safe_evidence_call(
+                runtime,
+                "observation",
+                lambda: runtime.evidence.record_observation(
+                    trader_id=runtime.trader_id,
+                    symbol=runtime.symbol,
+                    observation_bucket_timestamp=source_tick.timestamp,
+                    close_price=source_tick.price,
+                    source_trade_identity=source_trade_identity,
+                    source_trade_timestamp=source_tick.timestamp if runtime.renko_source == "ticks" else UNKNOWN,
+                    triggering_trade_identity=triggering_trade_identity,
+                    triggering_trade_timestamp=tick.timestamp,
+                ),
+            )
+        trade_snapshot = runtime.engine.trade_state_snapshot()
+        update_migration_evidence_once(
+            runtime,
+            "first_post_bootstrap_market_observation_timestamp",
+            source_tick.timestamp,
+        )
+        renko_bricks, actions = runtime.engine.on_tick(source_tick)
+        for brick in renko_bricks:
+            update_migration_evidence_once(
+                runtime,
+                "first_post_bootstrap_brick_timestamp",
+                brick.timestamp,
+            )
+            if runtime.evidence is not None and runtime.evidence.enabled:
+                safe_evidence_call(
+                    runtime,
+                    "renko_brick",
+                    lambda: runtime.evidence.record_renko_brick(
+                        trader_id=runtime.trader_id,
+                        symbol=runtime.symbol,
+                        brick=brick,
+                        source_observation_bucket_timestamp=source_tick.timestamp,
+                    ),
+                )
+            brick_payload = dataclass_to_jsonable(brick)
+            if source_event is not None:
+                brick_payload["source_record_id"] = source_event.source_record_id
+                brick_payload["source_sequence"] = source_event.source_sequence
+            runtime.log.write("renko_brick", brick_payload)
+            archive_renko_brick(root, runtime, brick_payload)
+        for signal, intent in actions:
+            update_migration_evidence_once(
+                runtime,
+                "first_eligible_signal_timestamp",
+                signal.timestamp,
+            )
+            if runtime.evidence is not None and runtime.evidence.enabled:
+                source_brick_timestamp = renko_bricks[-1].timestamp if renko_bricks else UNKNOWN
+                signal_sequence = safe_evidence_call(
+                    runtime,
+                    "strategy_signal",
+                    lambda: runtime.evidence.record_signal(
+                        trader_id=runtime.trader_id,
+                        symbol=runtime.symbol,
+                        signal=signal,
+                        intent=intent,
+                        source_brick_timestamp=source_brick_timestamp,
+                    ),
+                )
+                safe_evidence_call(
+                    runtime,
+                    "position_direction",
+                    lambda: runtime.evidence.record_position_direction(
+                        trader_id=runtime.trader_id,
+                        symbol=runtime.symbol,
+                        logical_transition_timestamp=signal.timestamp,
+                        before_direction=evidence_before_direction(trade_snapshot),
+                        after_direction=evidence_after_direction(signal),
+                        triggering_signal_sequence=signal_sequence,
+                    ),
+                )
+            if not handle_action(runtime, signal, intent):
+                runtime.engine.restore_trade_state(trade_snapshot)
+                reconcile_engine_with_broker(root, runtime)
+                archive_engine_state(root, runtime, reason="action_rejected")
+                break
+            archive_engine_state(root, runtime, reason="action_executed")
+        else:
+            archive_engine_state(root, runtime, reason=runtime.renko_source)
+
+
 async def run_market_stream(
+    market_data_source: str,
+    market_data_profile: str | None,
     mode: str,
     feed: str,
     runtimes: list[TraderRuntime],
     args: argparse.Namespace,
 ) -> None:
-    credentials = load_alpaca_credentials(mode, profile=None)
-    data_url = DATA_STREAM_URL_TEMPLATE.format(feed=feed)
     root = archive_root(args)
     symbols = sorted({runtime.symbol for runtime in runtimes})
     by_symbol: dict[str, list[TraderRuntime]] = {}
     for runtime in runtimes:
         by_symbol.setdefault(runtime.symbol, []).append(runtime)
+
+    if market_data_source == "local_archive_tail":
+        tail = LocalArchiveMarketDataTail(
+            root=market_archive_root(args),
+            symbols=symbols,
+            poll_seconds=float(getattr(args, "local_market_poll_seconds", 0.1)),
+            start_at_end=not bool(getattr(args, "local_market_start_at_beginning", False)),
+        )
+        for runtime in runtimes:
+            runtime.log.write(
+                "runner_started",
+                {
+                    "trader_id": runtime.trader_id,
+                    "symbol": runtime.symbol,
+                    "mode": runtime.mode,
+                    "credential_profile": runtime.credential_profile,
+                    "account_namespace": runtime.account_namespace,
+                    "market_data_source": market_data_source,
+                    "market_data_profile": None,
+                    "feed": runtime.feed,
+                    "renko_source": runtime.renko_source,
+                    "execution_mode": "real" if args.execute_real and runtime.execution_enabled else "shadow",
+                },
+            )
+            archive_engine_state(root, runtime, reason="runner_started")
+
+        async for event in tail.stream():
+            if not event.eligible:
+                continue
+            for runtime in by_symbol.get(event.tick.symbol, []):
+                process_market_tick_for_runtime(root=root, args=args, runtime=runtime, tick=event.tick, source_event=event)
+        return
+
+    credentials = load_alpaca_credentials(mode, profile=market_data_profile)
+    data_url = DATA_STREAM_URL_TEMPLATE.format(feed=feed)
     ssl_context = ssl.create_default_context(cafile=certifi.where())
+    source_sequence = 0
+    seen_source_records: set[str] = set()
 
     while True:
         try:
@@ -1285,6 +1800,9 @@ async def run_market_stream(
                             "symbol": runtime.symbol,
                             "mode": runtime.mode,
                             "credential_profile": runtime.credential_profile,
+                            "account_namespace": runtime.account_namespace,
+                            "market_data_source": market_data_source,
+                            "market_data_profile": market_data_profile,
                             "feed": runtime.feed,
                             "renko_source": runtime.renko_source,
                             "execution_mode": "real" if args.execute_real and runtime.execution_enabled else "shadow",
@@ -1316,126 +1834,24 @@ async def run_market_stream(
                         if message_type != "t":
                             continue
 
-                        tick = MarketTick.from_alpaca_trade(message)
+                        source_sequence += 1
+                        source_event = live_market_event_from_alpaca_message(message, source_sequence=source_sequence)
+                        tick = source_event.tick
+                        if source_event.source_record_id in seen_source_records:
+                            continue
+                        seen_source_records.add(source_event.source_record_id)
                         if not args.no_persist_ticks:
-                            archive_tick(root, tick, mode=mode, feed=feed)
-                        if not is_price_forming_trade(tick):
+                            archive_tick(root, tick, mode=mode, feed=feed, source_event=source_event)
+                        if not source_event.eligible:
                             continue
                         for runtime in by_symbol.get(tick.symbol, []):
-                            record_shadow_for_eligible_tick(runtime, tick)
-                            if args.log_ticks:
-                                payload = dataclass_to_jsonable(tick)
-                                payload["trader_id"] = runtime.trader_id
-                                runtime.log.write("market_tick", payload)
-
-                            broker_force_flat_if_due(
-                                root,
-                                runtime,
-                                tick.timestamp,
-                                price=tick.price,
-                                source="tick",
+                            process_market_tick_for_runtime(
+                                root=root,
+                                args=args,
+                                runtime=runtime,
+                                tick=tick,
+                                source_event=source_event,
                             )
-                            reconcile_broker_state_if_due(root, runtime)
-                            source_ticks = renko_source_ticks(runtime, tick)
-                            if not source_ticks:
-                                archive_engine_state(root, runtime, reason="tick")
-                                continue
-
-                            for source_tick in source_ticks:
-                                if runtime.evidence is not None and runtime.evidence.enabled:
-                                    production_sequence = next_production_observation_sequence(runtime)
-                                    safe_evidence_call(
-                                        runtime,
-                                        "production_observation",
-                                        lambda: runtime.evidence.record_production_observation(
-                                            trader_id=runtime.trader_id,
-                                            symbol=runtime.symbol,
-                                            sequence=production_sequence,
-                                            observation_bucket_timestamp=source_tick.timestamp,
-                                            close_price=source_tick.price,
-                                            production_source_mode=runtime.renko_source,
-                                        ),
-                                    )
-                                    safe_evidence_call(
-                                        runtime,
-                                        "observation",
-                                        lambda: runtime.evidence.record_observation(
-                                            trader_id=runtime.trader_id,
-                                            symbol=runtime.symbol,
-                                            observation_bucket_timestamp=source_tick.timestamp,
-                                            close_price=source_tick.price,
-                                            source_trade_identity=source_tick.trade_id or None,
-                                            source_trade_timestamp=source_tick.timestamp if runtime.renko_source == "ticks" else UNKNOWN,
-                                            triggering_trade_identity=tick.trade_id or None,
-                                            triggering_trade_timestamp=tick.timestamp,
-                                        ),
-                                    )
-                                trade_snapshot = runtime.engine.trade_state_snapshot()
-                                update_migration_evidence_once(
-                                    runtime,
-                                    "first_post_bootstrap_market_observation_timestamp",
-                                    source_tick.timestamp,
-                                )
-                                renko_bricks, actions = runtime.engine.on_tick(source_tick)
-                                for brick in renko_bricks:
-                                    update_migration_evidence_once(
-                                        runtime,
-                                        "first_post_bootstrap_brick_timestamp",
-                                        brick.timestamp,
-                                    )
-                                    if runtime.evidence is not None and runtime.evidence.enabled:
-                                        safe_evidence_call(
-                                            runtime,
-                                            "renko_brick",
-                                            lambda: runtime.evidence.record_renko_brick(
-                                                trader_id=runtime.trader_id,
-                                                symbol=runtime.symbol,
-                                                brick=brick,
-                                                source_observation_bucket_timestamp=source_tick.timestamp,
-                                            ),
-                                        )
-                                    brick_payload = dataclass_to_jsonable(brick)
-                                    runtime.log.write("renko_brick", brick_payload)
-                                    archive_renko_brick(root, runtime, brick_payload)
-                                for signal, intent in actions:
-                                    update_migration_evidence_once(
-                                        runtime,
-                                        "first_eligible_signal_timestamp",
-                                        signal.timestamp,
-                                    )
-                                    if runtime.evidence is not None and runtime.evidence.enabled:
-                                        source_brick_timestamp = renko_bricks[-1].timestamp if renko_bricks else UNKNOWN
-                                        signal_sequence = safe_evidence_call(
-                                            runtime,
-                                            "strategy_signal",
-                                            lambda: runtime.evidence.record_signal(
-                                                trader_id=runtime.trader_id,
-                                                symbol=runtime.symbol,
-                                                signal=signal,
-                                                intent=intent,
-                                                source_brick_timestamp=source_brick_timestamp,
-                                            ),
-                                        )
-                                        safe_evidence_call(
-                                            runtime,
-                                            "position_direction",
-                                            lambda: runtime.evidence.record_position_direction(
-                                                trader_id=runtime.trader_id,
-                                                symbol=runtime.symbol,
-                                                logical_transition_timestamp=signal.timestamp,
-                                                before_direction=evidence_before_direction(trade_snapshot),
-                                                after_direction=evidence_after_direction(signal),
-                                                triggering_signal_sequence=signal_sequence,
-                                            ),
-                                        )
-                                    if not handle_action(runtime, signal, intent):
-                                        runtime.engine.restore_trade_state(trade_snapshot)
-                                        reconcile_engine_with_broker(root, runtime)
-                                        archive_engine_state(root, runtime, reason="action_rejected")
-                                        break
-                                    archive_engine_state(root, runtime, reason="action_executed")
-                                else:
-                                    archive_engine_state(root, runtime, reason=runtime.renko_source)
         except asyncio.CancelledError:
             flush_evidence(runtimes)
             raise
@@ -1486,7 +1902,17 @@ async def async_main() -> None:
     if not grouped:
         raise RuntimeError("No enabled traders in fleet config.")
 
-    tasks = [run_market_stream(mode=mode, feed=feed, runtimes=items, args=args) for (mode, feed), items in grouped.items()]
+    tasks = [
+        run_market_stream(
+            market_data_source=market_data_source,
+            market_data_profile=market_data_profile or None,
+            mode=mode,
+            feed=feed,
+            runtimes=items,
+            args=args,
+        )
+        for (market_data_source, market_data_profile, mode, feed), items in grouped.items()
+    ]
     tasks.append(run_force_flat_scheduler(runtimes, args))
     await asyncio.gather(*tasks)
 

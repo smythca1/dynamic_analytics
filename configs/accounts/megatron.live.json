@@ -1,0 +1,148 @@
+{
+  "fleet_id": "megatron_tp_sl_beta_v1",
+  "experiment_id": "megatron_tp_sl_beta_v1",
+  "account_namespace": "megatron",
+  "expected_account_id": "71d38ca0-82d3-44a8-b79f-d48f72211c6c",
+  "runtime_roots": {
+    "state": "artifacts/live/megatron/state/",
+    "events": "artifacts/live/megatron/events/",
+    "orders": "artifacts/live/megatron/orders/",
+    "evidence": "artifacts/live/megatron/evidence/",
+    "renko": "artifacts/live/megatron/renko/"
+  },
+  "start_gates": {
+    "shorting_enabled_required": true,
+    "nvda_qty": 1,
+    "tsla_qty": 1,
+    "nvda_flat_required": true,
+    "tsla_flat_required": true,
+    "no_open_orders_required": true,
+    "market_data_source": "shared_camatron_sip_archive"
+  },
+  "traders": [
+    {
+      "id": "megatron_nvda_renko_tp_sl_e1_tp2_sl2_1sh_beta",
+      "enabled": false,
+      "execution_enabled": false,
+      "symbol": "NVDA",
+      "broker": "alpaca",
+      "account_namespace": "megatron",
+      "credential_profile": "megatron",
+      "expected_account_id": "71d38ca0-82d3-44a8-b79f-d48f72211c6c",
+      "mode": "live",
+      "event_log": "/root/trading-server/artifacts/live/megatron/events/fleet_events.jsonl",
+      "strategy_name": "nvda_renko_tp_sl_e1_tp2_sl2_1sh_megatron_beta",
+      "profile": {
+        "candidate_id": "cand_5ec9dc51a344ca30117b545a",
+        "source_optimization": "renko_10session_multi_asset_entry_tp_sl_capital_v4",
+        "candidate_classification": "PROMOTE TO PAPER TRADING / LIVE BETA EXPERIMENT",
+        "research_brick_pct": 0.43,
+        "research_backtest_qty": 48,
+        "live_qty_contract": 1,
+        "quantity_note": "Production live quantity is operator-approved qty=1; research backtest qty is not used for live sizing."
+      },
+      "data": {
+        "market_data_source": "local_archive_tail",
+        "market_data_profile": null,
+        "feed": "sip",
+        "renko_source": "ticks"
+      },
+      "strategy": {
+        "type": "renko_tp_sl",
+        "brick_size": 0.8841015,
+        "brick_sizing_mode": "fixed_dollars",
+        "renko_anchor_mode": "grid",
+        "renko_anchor_price": 0.0,
+        "entry_bricks": 1,
+        "take_profit_bricks": 2,
+        "stop_loss_bricks": 2,
+        "allow_short": true,
+        "order_type": "market",
+        "exit_management": "strategy"
+      },
+      "session": {
+        "timezone": "America/New_York",
+        "entry_start": "09:31:00",
+        "entry_end": "15:59:59",
+        "force_flat": null,
+        "active_start_date": "2026-08-07",
+        "active_end_date": null,
+        "allow_overnight": true
+      },
+      "sizing": {
+        "type": "qty",
+        "qty": 1
+      },
+      "risk": {
+        "max_daily_loss": 250,
+        "max_position_notional": 1000
+      },
+      "warm_start": {
+        "enabled": false,
+        "days": 0
+      }
+    },
+    {
+      "id": "megatron_tsla_renko_tp_sl_e2_tp1_sl1_1sh_beta",
+      "enabled": false,
+      "execution_enabled": false,
+      "symbol": "TSLA",
+      "broker": "alpaca",
+      "account_namespace": "megatron",
+      "credential_profile": "megatron",
+      "expected_account_id": "71d38ca0-82d3-44a8-b79f-d48f72211c6c",
+      "mode": "live",
+      "event_log": "/root/trading-server/artifacts/live/megatron/events/fleet_events.jsonl",
+      "strategy_name": "tsla_renko_tp_sl_e2_tp1_sl1_1sh_megatron_beta",
+      "profile": {
+        "candidate_id": "cand_729d38dc283ac03c8f171939",
+        "source_optimization": "renko_10session_multi_asset_entry_tp_sl_capital_v4",
+        "candidate_classification": "PROMOTE TO PAPER TRADING / LIVE BETA EXPERIMENT",
+        "research_brick_pct": 0.52,
+        "research_backtest_qty": 25,
+        "live_qty_contract": 1,
+        "quantity_note": "Production live quantity is operator-approved qty=1; research backtest qty is not used for live sizing."
+      },
+      "data": {
+        "market_data_source": "local_archive_tail",
+        "market_data_profile": null,
+        "feed": "sip",
+        "renko_source": "ticks"
+      },
+      "strategy": {
+        "type": "renko_tp_sl",
+        "brick_size": 2.00798,
+        "brick_sizing_mode": "fixed_dollars",
+        "renko_anchor_mode": "grid",
+        "renko_anchor_price": 0.0,
+        "entry_bricks": 2,
+        "take_profit_bricks": 1,
+        "stop_loss_bricks": 1,
+        "allow_short": true,
+        "order_type": "market",
+        "exit_management": "strategy"
+      },
+      "session": {
+        "timezone": "America/New_York",
+        "entry_start": "09:31:00",
+        "entry_end": "15:59:59",
+        "force_flat": null,
+        "active_start_date": "2026-08-07",
+        "active_end_date": null,
+        "allow_overnight": true
+      },
+      "sizing": {
+        "type": "qty",
+        "qty": 1
+      },
+      "risk": {
+        "max_daily_loss": 250,
+        "max_position_notional": 1000
+      },
+      "warm_start": {
+        "enabled": false,
+        "days": 0
+      }
+    }
+  ]
+}

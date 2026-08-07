@@ -142,6 +142,13 @@ def _process_observation(
             ledgers.accounting_snapshots.append(snapshot)
             ledgers.equity_curve.extend(snapshot.equity_curve[len(ledgers.equity_curve) :])
             ledgers.events.append(_compact_event(config.run_id, "SimulatedFillCreated", fill.timestamp, len(ledgers.events) + 1, fill.stable_fill_id, {}))
+            if fill.leg == "close" and accounting.position.side is None and hasattr(strategy, "mark_close_filled"):
+                strategy.mark_close_filled(
+                    timestamp=fill.timestamp,
+                    reason=fill.reason,
+                    order_id=fill.order_id,
+                    source=execution.version,
+                )
             for transition in accounting.position_transitions[before_transition_count:]:
                 ledgers.events.append(
                     _compact_event(config.run_id, "PositionTransitionCreated", transition.timestamp, len(ledgers.events) + 1, transition.fill_id, {})
@@ -174,7 +181,28 @@ def _process_observation(
     for signal, intent in actions:
         ledgers.strategy_signals.append(signal)
         ledgers.events.append(_compact_event(config.run_id, "StrategySignalGenerated", signal.timestamp, len(ledgers.events) + 1, observation.observation_id, _payload(signal)))
-        order = execution.queue(signal=signal, intent=intent, observation=observation)
+        order = execution.queue(signal=signal, intent=intent, observation=observation, position=accounting.position)
+        if order is None:
+            ledgers.events.append(
+                _compact_event(
+                    config.run_id,
+                    "SimulatedOrderSkipped",
+                    signal.timestamp,
+                    len(ledgers.events) + 1,
+                    signal.signal_id,
+                    {"reason": "close_position_already_flat", "intent": _payload(intent)},
+                )
+            )
+            if intent.close_position and hasattr(strategy, "mark_close_filled"):
+                strategy.mark_close_filled(
+                    timestamp=signal.timestamp,
+                    reason=intent.reason,
+                    order_id=None,
+                    source=f"{execution.version}:already_flat",
+                )
+            continue
+        if intent.close_position and hasattr(strategy, "mark_close_submitted"):
+            strategy.mark_close_submitted(intent, response={"id": order.order_id})
         ledgers.simulated_orders.append(order)
         ledgers.events.append(_compact_event(config.run_id, "SimulatedOrderQueued", signal.timestamp, len(ledgers.events) + 1, signal.signal_id, _payload(order)))
 

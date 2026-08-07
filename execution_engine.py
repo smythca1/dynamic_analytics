@@ -53,6 +53,8 @@ class AlpacaExecutionEngine:
         self,
         mode: str | None = None,
         credential_profile: str | None = None,
+        account_namespace: str | None = None,
+        expected_account_id: str | None = None,
         max_notional: float = 250000,
         log: JsonlEventLog | None = None,
     ) -> None:
@@ -60,9 +62,14 @@ class AlpacaExecutionEngine:
             credentials=load_alpaca_credentials(mode, profile=credential_profile),
             max_notional=max_notional,
         )
+        self.credential_profile = self.trader.credentials.profile
+        self.account_namespace = _normalize_namespace(account_namespace or credential_profile)
+        self.expected_account_id = str(expected_account_id) if expected_account_id else None
+        self._verified_account_id: str | None = None
         self.log = log
 
     def execute(self, intent: OrderIntent) -> ExecutionEvent:
+        self._verify_execution_account(intent)
         action = "close" if intent.close_position else intent.side
         payload: dict[str, object] = {
             "symbol": intent.symbol,
@@ -70,10 +77,18 @@ class AlpacaExecutionEngine:
             "order_type": intent.order_type,
             "reason": intent.reason,
             "client_order_id": intent.client_order_id,
+            "timestamp": intent.timestamp,
+            "signal_type": intent.signal_type,
             "close_position": intent.close_position,
         }
         if intent.trader_id:
             payload["trader_id"] = intent.trader_id
+        if intent.account_namespace:
+            payload["account_namespace"] = intent.account_namespace
+        if intent.signal_id:
+            payload["signal_id"] = intent.signal_id
+        if intent.lifecycle_state:
+            payload["lifecycle_state"] = intent.lifecycle_state
         if intent.qty is not None:
             payload["qty"] = intent.qty
         if intent.target_qty is not None:
@@ -137,3 +152,29 @@ class AlpacaExecutionEngine:
         if self.log:
             self.log.write("execution", dataclass_to_jsonable(event))
         return event
+
+    def _verify_execution_account(self, intent: OrderIntent) -> None:
+        intent_namespace = _normalize_namespace(intent.account_namespace)
+        engine_namespace = getattr(self, "account_namespace", None)
+        if intent_namespace and engine_namespace and intent_namespace != engine_namespace:
+            raise RuntimeError(
+                f"Execution account namespace mismatch: intent={intent_namespace} engine={engine_namespace}"
+            )
+        expected_account_id = getattr(self, "expected_account_id", None)
+        if not expected_account_id:
+            return
+        if getattr(self, "_verified_account_id", None) == expected_account_id:
+            return
+        account = self.trader.get_account()
+        account_id = str(account.get("id") or "")
+        if account_id != expected_account_id:
+            raise RuntimeError(
+                f"Execution account identity mismatch for namespace {engine_namespace}: "
+                f"expected {expected_account_id}, got {account_id or 'UNKNOWN'}"
+            )
+        self._verified_account_id = account_id
+
+
+def _normalize_namespace(value: object) -> str | None:
+    raw = str(value or "").strip().lower()
+    return raw or None

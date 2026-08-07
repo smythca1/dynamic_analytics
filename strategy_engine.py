@@ -14,6 +14,17 @@ from trading_events import MarketBar, MarketTick, OrderIntent, PositionState, Re
 
 
 MAX_CLIENT_ORDER_ID_LENGTH = 48
+TP_SL_LIFECYCLE_FLAT = "FLAT"
+TP_SL_LIFECYCLE_POSITION_OPEN = "POSITION_OPEN"
+TP_SL_LIFECYCLE_TRIGGERED = "TP_OR_SL_TRIGGERED"
+TP_SL_LIFECYCLE_EXIT_PENDING = "EXIT_PENDING"
+TP_SL_LIFECYCLE_CLOSE_SUBMITTED = "CLOSE_SUBMITTED"
+TP_SL_LIFECYCLE_CLOSE_FILLED = "CLOSE_FILLED"
+TP_SL_EXIT_LOCK_STATES = {
+    TP_SL_LIFECYCLE_TRIGGERED,
+    TP_SL_LIFECYCLE_EXIT_PENDING,
+    TP_SL_LIFECYCLE_CLOSE_SUBMITTED,
+}
 
 
 @dataclass(frozen=True)
@@ -30,6 +41,7 @@ class RenkoStrategyConfig:
     trader_id: str | None = None
     allow_short: bool = True
     strategy_name: str = "renko_live_v1"
+    account_namespace: str | None = None
     qty: float | None = None
     notional: float | None = None
     order_type: str = "market"
@@ -109,6 +121,7 @@ class MeanReversionStrategyConfig:
     trader_id: str | None = None
     allow_short: bool = True
     strategy_name: str = "chop_mean_reversion_v1"
+    account_namespace: str | None = None
     qty: float | None = None
     notional: float | None = None
     order_type: str = "market"
@@ -198,6 +211,10 @@ class RenkoStrategyEngine:
         self.psar_sar: float | None = None
         self.psar_ep: float | None = None
         self.psar_af: float | None = None
+        self.tp_sl_lifecycle_state = TP_SL_LIFECYCLE_FLAT
+        self.pending_exit: dict[str, Any] | None = None
+        self.last_closed_exit: dict[str, Any] | None = None
+        self.reconciliation_unsafe = False
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -234,6 +251,10 @@ class RenkoStrategyEngine:
             "psar_ep": self.psar_ep,
             "psar_af": self.psar_af,
             "force_flat_dates": sorted(self.force_flat_dates),
+            "tp_sl_lifecycle_state": self.tp_sl_lifecycle_state,
+            "pending_exit": self.pending_exit,
+            "last_closed_exit": self.last_closed_exit,
+            "reconciliation_unsafe": self.reconciliation_unsafe,
         }
 
     def restore_snapshot(self, snapshot: dict[str, Any]) -> None:
@@ -289,6 +310,15 @@ class RenkoStrategyEngine:
         self.psar_af = float(snapshot["psar_af"]) if snapshot.get("psar_af") is not None else None
         force_flat_dates = snapshot.get("force_flat_dates")
         self.force_flat_dates = set(force_flat_dates if isinstance(force_flat_dates, list) else [])
+        self.tp_sl_lifecycle_state = str(
+            snapshot.get("tp_sl_lifecycle_state")
+            or (TP_SL_LIFECYCLE_POSITION_OPEN if self.position is not None else TP_SL_LIFECYCLE_FLAT)
+        )
+        pending_exit = snapshot.get("pending_exit")
+        self.pending_exit = dict(pending_exit) if isinstance(pending_exit, dict) else None
+        last_closed_exit = snapshot.get("last_closed_exit")
+        self.last_closed_exit = dict(last_closed_exit) if isinstance(last_closed_exit, dict) else None
+        self.reconciliation_unsafe = bool(snapshot.get("reconciliation_unsafe", False))
 
     def on_bar(self, bar: MarketBar) -> list[tuple[Signal, OrderIntent]]:
         _, emitted = self.on_bar_with_bricks(bar)
@@ -320,7 +350,10 @@ class RenkoStrategyEngine:
         if force_exit is not None:
             emitted.append(force_exit)
         for brick in new_brick_rows:
-            emitted.extend(self._on_brick(brick))
+            brick_actions = self._on_brick(brick)
+            emitted.extend(brick_actions)
+            if self.config.strategy_type == "renko_tp_sl" and brick_actions:
+                break
         return completed_bricks, emitted
 
     def _build_renko_brick(self, brick: dict[str, object]) -> RenkoBrick:
@@ -425,6 +458,9 @@ class RenkoStrategyEngine:
         direction = int(brick["direction"])
         run_len = int(brick["run_len"])
 
+        if self._tp_sl_entries_and_exits_locked():
+            return []
+
         if self.position is not None:
             exit_reason = self._exit_reason(brick_price)
             if exit_reason:
@@ -439,7 +475,7 @@ class RenkoStrategyEngine:
                     reason=exit_reason,
                 )
                 intent = self._build_order_intent(signal, close_position=True)
-                self.position = None
+                self._mark_tp_sl_exit_pending(signal, intent)
                 return [(signal, intent)]
             return []
 
@@ -468,6 +504,7 @@ class RenkoStrategyEngine:
             entry_price=price,
             qty=intent.qty or self.config.qty,
         )
+        self._mark_tp_sl_position_open()
         return [(signal, intent)]
 
     def _on_brick_psar(self, brick: dict[str, object]) -> list[tuple[Signal, OrderIntent]]:
@@ -668,6 +705,8 @@ class RenkoStrategyEngine:
     def _force_flat_action(self, timestamp: pd.Timestamp, price: float) -> tuple[Signal, OrderIntent] | None:
         if self.position is None or self.config.allow_overnight or self.force_flat is None:
             return None
+        if self.config.strategy_type == "renko_tp_sl" and self._tp_sl_entries_and_exits_locked():
+            return None
 
         local_timestamp = self._local_timestamp(timestamp)
         current_time = local_timestamp.time()
@@ -685,8 +724,11 @@ class RenkoStrategyEngine:
             reason="session_force_flat",
         )
         intent = self._build_order_intent(signal, close_position=True)
-        self.position = None
-        self._reset_psar()
+        if self.config.strategy_type == "renko_tp_sl":
+            self._mark_tp_sl_exit_pending(signal, intent)
+        else:
+            self.position = None
+            self._reset_psar()
         return signal, intent
 
     def _close_psar_position(self, timestamp: pd.Timestamp, price: float, reason: str) -> tuple[Signal, OrderIntent]:
@@ -730,6 +772,80 @@ class RenkoStrategyEngine:
         self.psar_sar = None
         self.psar_ep = None
         self.psar_af = None
+
+    def _mark_tp_sl_position_open(self) -> None:
+        if self.config.strategy_type != "renko_tp_sl":
+            return
+        self.tp_sl_lifecycle_state = TP_SL_LIFECYCLE_POSITION_OPEN
+        self.pending_exit = None
+
+    def _mark_tp_sl_exit_pending(self, signal: Signal, intent: OrderIntent) -> None:
+        if self.config.strategy_type != "renko_tp_sl":
+            return
+        self.tp_sl_lifecycle_state = TP_SL_LIFECYCLE_TRIGGERED
+        self.pending_exit = {
+            "state": TP_SL_LIFECYCLE_EXIT_PENDING,
+            "signal_id": signal.signal_id,
+            "client_order_id": intent.client_order_id,
+            "reason": signal.reason,
+            "side": signal.side,
+            "broker_side": intent.side,
+            "timestamp": signal.timestamp.isoformat(),
+        }
+        self.tp_sl_lifecycle_state = TP_SL_LIFECYCLE_EXIT_PENDING
+
+    def mark_close_submitted(self, intent: OrderIntent, response: object | None = None) -> None:
+        if self.config.strategy_type != "renko_tp_sl" or not intent.close_position:
+            return
+        if self.pending_exit is None:
+            self.pending_exit = {
+                "state": TP_SL_LIFECYCLE_CLOSE_SUBMITTED,
+                "client_order_id": intent.client_order_id,
+                "reason": intent.reason,
+                "broker_side": intent.side,
+                "timestamp": intent.timestamp.isoformat(),
+            }
+        else:
+            self.pending_exit = dict(self.pending_exit)
+        self.pending_exit["state"] = TP_SL_LIFECYCLE_CLOSE_SUBMITTED
+        broker_order_id = _broker_order_id(response)
+        if broker_order_id:
+            self.pending_exit["broker_order_id"] = broker_order_id
+        self.tp_sl_lifecycle_state = TP_SL_LIFECYCLE_CLOSE_SUBMITTED
+
+    def mark_close_filled(
+        self,
+        *,
+        timestamp: object | None = None,
+        reason: str | None = None,
+        order_id: str | None = None,
+        source: str = "reconciliation",
+    ) -> None:
+        if self.config.strategy_type != "renko_tp_sl":
+            return
+        self.tp_sl_lifecycle_state = TP_SL_LIFECYCLE_CLOSE_FILLED
+        self.last_closed_exit = {
+            "timestamp": timestamp.isoformat() if hasattr(timestamp, "isoformat") else timestamp,
+            "reason": reason or (self.pending_exit or {}).get("reason"),
+            "order_id": order_id or (self.pending_exit or {}).get("broker_order_id"),
+            "source": source,
+        }
+        self.position = None
+        self.pending_exit = None
+        self.tp_sl_lifecycle_state = TP_SL_LIFECYCLE_FLAT
+
+    def mark_reconciliation_unsafe(self, reason: str) -> None:
+        self.reconciliation_unsafe = True
+        if self.config.strategy_type == "renko_tp_sl":
+            pending = dict(self.pending_exit or {})
+            pending["unsafe_reason"] = reason
+            self.pending_exit = pending or None
+
+    def _tp_sl_entries_and_exits_locked(self) -> bool:
+        return (
+            self.config.strategy_type == "renko_tp_sl"
+            and (self.reconciliation_unsafe or self.tp_sl_lifecycle_state in TP_SL_EXIT_LOCK_STATES)
+        )
 
     def _target_qty(self, price: float) -> float:
         if self.config.qty is not None:
@@ -857,7 +973,7 @@ class RenkoStrategyEngine:
             strategy=signal.strategy,
             reason=signal.reason,
             qty=intent_qty,
-            target_qty=None if close_position else target_qty,
+            target_qty=0 if close_position else target_qty,
             notional=None if order_qty is not None or close_position else order_notional,
             limit_price=signal.price if self.config.order_type == "limit" else None,
             exit_management=exit_management,
@@ -883,6 +999,11 @@ class RenkoStrategyEngine:
             else None,
             close_position=close_position,
             trader_id=self.config.trader_id,
+            signal_id=signal.signal_id,
+            lifecycle_state=TP_SL_LIFECYCLE_TRIGGERED
+            if close_position and self.config.strategy_type == "renko_tp_sl"
+            else None,
+            account_namespace=self.config.account_namespace,
         )
 
     def _client_order_id(self, signal: Signal) -> str:
@@ -891,6 +1012,18 @@ class RenkoStrategyEngine:
         prefix = "".join(char if char.isalnum() or char in {"-", "_"} else "-" for char in raw_prefix.lower())
         max_prefix_length = MAX_CLIENT_ORDER_ID_LENGTH - len(suffix) - 1
         return f"{prefix[:max_prefix_length]}-{suffix}"[:MAX_CLIENT_ORDER_ID_LENGTH]
+
+
+def _broker_order_id(response: object | None) -> str | None:
+    if not isinstance(response, dict):
+        return None
+    direct = response.get("id")
+    if direct:
+        return str(direct)
+    child = response.get("response")
+    if isinstance(child, dict) and child.get("id"):
+        return str(child["id"])
+    return None
 
 
 class MeanReversionStrategyEngine:
@@ -1224,6 +1357,8 @@ class MeanReversionStrategyEngine:
             exit_management="strategy",
             close_position=close_position,
             trader_id=self.config.trader_id,
+            signal_id=signal.signal_id,
+            account_namespace=self.config.account_namespace,
         )
 
     def _client_order_id(self, signal: Signal) -> str:

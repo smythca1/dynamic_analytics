@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import patch
 
+from fastapi import HTTPException
+
 from alpaca_trader import AlpacaCredentials, AlpacaTrader, MAX_CLIENT_ORDER_ID_LENGTH, child_client_order_id
 
 
@@ -194,6 +196,48 @@ class AlpacaTraderReversalTests(unittest.TestCase):
         self.assertEqual(trader.cancelled_symbols, ["TSLA"])
         self.assertEqual(trader.orders[0][0], {"symbol": "TSLA", "side": "sell", "time_in_force": "day", "qty": "25", "type": "market"})
         self.assertEqual(trader.orders[0][3], True)
+
+    def test_close_position_short_take_profit_buys_actual_broker_quantity(self):
+        trader = StubAlpacaTrader({"symbol": "TSLA", "side": "short", "qty": "-9", "qty_available": "-9"})
+
+        result = trader.submit_order(
+            {
+                "symbol": "TSLA",
+                "side": "buy",
+                "qty": 25,
+                "target_qty": 25,
+                "reason": "take_profit_1_bricks",
+                "close_position": True,
+                "order_type": "market",
+            },
+            "close",
+            "buy",
+        )
+
+        self.assertEqual(result["status"], "order sent")
+        self.assertEqual(result["close_resolution"]["status"], "resolved")
+        self.assertEqual(trader.orders[0][0]["side"], "buy")
+        self.assertEqual(trader.orders[0][0]["qty"], "9")
+        self.assertEqual(trader.orders[0][3], True)
+
+    def test_close_position_rejects_side_that_would_open_opposite_position(self):
+        trader = StubAlpacaTrader({"symbol": "TSLA", "side": "long", "qty": "25", "qty_available": "25"})
+
+        with self.assertRaises(HTTPException) as raised:
+            trader.submit_order(
+                {
+                    "symbol": "TSLA",
+                    "side": "buy",
+                    "reason": "take_profit_1_bricks",
+                    "close_position": True,
+                    "order_type": "market",
+                },
+                "close",
+                "buy",
+            )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(trader.orders, [])
 
     def test_close_position_cancels_resting_orders_even_when_broker_is_flat(self):
         trader = StubAlpacaTrader(None, cancelled_order_ids=["oco-parent", "oco-stop"])
