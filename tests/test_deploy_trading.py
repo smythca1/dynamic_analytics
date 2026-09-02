@@ -62,6 +62,7 @@ class DeployTradingTests(unittest.TestCase):
             "alpaca_trader.py",
             "execution_engine.py",
             "fleet_runner.py",
+            "mission_control_telemetry.py",
             "monitoring_app.py",
             "renko_builder.py",
             "strategy_engine.py",
@@ -149,6 +150,11 @@ class DeployTradingTests(unittest.TestCase):
         result = self._run("--commit", self.commit, "--dry-run")
         self.assertIn("  shared", result.stdout)
         self.assertIn("  silver", result.stdout)
+
+    def test_mission_control_telemetry_runtime_file_is_included(self) -> None:
+        result = self._run("--commit", self.commit, "--dry-run")
+        self.assertIn("  mission_control_telemetry.py", result.stdout)
+        self.assertIn("mission_control_telemetry.py", result.stdout.split("Validation commands:", 1)[1])
 
     def test_excluded_paths_are_not_included(self) -> None:
         result = self._run("--commit", self.commit, "--dry-run")
@@ -1048,6 +1054,7 @@ class DeployTradingTests(unittest.TestCase):
             "alpaca_trader.py",
             "execution_engine.py",
             "fleet_runner.py",
+            "mission_control_telemetry.py",
             "monitoring_app.py",
             "renko_builder.py",
             "strategy_engine.py",

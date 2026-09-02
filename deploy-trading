@@ -15,6 +15,7 @@ RUNTIME_FILES=(
   "alpaca_trader.py"
   "execution_engine.py"
   "fleet_runner.py"
+  "mission_control_telemetry.py"
   "monitoring_app.py"
   "renko_builder.py"
   "strategy_engine.py"
@@ -340,7 +341,7 @@ EOF
 Validation commands:
   cd ${REMOTE_DIR}/.deploy-staging/${deployment_id}
   source ${REMOTE_DIR}/venv/bin/activate
-  python -m py_compile alpaca_trader.py trading_events.py renko_builder.py strategy_engine.py execution_engine.py fleet_runner.py monitoring_app.py
+  python -m py_compile alpaca_trader.py trading_events.py renko_builder.py strategy_engine.py execution_engine.py fleet_runner.py mission_control_telemetry.py monitoring_app.py
   python -c 'import shared.config.trader_config; import silver.market.one_second_sampler; import silver.evidence.logger; import silver.evidence.shadow_sampler; import fleet_runner'
   python - /path/to/config.json <<'PY'  # fixed Python source; config path passed as argv in real validation
   import json
@@ -396,7 +397,7 @@ test -d shared
 test -d silver
 test -f requirements.txt
 source $(quote "$REMOTE_DIR")/venv/bin/activate
-python -m py_compile alpaca_trader.py trading_events.py renko_builder.py strategy_engine.py execution_engine.py fleet_runner.py monitoring_app.py
+python -m py_compile alpaca_trader.py trading_events.py renko_builder.py strategy_engine.py execution_engine.py fleet_runner.py mission_control_telemetry.py monitoring_app.py
 python - <<'PY'
 import shared.config.trader_config
 import silver.market.one_second_sampler
@@ -1189,7 +1190,7 @@ if [[ "\$service_files_restored" == "true" ]]; then
   systemctl daemon-reload
 fi
 source venv/bin/activate
-python -m py_compile alpaca_trader.py trading_events.py renko_builder.py strategy_engine.py execution_engine.py fleet_runner.py monitoring_app.py
+python -m py_compile alpaca_trader.py trading_events.py renko_builder.py strategy_engine.py execution_engine.py fleet_runner.py mission_control_telemetry.py monitoring_app.py
 python - <<'PY'
 import shared.config.trader_config
 import silver.market.one_second_sampler

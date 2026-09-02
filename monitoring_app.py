@@ -10,9 +10,14 @@ from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from alpaca_trader import AlpacaTrader, load_alpaca_credentials
+from mission_control_telemetry import (
+    MissionControlTelemetryCollector,
+    TelemetryConfig,
+    render_emergency_metrics,
+)
 
 
 load_dotenv()
@@ -46,6 +51,11 @@ def default_event_log_path() -> Path:
 
 def default_fleet_config_path() -> Path:
     return Path(os.getenv("TRADER_CONFIG_PATH", "configs/traders.example.json"))
+
+
+@lru_cache(maxsize=1)
+def get_telemetry_collector() -> MissionControlTelemetryCollector:
+    return MissionControlTelemetryCollector(TelemetryConfig.from_environment())
 
 
 def load_fleet_config(path: Path | None = None) -> dict[str, Any]:
@@ -441,6 +451,18 @@ async def mission_control(
         "event_logs": sorted({str(default_event_log_path()), *(summary["event_log"] for summary in trader_summaries)}),
         "server_time": datetime.now(tz=timezone.utc).isoformat(),
     }
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+async def metrics() -> PlainTextResponse:
+    try:
+        body = get_telemetry_collector().collect_prometheus(broker_reader_for=get_trader)
+    except Exception:
+        body = render_emergency_metrics(os.getenv("MISSION_CONTROL_ENVIRONMENT") or "production")
+    return PlainTextResponse(
+        body,
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
 
 
 DASHBOARD_HTML = """
