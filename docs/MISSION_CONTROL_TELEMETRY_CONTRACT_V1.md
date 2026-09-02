@@ -41,6 +41,13 @@ Histogram bucket samples also use Prometheus' required control label `le`.
 Do not use order IDs, client order IDs, signal IDs, trade IDs, timestamps,
 prices, raw exception text, file paths, or free-form reason strings as labels.
 
+If multiple configured traders collapse to the same bounded metric identity
+(`fleet`, `strategy`, `symbol`), V1 emits only one deterministic representative
+series and sets
+`renko_telemetry_source_error{service="fleet_config_label_collision"}` to `1`
+for that identity. Selection prefers enabled traders, then execution-enabled
+traders, then the newest state snapshot mtime.
+
 Bounded `side` values are `flat`, `long`, `short`, and `unknown`.
 Bounded `event_type` values are:
 
@@ -179,6 +186,10 @@ open.
 - Holiday-aware market-session readiness is not included.
 - Broker position/order metrics are symbol-scoped. V1 assumes one active
   strategy per fleet/symbol/account for reconciliation display.
+- Duplicate configured traders with identical bounded `fleet`, `strategy`, and
+  `symbol` labels cannot be represented separately without increasing label
+  cardinality. V1 collapses them and emits a visible label-collision source
+  error.
 
 ## Deployment Notes
 

@@ -405,6 +405,7 @@ class MissionControlTelemetryCollector:
         self._update_canonical_journal(renderer, source_errors, market_paths.journal_path)
 
         specs = self._load_fleet_specs(renderer, source_errors)
+        metric_specs = self._deduplicate_metric_specs(specs, source_errors)
         specs_by_trader = {spec.trader_id: spec for spec in specs}
         event_paths = sorted({spec.event_log_path for spec in specs})
         self._update_event_counters(renderer, source_errors, event_paths, specs_by_trader)
@@ -416,18 +417,26 @@ class MissionControlTelemetryCollector:
             broker_reader_for=broker_reader_for,
             now=now,
         )
-        self._emit_market_data_metrics(renderer, health, specs, market_open=market_open, now=now)
+        self._emit_market_data_metrics(renderer, health, metric_specs, market_open=market_open, now=now)
         readiness_inputs = self._emit_trader_metrics(
             renderer,
             source_errors,
-            specs,
+            metric_specs,
             broker_snapshots,
             market_open=market_open,
             now=now,
         )
-        self._emit_broker_and_portfolio_metrics(renderer, broker_snapshots, specs)
+        self._emit_broker_and_portfolio_metrics(renderer, broker_snapshots, metric_specs)
         self._emit_activity_metrics(renderer)
-        self._emit_readiness(renderer, specs, broker_snapshots, readiness_inputs, market_open=market_open, health=health, now=now)
+        self._emit_readiness(
+            renderer,
+            metric_specs,
+            broker_snapshots,
+            readiness_inputs,
+            market_open=market_open,
+            health=health,
+            now=now,
+        )
         self._histograms.render(renderer)
 
     def _market_data_paths(
@@ -564,6 +573,40 @@ class MissionControlTelemetryCollector:
             help_text="Unix timestamp for the last successful bounded telemetry source read.",
         )
         return specs
+
+    def _deduplicate_metric_specs(
+        self,
+        specs: list[FleetSpec],
+        source_errors: Counter[tuple[tuple[str, str], ...]],
+    ) -> list[FleetSpec]:
+        grouped: dict[tuple[str, str, str], list[FleetSpec]] = defaultdict(list)
+        for spec in specs:
+            grouped[(spec.fleet, spec.strategy, spec.symbol)].append(spec)
+
+        selected: list[FleetSpec] = []
+        for (fleet, strategy, symbol), candidates in sorted(grouped.items()):
+            if len(candidates) > 1:
+                source_errors[
+                    _label_tuple(
+                        {
+                            "environment": self.config.environment,
+                            "fleet": fleet,
+                            "strategy": strategy,
+                            "symbol": symbol,
+                            "service": "fleet_config_label_collision",
+                        }
+                    )
+                ] = 1
+            selected.append(max(candidates, key=self._metric_spec_priority))
+        return selected
+
+    @staticmethod
+    def _metric_spec_priority(spec: FleetSpec) -> tuple[int, int, float, str]:
+        try:
+            state_mtime = spec.state_path.stat().st_mtime
+        except OSError:
+            state_mtime = 0.0
+        return (int(spec.enabled), int(spec.execution_enabled), state_mtime, spec.trader_id)
 
     def _fleet_specs_from_config(self, config: dict[str, Any]) -> list[FleetSpec]:
         fleet = _bounded_label_value(config.get("fleet_id") or config.get("experiment_id") or "unknown")

@@ -186,6 +186,38 @@ class MissionControlTelemetryTests(unittest.TestCase):
                 self.assertIn(item.split("=", 1)[0], allowed)
         self.assertEqual([], duplicates)
 
+    def test_duplicate_strategy_labels_are_collapsed_and_visible(self) -> None:
+        paths = self._healthy_workspace()
+        config = paths["config"]
+        config_path = config.fleet_config_paths[0]
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        duplicate = dict(payload["traders"][0])
+        duplicate["id"] = "trader-duplicate"
+        duplicate["enabled"] = False
+        payload["traders"].insert(0, duplicate)
+        config_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+        output = MissionControlTelemetryCollector(config).collect_prometheus(
+            broker_reader_for=lambda mode, profile: GuardedBroker(),
+            now=datetime(2026, 9, 1, 14, 30, 4, tzinfo=timezone.utc),
+        )
+
+        samples: set[str] = set()
+        duplicates: list[str] = []
+        for line in output.splitlines():
+            if not line or line.startswith("#"):
+                continue
+            identity = line.rsplit(" ", 1)[0]
+            if identity in samples:
+                duplicates.append(identity)
+            samples.add(identity)
+        self.assertEqual([], duplicates)
+        self.assertIn(
+            'renko_telemetry_source_error{environment="test",fleet="fleet-a",strategy="strategy_a",symbol="AAPL",service="fleet_config_label_collision"} 1',
+            output,
+        )
+        self.assertIn('renko_trader_up{environment="test",fleet="fleet-a",strategy="strategy_a",symbol="AAPL"} 1', output)
+
     def test_metrics_route_returns_emergency_payload_on_collector_failure(self) -> None:
         import monitoring_app
 
