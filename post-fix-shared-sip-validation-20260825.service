@@ -1,0 +1,16 @@
+[Unit]
+Description=Post-fix shared SIP active-session validation and conditional qty-1 canary start for 2026-08-27
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/trading-server
+EnvironmentFile=/root/trading-server/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/root/trading-server
+ExecStart=/root/trading-server/venv/bin/python /root/trading-server/scripts/post_fix_shared_sip_validation_20260825.py
+TimeoutStartSec=4h
+StandardOutput=journal
+StandardError=journal

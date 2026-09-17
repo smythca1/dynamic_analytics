@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Trading Tick Archive Retention Daily
+
+[Timer]
+OnCalendar=*-*-* 18:15:00 America/New_York
+Persistent=true
+Unit=trading-tick-retention.service
+
+[Install]
+WantedBy=timers.target

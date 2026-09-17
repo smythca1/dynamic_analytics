@@ -1,10 +1,10 @@
 # Production Version Contract
 
-Date: 2026-06-22
+Date: 2026-07-21
 
-This repo now has one active Renko backtest standard and one live trading path.
-Older raw-tick backtest/replay code and generated artifacts have been removed to
-avoid mixing incompatible assumptions.
+This repo has one canonical Renko construction specification and one live trading
+path. Backtests must state whether they target the current live E1 reversal
+profiles or the older continuation-case TP/SL research case.
 
 ## Current Production Baseline
 
@@ -23,7 +23,9 @@ Live execution stack:
 
 Aligned backtester:
 
-- `validated_renko_backtest.cpp`
+- Current live E1 production-parity sweep: `scripts/e1_renko_production_parity_sweep.py`
+- Historical continuation-case TP/SL backtester: `validated_renko_backtest.cpp`
+- Canonical Renko rule spec: `RENKO_SPEC.md`
 
 The passing local baseline is:
 
@@ -32,33 +34,72 @@ make compile
 make test
 ```
 
-## Canonical Backtest Case: Continuation Case
+## Canonical Renko Construction
 
-The canonical Renko TP/SL backtest logic is named `continuation_case`.
+All Python and C++ Renko implementations must match `RENKO_SPEC.md`.
+
+Required semantics:
+
+- First input anchors and emits no brick.
+- `grid` anchoring uses the configured grid; `first_price` anchors exactly to
+  the first observed price.
+- Continuations emit every full brick crossed by one market event.
+- Reversals require a two-box move from the prior brick close; the skipped
+  reversal box is not emitted.
+- A large reversal may emit the first reversal brick and then additional
+  continuation bricks from the same market event.
+- Equality at the threshold emits; comparisons use the documented epsilon.
+- Multiple bricks from one market event carry that event timestamp.
+- Restart/snapshot state must reproduce the same logical stream.
+
+The parity harness is `tests/test_renko_cpp_parity.py`, which compiles
+`validated_renko_backtest.cpp` in parity mode and compares:
+
+```text
+timestamp, brick_close, direction, run_len
+```
+
+## Current Live Backtest Case: E1 Reversal
+
+The production AAPL/NVDA/TSLA profiles are `renko_reversal` E1 strategies. Their
+production-parity sweep is `scripts/e1_renko_production_parity_sweep.py`.
 
 Data and Renko rules:
 
 - Aggregate stored ticks to 1-second closes before Renko construction.
-- Use TradingView-style Renko reversal behavior:
-  - one brick continues an existing run,
-  - reversal requires a two-brick move from the previous brick close.
 - Use grid anchoring unless a task explicitly states otherwise.
-- The raw tick mode in `validated_renko_backtest.cpp` is research-only and must
-  be explicitly requested with `--source-mode tick`.
+- Use the same `RenkoStrategyEngine` transition called by `fleet_runner.py`
+  after live `renko_source=1s_close` conversion.
 
 Strategy rules:
 
-- Enter only while flat, on the exact `E` brick of a fresh same-direction run.
-- While in a position, ignore opposing entry conditions until TP or SL exits the
-  open trade.
-- If a brick exits a trade, do not also enter a new trade on that same brick.
-- Fill entries and exits at the Renko brick close.
-- Intraday backtests must force-flat and count open positions at the configured
-  flat time, defaulting to 19:59:00 UTC for the current US regular-session
-  profiles.
-- Use explicit slippage only when requested by the run configuration.
-- Report neighbor profitability, fixed return, gross return, drawdown, trade
-  count, and validation flags.
+- Enter on the configured E1 Renko reversal/continuation signal emitted by
+  `RenkoStrategyEngine`.
+- E1 reversals are modeled as two brokerage fills: close the existing side, then
+  open the target side.
+- Backtests must distinguish `signal_price`, `order_submission_time`,
+  `fill_price`, and `fill_time`.
+- Supported fill models are `idealized`, `slippage`, and `next_event`.
+  `idealized` is optimistic and fills at the signal threshold. `next_event`
+  fills only from the next chronological market event after signal generation.
+- Data-quality statistics must be written for each run, including sorting and
+  duplicate timestamp repairs.
+
+## Historical Backtest Case: Continuation TP/SL
+
+`validated_renko_backtest.cpp` implements the older continuation-case TP/SL
+strategy. It remains useful for that research case and for C++ Renko parity, but
+it is not a production-equivalent backtest for the current live E1 reversal
+profiles.
+
+TP/SL semantics:
+
+- `exit_management=strategy` exits are strategy-managed and evaluated on Renko
+  brick closes.
+- `exit_management=oco` exits are broker-managed after entry submission and are
+  raw-market-price/order-book dependent. A Renko-close TP/SL backtest is not
+  equivalent to production OCO execution.
+- Do not infer TP/SL ordering from OHLC bars.
 
 ## Live 1S Renko Source
 

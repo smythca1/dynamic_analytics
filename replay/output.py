@@ -6,6 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from .artifact_serialization import artifact_jsonable
 from .context import ReplayContext
 from .ledgers import ReplayLedgers
 from .metrics import metric_definitions
@@ -59,17 +60,7 @@ def _write_csv(path: Path, rows: list[Any]) -> None:
 
 
 def _jsonable(value: Any) -> Any:
-    if is_dataclass(value):
-        return _jsonable(asdict(value))
-    if isinstance(value, dict):
-        return {key: _jsonable(val) for key, val in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(item) for item in value]
-    if isinstance(value, Decimal):
-        return str(value)
-    if hasattr(value, "isoformat"):
-        return value.isoformat()
-    return value
+    return artifact_jsonable(value)
 
 
 def _report_text(metrics: dict[str, Any], manifest: dict[str, Any]) -> str:

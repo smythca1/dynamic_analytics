@@ -1,0 +1,32 @@
+{
+  "feed": "sip",
+  "canonical_source": "1s_close",
+  "symbols": [
+    "AAPL",
+    "NVDA",
+    "TSLA"
+  ],
+  "socket_path": "/run/trading/market-data/live.sock",
+  "journal_path": "/root/trading-server/artifacts/live/market-data/canonical_journal.jsonl",
+  "archive_root": "/root/trading-server/artifacts/live/market-data",
+  "health_path": "/root/trading-server/artifacts/live/market-data/health/status.json",
+  "replay_limit_records": 20000,
+  "consumer_queue_limit": 1000,
+  "freshness_threshold_seconds": 5.0,
+  "disk_min_free_bytes": 1000000000,
+  "disk_min_free_inodes": 10000,
+  "journal_max_bytes": 1000000000,
+  "retention_sessions": 15,
+  "credential_profile": "market_data",
+  "credential_secret_path": "/etc/trading-secrets/shared-market-data.env",
+  "raw_archive_enabled": false,
+  "nonessential_canonical_archive_enabled": false,
+  "canonical_journal_enabled": true,
+  "socket_mode": "660",
+  "lock_path": "/run/trading/market-data/live.lock",
+  "contract_fingerprints": {
+    "AAPL": "0761d66b121034dea1c4ab89569a5578084f60e072f7281d38d7a7ea7cdd580a",
+    "NVDA": "83f01df8ed0b3ba105c94d1e042e5d63cf1f888b94d9e70d4ab45236605625d3",
+    "TSLA": "6ff4bc9a603abbde9999a767009a94304646032f458978c6d71cfc31e01b656d"
+  }
+}

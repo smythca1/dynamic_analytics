@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from hashlib import sha256
 from typing import Any
+
+import pandas as pd
 
 from silver.events.models import utc_datetime
 
@@ -19,6 +21,9 @@ def to_decimal(value: Decimal | int | float | str) -> Decimal:
 
 
 def second_bucket(value: datetime | str) -> datetime:
+    if isinstance(value, pd.Timestamp):
+        ts = value.tz_localize(timezone.utc) if value.tzinfo is None else value.tz_convert(timezone.utc)
+        return ts.floor("s").to_pydatetime()
     ts = utc_datetime(value)
     return ts.replace(microsecond=0)
 

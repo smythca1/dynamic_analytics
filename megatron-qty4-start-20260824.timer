@@ -1,0 +1,10 @@
+[Unit]
+Description=Timer for Megatron AAPL/TSLA qty4 TP/SL regular-session start
+
+[Timer]
+OnCalendar=2026-08-24 13:20:00 UTC
+Persistent=false
+Unit=megatron-qty4-start-20260824.service
+
+[Install]
+WantedBy=timers.target

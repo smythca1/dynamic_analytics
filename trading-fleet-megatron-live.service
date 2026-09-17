@@ -1,7 +1,7 @@
 [Unit]
 Description=Trading Fleet Megatron Live Beta Engine
-After=network-online.target
-Wants=network-online.target
+After=network-online.target trading-market-data-live.service
+Wants=network-online.target trading-market-data-live.service
 
 [Service]
 Type=simple
@@ -10,7 +10,7 @@ WorkingDirectory=/root/trading-server
 EnvironmentFile=/root/trading-server/.env
 Environment=PYTHONUNBUFFERED=1
 ExecStartPre=/usr/bin/mkdir -p /root/trading-server/artifacts/live/megatron/state /root/trading-server/artifacts/live/megatron/events /root/trading-server/artifacts/live/megatron/orders /root/trading-server/artifacts/live/megatron/evidence /root/trading-server/artifacts/live/megatron/renko
-ExecStart=/root/trading-server/venv/bin/python fleet_runner.py --config /root/trading-server/configs/accounts/megatron.live.json --execute-real --force-mode live --market-data-source local_archive_tail --archive-root /root/trading-server/artifacts/live/megatron --market-archive-root /root/trading-server/artifacts/live --local-market-poll-seconds 0.1 --log-output /root/trading-server/artifacts/live/megatron/events/fleet_events.jsonl --evidence-enabled --evidence-session-id megatron_tp_sl_beta_v1 --evidence-output /root/trading-server/artifacts/live/megatron/evidence/megatron_tp_sl_beta_v1.jsonl --log-ticks
+ExecStart=/root/trading-server/venv/bin/python fleet_runner.py --config /root/trading-server/configs/accounts/megatron.live.json --execute-real --force-mode live --market-data-source shared_canonical_stream --shared-market-data-config /root/trading-server/configs/market-data.live.example.json --archive-root /root/trading-server/artifacts/live/megatron --log-output /root/trading-server/artifacts/live/megatron/events/fleet_events.jsonl --log-ticks
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

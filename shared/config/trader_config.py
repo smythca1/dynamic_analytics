@@ -7,11 +7,27 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+from silver.market.contract import CANONICAL_RENKO_SOURCE, contract_snapshot, validate_canonical_renko_source
 from strategy_engine import MeanReversionStrategyConfig, RenkoStrategyConfig
 
 
 class TraderConfigError(ValueError):
     """Raised when a trader JSON record cannot be mapped safely."""
+
+
+TP_SL_SESSION_CONTRACT = {
+    "timezone": "America/New_York",
+    "entry_start": "09:30:15",
+    "entry_end": "15:50:15",
+    "force_flat": "15:59:30",
+    "allow_overnight": False,
+}
+
+SINGLE_STRATEGY_KERNEL_TRADER_ID = "camatron_tsla_1s_renko_0p42_e2_tp1_sl3_qty1_20260917_live"
+SINGLE_STRATEGY_KERNEL_BRICK_PCT = Decimal("0.42")
+SINGLE_STRATEGY_KERNEL_ENTRY_BRICKS = 2
+SINGLE_STRATEGY_KERNEL_TAKE_PROFIT_BRICKS = 1
+SINGLE_STRATEGY_KERNEL_STOP_LOSS_BRICKS = 3
 
 
 @dataclass(frozen=True)
@@ -42,6 +58,7 @@ def build_strategy_config(trader: dict[str, Any]) -> RenkoStrategyConfig | MeanR
     strategy = trader.get("strategy") if isinstance(trader.get("strategy"), dict) else {}
     session = trader.get("session") if isinstance(trader.get("session"), dict) else {}
     sizing = trader.get("sizing") if isinstance(trader.get("sizing"), dict) else {}
+    protection = strategy.get("protection") if isinstance(strategy.get("protection"), dict) else {}
 
     strategy_type = str(strategy.get("type") or "renko_tp_sl")
     if strategy_type not in {"renko_tp_sl", "renko_psar", "renko_reversal", "chop_mean_reversion"}:
@@ -53,11 +70,13 @@ def build_strategy_config(trader: dict[str, Any]) -> RenkoStrategyConfig | MeanR
     qty = as_float(sizing.get("qty"), default=0.0) or None
     notional = as_float(sizing.get("notional"), default=0.0) or None
     exit_management = str(strategy.get("exit_management") or "strategy").lower().strip()
-    if exit_management == "oco":
+    if exit_management in {"oco", "bracket", "catastrophic_stop"}:
         if qty is None:
-            raise TraderConfigError(f"{trader.get('id')}: oco exit_management requires whole-share qty sizing.")
+            raise TraderConfigError(f"{trader.get('id')}: {exit_management} exit_management requires whole-share qty sizing.")
         if abs(qty - round(qty)) > 1e-9:
-            raise TraderConfigError(f"{trader.get('id')}: Alpaca OCO does not support fractional qty sizing ({qty:g}).")
+            raise TraderConfigError(
+                f"{trader.get('id')}: Alpaca-managed exit does not support fractional qty sizing ({qty:g})."
+            )
 
     if strategy_type == "chop_mean_reversion":
         return MeanReversionStrategyConfig(
@@ -85,7 +104,28 @@ def build_strategy_config(trader: dict[str, Any]) -> RenkoStrategyConfig | MeanR
             allow_overnight=bool(session.get("allow_overnight", False)),
         )
 
+    if strategy_type == "renko_tp_sl":
+        session_timezone = TP_SL_SESSION_CONTRACT["timezone"]
+        session_entry_start = TP_SL_SESSION_CONTRACT["entry_start"]
+        session_entry_end = TP_SL_SESSION_CONTRACT["entry_end"]
+        session_force_flat = TP_SL_SESSION_CONTRACT["force_flat"]
+        session_allow_overnight = TP_SL_SESSION_CONTRACT["allow_overnight"]
+    else:
+        session_timezone = str(session.get("timezone") or "America/New_York")
+        session_entry_start = session.get("entry_start")
+        session_entry_end = session.get("entry_end")
+        session_force_flat = session.get("force_flat")
+        session_allow_overnight = bool(session.get("allow_overnight", False))
+
     brick_size = effective_renko_brick_size(trader)
+    contract_fingerprints = trader.get("contract_fingerprints") if isinstance(trader.get("contract_fingerprints"), dict) else {}
+    market_stream_contract = contract_fingerprints.get("market_stream") if isinstance(contract_fingerprints.get("market_stream"), dict) else {}
+    max_recovery_attempts = protection.get("max_recovery_attempts")
+    if max_recovery_attempts is None:
+        max_recovery_attempts = strategy.get("protection_max_recovery_attempts")
+    emergency_flatten_enabled = protection.get("emergency_flatten_enabled")
+    if emergency_flatten_enabled is None:
+        emergency_flatten_enabled = strategy.get("emergency_flatten_enabled", False)
     return RenkoStrategyConfig(
         trader_id=str(trader["id"]),
         symbol=str(trader["symbol"]).upper(),
@@ -94,6 +134,11 @@ def build_strategy_config(trader: dict[str, Any]) -> RenkoStrategyConfig | MeanR
         entry_bricks=int(strategy["entry_bricks"]),
         take_profit_bricks=int(strategy["take_profit_bricks"]) if strategy.get("take_profit_bricks") else None,
         stop_loss_bricks=int(strategy["stop_loss_bricks"]) if strategy.get("stop_loss_bricks") else None,
+        catastrophic_stop_bricks=int(
+            protection.get("catastrophic_stop_bricks") or strategy.get("catastrophic_stop_bricks")
+        )
+        if protection.get("catastrophic_stop_bricks") or strategy.get("catastrophic_stop_bricks")
+        else None,
         psar_initial_stop_bricks=int(strategy["psar_initial_stop_bricks"]) if strategy.get("psar_initial_stop_bricks") else None,
         psar_af_step=float(strategy["psar_af_step"]) if strategy.get("psar_af_step") else None,
         psar_af_max=float(strategy["psar_af_max"]) if strategy.get("psar_af_max") else None,
@@ -104,6 +149,16 @@ def build_strategy_config(trader: dict[str, Any]) -> RenkoStrategyConfig | MeanR
         exit_management=exit_management,
         stop_loss_order_type=str(strategy.get("stop_loss_order_type") or "stop_market").lower().strip(),
         stop_limit_offset_pct=float(strategy.get("stop_limit_offset_pct") or 0.0),
+        protection_acknowledgement_timeout_seconds=float(
+            protection.get("acknowledgement_timeout_seconds")
+            or strategy.get("protection_acknowledgement_timeout_seconds")
+            or 2.0
+        ),
+        protection_polling_interval_seconds=float(
+            protection.get("polling_interval_seconds") or strategy.get("protection_polling_interval_seconds") or 0.25
+        ),
+        protection_max_recovery_attempts=int(max_recovery_attempts if max_recovery_attempts is not None else 1),
+        emergency_flatten_enabled=as_bool(emergency_flatten_enabled, default=False),
         qty=qty,
         notional=notional,
         renko_anchor_mode=str(strategy.get("renko_anchor_mode") or strategy.get("anchor_mode") or "first_price"),
@@ -112,13 +167,23 @@ def build_strategy_config(trader: dict[str, Any]) -> RenkoStrategyConfig | MeanR
         else float(strategy["anchor_price"])
         if strategy.get("anchor_price") is not None
         else None,
-        timezone=str(session.get("timezone") or "America/New_York"),
-        entry_start=session.get("entry_start"),
-        entry_end=session.get("entry_end"),
-        force_flat=session.get("force_flat"),
+        timezone=str(session_timezone),
+        entry_start=session_entry_start,
+        entry_end=session_entry_end,
+        force_flat=session_force_flat,
         active_start_date=session.get("active_start_date"),
         active_end_date=session.get("active_end_date"),
-        allow_overnight=bool(session.get("allow_overnight", False)),
+        allow_overnight=bool(session_allow_overnight),
+        candidate_config_fingerprint=(
+            strategy.get("candidate_config_fingerprint")
+            or trader.get("candidate_config_fingerprint")
+            or trader.get("config_fingerprint")
+        ),
+        market_contract_fingerprint=(
+            strategy.get("market_contract_fingerprint")
+            or trader.get("market_contract_fingerprint")
+            or market_stream_contract.get("fingerprint")
+        ),
     )
 
 
@@ -129,6 +194,7 @@ def load_production_renko_config(config_path: str | Path, trader_id: str) -> Loa
     strategy_config = build_strategy_config(trader)
     if not isinstance(strategy_config, RenkoStrategyConfig):
         raise TraderConfigError(f"{trader_id}: PRODUCTION_CONFIG replay V1 supports RenkoStrategyConfig only.")
+    validate_renko_trader_source(trader)
     brick_audit = audit_renko_brick_config(trader, strategy_config=strategy_config)
     metadata = production_metadata(path, trader_id, trader, strategy_config, brick_audit)
     compact = {
@@ -241,6 +307,11 @@ def production_metadata(
     session = trader.get("session") if isinstance(trader.get("session"), dict) else {}
     data_block = trader.get("data") if isinstance(trader.get("data"), dict) else {}
     sizing = trader.get("sizing") if isinstance(trader.get("sizing"), dict) else {}
+    contracts = contract_snapshot(
+        symbol=strategy_config.symbol,
+        strategy_config=strategy_config,
+        session_timezone=strategy_config.timezone,
+    )
     return {
         "source_config_path": str(path),
         "selected_trader_id": trader_id,
@@ -267,6 +338,7 @@ def production_metadata(
         "session": session,
         "sizing": sizing,
         "brick_audit": asdict(brick_audit),
+        "contract_fingerprints": contracts,
     }
 
 
@@ -277,13 +349,73 @@ def find_trader(data: dict[str, Any], trader_id: str) -> dict[str, Any]:
     raise TraderConfigError(f"Trader {trader_id} not found in production config.")
 
 
+def validate_single_strategy_kernel_config(data: dict[str, Any], *, config_path: str | None = None) -> None:
+    active = [
+        trader
+        for trader in data.get("traders", [])
+        if isinstance(trader, dict)
+        and bool(trader.get("enabled", True))
+        and bool(trader.get("execution_enabled", True))
+    ]
+    source = f"{config_path}: " if config_path else ""
+    if len(active) != 1:
+        ids = [str(trader.get("id") or "<missing-id>") for trader in active]
+        raise TraderConfigError(
+            f"{source}single-strategy kernel requires exactly one active execution trader; found {len(active)}: {ids}"
+        )
+
+    trader = active[0]
+    strategy = trader.get("strategy") if isinstance(trader.get("strategy"), dict) else {}
+    data_block = trader.get("data") if isinstance(trader.get("data"), dict) else {}
+    sizing = trader.get("sizing") if isinstance(trader.get("sizing"), dict) else {}
+    profile = trader.get("profile") if isinstance(trader.get("profile"), dict) else {}
+    trader_id = str(trader.get("id") or "<missing-id>")
+    account_namespace = normalized_account_namespace(
+        trader.get("account_namespace") or trader.get("account_alias") or trader.get("credential_profile")
+    )
+    qty = as_float(sizing.get("qty"), default=0.0)
+    brick_pct = _decimal_or_none(strategy.get("brick_pct") or profile.get("renko_brick_pct"))
+    checks = {
+        "trader_id": trader_id == SINGLE_STRATEGY_KERNEL_TRADER_ID,
+        "symbol": str(trader.get("symbol") or "").upper() == "TSLA",
+        "broker": str(trader.get("broker") or "").lower() == "alpaca",
+        "account_namespace": account_namespace == "camatron",
+        "mode": str(trader.get("mode") or "").lower() == "live",
+        "strategy_type": str(strategy.get("type") or "").lower() == "renko_tp_sl",
+        "brick_pct": brick_pct == SINGLE_STRATEGY_KERNEL_BRICK_PCT,
+        "entry_bricks": int(strategy.get("entry_bricks") or 0) == SINGLE_STRATEGY_KERNEL_ENTRY_BRICKS,
+        "take_profit_bricks": int(strategy.get("take_profit_bricks") or 0) == SINGLE_STRATEGY_KERNEL_TAKE_PROFIT_BRICKS,
+        "stop_loss_bricks": int(strategy.get("stop_loss_bricks") or 0) == SINGLE_STRATEGY_KERNEL_STOP_LOSS_BRICKS,
+        "exit_management": str(strategy.get("exit_management") or "").lower() == "bracket",
+        "qty": abs(qty - 1.0) <= 1e-9,
+        "market_data_source": str(data_block.get("market_data_source") or "").lower() == "shared_canonical_stream",
+        "feed": str(data_block.get("feed") or "").lower() == "sip",
+        "renko_source": str(data_block.get("renko_source") or "").lower() == CANONICAL_RENKO_SOURCE,
+    }
+    failed = [name for name, ok in checks.items() if not ok]
+    if failed:
+        raise TraderConfigError(
+            f"{source}{trader_id}: single-strategy kernel violation: {', '.join(failed)}"
+        )
+
+
 def normalize_renko_source(value: Any) -> str:
-    raw = str(value or "ticks").lower().strip().replace("-", "_")
-    if raw in {"tick", "ticks", "raw_ticks"}:
-        return "ticks"
-    if raw in {"1s", "1s_close", "one_second_close", "second_close", "one_second_close"}:
-        return "1s_close"
-    raise TraderConfigError(f"Unsupported renko_source: {value}")
+    try:
+        return validate_canonical_renko_source(value)
+    except ValueError as exc:
+        raise TraderConfigError(str(exc)) from exc
+
+
+def validate_renko_trader_source(trader: dict[str, Any]) -> str:
+    data_block = trader.get("data") if isinstance(trader.get("data"), dict) else {}
+    try:
+        return validate_canonical_renko_source(data_block.get("renko_source"), trader_id=str(trader.get("id") or "UNKNOWN"))
+    except ValueError as exc:
+        raise TraderConfigError(str(exc)) from exc
+
+
+def canonical_observation_source_for_non_renko() -> str:
+    return CANONICAL_RENKO_SOURCE
 
 
 def normalized_account_namespace(value: Any) -> str | None:
@@ -296,6 +428,19 @@ def as_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
 
 
 def _decimal_or_none(value: Any) -> Decimal | None:

@@ -160,6 +160,35 @@ struct BrickAudit {
     double threshold = 0.0;
 };
 
+struct RenkoParityArgs {
+    bool enabled = false;
+    std::string input_csv;
+    double brick_size = 1.0;
+    std::string anchor_mode = "first_price";
+    double anchor_price = 0.0;
+};
+
+struct LogicalBrick {
+    std::string timestamp;
+    double close = 0.0;
+    int direction = 0;
+    int run_len = 0;
+};
+
+struct RenkoParityState {
+    double brick_size = 1.0;
+    double last_close = 0.0;
+    int run_dir = 0;
+    int run_len = 0;
+    bool initialized = false;
+    std::string anchor_mode = "first_price";
+    double anchor_price = 0.0;
+};
+
+constexpr double RENKO_EPSILON = 1e-12;
+
+static std::string arg_value(int& idx, int argc, char** argv);
+
 static std::vector<std::string> split(const std::string& raw, char delim) {
     std::vector<std::string> out;
     std::stringstream ss(raw);
@@ -182,6 +211,145 @@ static std::vector<double> parse_doubles(const std::string& raw) {
     for (const auto& part : split(raw, ',')) values.push_back(std::stod(part));
     if (values.empty()) throw std::runtime_error("empty double list");
     return values;
+}
+
+static std::string trim_copy(const std::string& raw) {
+    size_t start = 0;
+    while (start < raw.size() && std::isspace(static_cast<unsigned char>(raw[start]))) start++;
+    size_t end = raw.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(raw[end - 1]))) end--;
+    return raw.substr(start, end - start);
+}
+
+static bool threshold_gte(double value, double threshold) {
+    return value >= threshold - RENKO_EPSILON;
+}
+
+static bool threshold_lte(double value, double threshold) {
+    return value <= threshold + RENKO_EPSILON;
+}
+
+static double initial_renko_close_cpp(double price, const RenkoParityState& state) {
+    std::string mode = state.anchor_mode;
+    std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) { return std::tolower(c); });
+    if (mode == "first_price" || mode == "first" || mode == "price") return price;
+    if (mode == "grid" || mode == "zero_grid" || mode == "anchored_grid") {
+        return state.anchor_price + std::floor((price - state.anchor_price) / state.brick_size) * state.brick_size;
+    }
+    throw std::runtime_error("unsupported parity anchor mode: " + state.anchor_mode);
+}
+
+static bool next_renko_step_cpp(const RenkoParityState& state, double price, int& direction, int& close_bricks) {
+    const double move = price - state.last_close;
+    direction = 0;
+    close_bricks = 1;
+    if (state.run_dir == 1) {
+        if (threshold_gte(move, state.brick_size)) {
+            direction = 1;
+            close_bricks = 1;
+            return true;
+        }
+        if (threshold_lte(move, -2.0 * state.brick_size)) {
+            direction = -1;
+            close_bricks = 2;
+            return true;
+        }
+    } else if (state.run_dir == -1) {
+        if (threshold_lte(move, -state.brick_size)) {
+            direction = -1;
+            close_bricks = 1;
+            return true;
+        }
+        if (threshold_gte(move, 2.0 * state.brick_size)) {
+            direction = 1;
+            close_bricks = 2;
+            return true;
+        }
+    } else {
+        if (threshold_gte(move, state.brick_size)) {
+            direction = 1;
+            close_bricks = 1;
+            return true;
+        }
+        if (threshold_lte(move, -state.brick_size)) {
+            direction = -1;
+            close_bricks = 1;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void update_renko_parity_state(
+    RenkoParityState& state,
+    const std::string& timestamp,
+    double price,
+    std::vector<LogicalBrick>& bricks
+) {
+    if (state.brick_size <= 0.0) throw std::runtime_error("brick_size must be > 0");
+    if (!state.initialized) {
+        state.last_close = initial_renko_close_cpp(price, state);
+        state.initialized = true;
+        return;
+    }
+    while (true) {
+        int direction = 0;
+        int close_bricks = 1;
+        if (!next_renko_step_cpp(state, price, direction, close_bricks)) break;
+        state.last_close += direction * state.brick_size * close_bricks;
+        if (direction == state.run_dir) {
+            state.run_len++;
+        } else {
+            state.run_dir = direction;
+            state.run_len = 1;
+        }
+        bricks.push_back(LogicalBrick{timestamp, state.last_close, direction, state.run_len});
+    }
+}
+
+static RenkoParityArgs parse_renko_parity_args(int argc, char** argv) {
+    RenkoParityArgs out;
+    for (int i = 1; i < argc; i++) {
+        const std::string key = argv[i];
+        if (key == "--renko-parity-csv") {
+            out.enabled = true;
+            out.input_csv = arg_value(i, argc, argv);
+        } else if (key == "--brick-size") {
+            out.brick_size = std::stod(arg_value(i, argc, argv));
+        } else if (key == "--anchor-mode") {
+            out.anchor_mode = arg_value(i, argc, argv);
+        } else if (key == "--anchor-price") {
+            out.anchor_price = std::stod(arg_value(i, argc, argv));
+        }
+    }
+    if (out.enabled && out.input_csv.empty()) throw std::runtime_error("--renko-parity-csv requires a path");
+    return out;
+}
+
+static int run_renko_parity_mode(const RenkoParityArgs& args) {
+    std::ifstream in(args.input_csv);
+    if (!in) throw std::runtime_error("could not open parity csv: " + args.input_csv);
+    std::string line;
+    std::getline(in, line);
+    RenkoParityState state;
+    state.brick_size = args.brick_size;
+    state.anchor_mode = args.anchor_mode;
+    state.anchor_price = args.anchor_price;
+    std::vector<LogicalBrick> bricks;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        const auto parts = split(line, ',');
+        if (parts.size() < 2) continue;
+        const std::string ts = trim_copy(parts[0]);
+        const double price = std::stod(trim_copy(parts[1]));
+        update_renko_parity_state(state, ts, price, bricks);
+    }
+    std::cout << "timestamp,brick_close,direction,run_len\n";
+    std::cout << std::fixed << std::setprecision(12);
+    for (const auto& brick : bricks) {
+        std::cout << brick.timestamp << ',' << brick.close << ',' << brick.direction << ',' << brick.run_len << "\n";
+    }
+    return 0;
 }
 
 static std::string arg_value(int& idx, int argc, char** argv) {
@@ -216,8 +384,8 @@ static Args parse_args(int argc, char** argv) {
     }
     if (args.archive_root.empty()) throw std::runtime_error("--archive-root required");
     if (args.output_dir.empty()) throw std::runtime_error("--output-dir required");
-    if (args.source_mode != "1s-close" && args.source_mode != "tick") {
-        throw std::runtime_error("--source-mode must be 1s-close or tick");
+    if (args.source_mode != "1s-close") {
+        throw std::runtime_error("--source-mode must be canonical 1s-close; raw tick mode is noncanonical and blocked");
     }
     return args;
 }
@@ -629,6 +797,8 @@ static void write_metadata(const fs::path& path, const Args& args, const PriceLo
     out << "  \"archive_root\": \"" << args.archive_root << "\",\n";
     out << "  \"symbol\": \"" << args.symbol << "\",\n";
     out << "  \"source_mode\": \"" << args.source_mode << "\",\n";
+    out << "  \"promotion_eligible\": false,\n";
+    out << "  \"promotion_block_reason\": \"C++ historical helper does not consume persisted Silver canonical observations or contract fingerprints\",\n";
     out << "  \"entry_session_start_utc\": \"" << args.entry_session_start_utc << "\",\n";
     out << "  \"entry_session_end_utc\": \"" << args.entry_session_end_utc << "\",\n";
     out << "  \"force_flat_utc\": \"" << args.force_flat_utc << "\",\n";
@@ -652,6 +822,10 @@ static void write_metadata(const fs::path& path, const Args& args, const PriceLo
 
 int main(int argc, char** argv) {
     try {
+        const RenkoParityArgs parity_args = parse_renko_parity_args(argc, argv);
+        if (parity_args.enabled) {
+            return run_renko_parity_mode(parity_args);
+        }
         Args args = parse_args(argc, argv);
         fs::create_directories(args.output_dir);
         PriceLoad load = load_prices(args);

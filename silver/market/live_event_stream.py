@@ -9,7 +9,8 @@ from typing import Any, AsyncIterator
 
 import pandas as pd
 
-from trading_events import MarketTick, is_price_forming_trade
+from trading_events import MarketTick, utc_timestamp_with_info
+from .trade_filter import evaluate_market_tick_eligibility
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,7 @@ class LiveMarketEvent:
     source_sequence: int | None
     eligible: bool
     archive_path: str | None = None
+    local_timing: dict[str, float] | None = None
 
 
 def live_market_event_from_archive_payload(
@@ -45,19 +47,29 @@ def live_market_event_from_archive_payload(
         source_record_id=str(payload.get("source_record_id") or _stable_source_record_id(tick, producer_sequence)),
         broker_trade_id=tick.trade_id or None,
         source_sequence=resolved_sequence,
-        eligible=bool(payload.get("eligible", is_price_forming_trade(tick))),
+        eligible=bool(payload.get("eligible", evaluate_market_tick_eligibility(tick))),
         archive_path=archive_path,
     )
 
 
 def live_market_event_from_alpaca_message(message: dict[str, Any], *, source_sequence: int) -> LiveMarketEvent:
-    tick = MarketTick.from_alpaca_trade(message)
+    timestamp, _info = utc_timestamp_with_info(message["t"])
+    tick = MarketTick(
+        timestamp=timestamp,
+        symbol=str(message["S"]).upper(),
+        price=float(message["p"]),
+        size=float(message["s"]),
+        exchange=str(message.get("x", "")),
+        trade_id=str(message.get("i", "")),
+        tape=str(message.get("z", "")),
+        conditions=tuple(str(condition) for condition in message.get("c", []) if condition is not None),
+    )
     return LiveMarketEvent(
         tick=tick,
         source_record_id=_stable_source_record_id(tick, None),
         broker_trade_id=tick.trade_id or None,
         source_sequence=source_sequence,
-        eligible=is_price_forming_trade(tick),
+        eligible=evaluate_market_tick_eligibility(tick),
     )
 
 

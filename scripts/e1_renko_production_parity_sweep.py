@@ -31,6 +31,22 @@ class PricePoint:
     close: float
 
 
+@dataclass(frozen=True)
+class DataQualityStats:
+    raw_rows: int = 0
+    valid_rows: int = 0
+    invalid_rows: int = 0
+    non_finite_prices: int = 0
+    out_of_order_rows: int = 0
+    duplicate_timestamps: int = 0
+    unchanged_prices: int = 0
+    first_raw_timestamp: str | None = None
+    last_raw_timestamp: str | None = None
+    first_output_timestamp: str | None = None
+    last_output_timestamp: str | None = None
+    sorted_or_deduped: bool = False
+
+
 @dataclass
 class SimPosition:
     side: str
@@ -39,14 +55,44 @@ class SimPosition:
     entry_time: pd.Timestamp
 
 
+@dataclass(frozen=True)
+class PendingFill:
+    order_id: str
+    action: str
+    side: str
+    qty: float
+    signal_time: pd.Timestamp
+    signal_price: float
+    order_submission_time: pd.Timestamp
+    reason: str
+
+
+@dataclass(frozen=True)
+class SimFill:
+    order_id: str
+    action: str
+    side: str
+    qty: float
+    signal_time: str
+    signal_price: float
+    order_submission_time: str
+    fill_time: str
+    fill_price: float
+    reason: str
+    pnl: float | None = None
+
+
 @dataclass
 class SweepRow:
     trader_id: str
     symbol: str
     brick_size: float
+    execution_model: str
+    slippage_per_fill: float
     renko_bricks: int
     signals: int
     simulated_fills: int
+    pending_fills: int
     closed_trades: int
     wins: int
     losses: int
@@ -90,7 +136,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-pct", type=float, default=0.05, help="Min brick as percent of last price.")
     parser.add_argument("--max-pct", type=float, default=1.50, help="Max brick as percent of last price.")
     parser.add_argument("--step-pct", type=float, default=0.01, help="Brick percent step.")
-    parser.add_argument("--slippage", type=float, default=0.03, help="Adverse dollars per simulated fill.")
+    parser.add_argument(
+        "--execution-model",
+        choices=["idealized", "slippage", "next_event"],
+        default="slippage",
+        help="Fill model: idealized=signal threshold, slippage=signal threshold +/- slippage, next_event=next market event after signal.",
+    )
+    parser.add_argument("--slippage", type=float, default=0.03, help="Adverse dollars per simulated fill in slippage mode.")
     parser.add_argument("--write-renko-bars", choices=["none", "top", "all"], default="top")
     parser.add_argument("--top", type=int, default=25)
     parser.add_argument("--request-sleep", type=float, default=0.02)
@@ -157,8 +209,69 @@ def cache_path(symbol: str, feed: str, day: date) -> Path:
     return Path("artifacts/market_data/daily") / f"{symbol.upper()}_{feed}_{day}_price_forming_1s_close.csv"
 
 
-def load_csv_prices(path: Path) -> list[PricePoint]:
+def quality_stats(raw: list[PricePoint], output: list[PricePoint], invalid_rows: int = 0, non_finite_prices: int = 0) -> DataQualityStats:
+    out_of_order = 0
+    duplicate_timestamps = 0
+    unchanged = 0
+    seen: set[pd.Timestamp] = set()
+    previous_ts: pd.Timestamp | None = None
+    previous_price: float | None = None
+    for point in raw:
+        if previous_ts is not None and point.timestamp < previous_ts:
+            out_of_order += 1
+        if point.timestamp in seen:
+            duplicate_timestamps += 1
+        if previous_price is not None and abs(point.close - previous_price) < 1e-12:
+            unchanged += 1
+        seen.add(point.timestamp)
+        previous_ts = point.timestamp
+        previous_price = point.close
+    return DataQualityStats(
+        raw_rows=len(raw) + invalid_rows,
+        valid_rows=len(raw),
+        invalid_rows=invalid_rows,
+        non_finite_prices=non_finite_prices,
+        out_of_order_rows=out_of_order,
+        duplicate_timestamps=duplicate_timestamps,
+        unchanged_prices=unchanged,
+        first_raw_timestamp=iso_z(raw[0].timestamp) if raw else None,
+        last_raw_timestamp=iso_z(raw[-1].timestamp) if raw else None,
+        first_output_timestamp=iso_z(output[0].timestamp) if output else None,
+        last_output_timestamp=iso_z(output[-1].timestamp) if output else None,
+        sorted_or_deduped=bool(out_of_order or duplicate_timestamps),
+    )
+
+
+def merge_quality_stats(parts: list[DataQualityStats], output: list[PricePoint]) -> DataQualityStats:
+    if not parts:
+        return quality_stats(output, output)
+    raw_rows = sum(part.raw_rows for part in parts)
+    valid_rows = sum(part.valid_rows for part in parts)
+    invalid_rows = sum(part.invalid_rows for part in parts)
+    non_finite_prices = sum(part.non_finite_prices for part in parts)
+    out_of_order_rows = sum(part.out_of_order_rows for part in parts)
+    duplicate_timestamps = sum(part.duplicate_timestamps for part in parts)
+    unchanged_prices = sum(part.unchanged_prices for part in parts)
+    return DataQualityStats(
+        raw_rows=raw_rows,
+        valid_rows=valid_rows,
+        invalid_rows=invalid_rows,
+        non_finite_prices=non_finite_prices,
+        out_of_order_rows=out_of_order_rows,
+        duplicate_timestamps=duplicate_timestamps,
+        unchanged_prices=unchanged_prices,
+        first_raw_timestamp=parts[0].first_raw_timestamp,
+        last_raw_timestamp=parts[-1].last_raw_timestamp,
+        first_output_timestamp=iso_z(output[0].timestamp) if output else None,
+        last_output_timestamp=iso_z(output[-1].timestamp) if output else None,
+        sorted_or_deduped=any(part.sorted_or_deduped for part in parts),
+    )
+
+
+def load_csv_prices(path: Path) -> tuple[list[PricePoint], DataQualityStats]:
     rows: list[PricePoint] = []
+    invalid_rows = 0
+    non_finite_prices = 0
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         fields = {name.lower(): name for name in (reader.fieldnames or [])}
@@ -167,9 +280,20 @@ def load_csv_prices(path: Path) -> list[PricePoint]:
         if not time_key or not close_key:
             raise RuntimeError(f"{path} needs timestamp and close/price columns.")
         for row in reader:
-            if row.get(time_key) and row.get(close_key):
-                rows.append(PricePoint(timestamp=parse_ts(row[time_key]), close=float(row[close_key])))
-    return dedupe_points(rows)
+            if not row.get(time_key) or not row.get(close_key):
+                invalid_rows += 1
+                continue
+            try:
+                close = float(row[close_key])
+                if not math.isfinite(close):
+                    non_finite_prices += 1
+                    invalid_rows += 1
+                    continue
+                rows.append(PricePoint(timestamp=parse_ts(row[time_key]), close=close))
+            except (TypeError, ValueError):
+                invalid_rows += 1
+    output = dedupe_points(rows)
+    return output, quality_stats(rows, output, invalid_rows=invalid_rows, non_finite_prices=non_finite_prices)
 
 
 def write_prices_csv(path: Path, points: list[PricePoint]) -> None:
@@ -203,7 +327,7 @@ def request_json(url: str, headers: dict[str, str], params: dict[str, object], a
     raise RuntimeError(f"Alpaca request failed after {attempts} attempts: {last_error}") from last_error
 
 
-def fetch_trade_day(symbol: str, day: date, feed: str, headers: dict[str, str], request_sleep: float, max_pages: int) -> list[PricePoint]:
+def fetch_trade_day(symbol: str, day: date, feed: str, headers: dict[str, str], request_sleep: float, max_pages: int) -> tuple[list[PricePoint], DataQualityStats]:
     start, end = session_bounds_utc(day)
     params: dict[str, object] = {
         "start": iso_z(start),
@@ -228,28 +352,33 @@ def fetch_trade_day(symbol: str, day: date, feed: str, headers: dict[str, str], 
         params["page_token"] = token
         if request_sleep > 0:
             time.sleep(request_sleep)
-    return [PricePoint(timestamp=ts, close=tick.price) for ts, tick in sorted(by_second.items())]
+    points = [PricePoint(timestamp=ts, close=tick.price) for ts, tick in sorted(by_second.items())]
+    return points, quality_stats(points, points)
 
 
-def load_or_fetch(symbol: str, start: date, end: date, args: argparse.Namespace, source_csvs: dict[str, Path]) -> tuple[str, list[PricePoint]]:
+def load_or_fetch(symbol: str, start: date, end: date, args: argparse.Namespace, source_csvs: dict[str, Path]) -> tuple[str, list[PricePoint], DataQualityStats]:
     if symbol in source_csvs:
-        return str(source_csvs[symbol]), load_csv_prices(source_csvs[symbol])
+        points, stats = load_csv_prices(source_csvs[symbol])
+        return str(source_csvs[symbol]), points, stats
 
     headers = alpaca_headers()
     points: list[PricePoint] = []
+    stats_parts: list[DataQualityStats] = []
     current = start
     while current <= end:
         path = cache_path(symbol, args.feed, current)
         if path.exists():
-            day_points = load_csv_prices(path)
+            day_points, day_stats = load_csv_prices(path)
             print(f"{symbol} {current}: loaded {len(day_points)} cached price-forming 1s closes", flush=True)
         else:
-            day_points = fetch_trade_day(symbol, current, args.feed, headers, args.request_sleep, args.max_pages_per_day)
+            day_points, day_stats = fetch_trade_day(symbol, current, args.feed, headers, args.request_sleep, args.max_pages_per_day)
             write_prices_csv(path, day_points)
             print(f"{symbol} {current}: fetched {len(day_points)} price-forming 1s closes", flush=True)
         points.extend(day_points)
+        stats_parts.append(day_stats)
         current += timedelta(days=1)
-    return f"daily:{args.feed}:{start}:{end}:price_forming_1s_close", dedupe_points(points)
+    output = dedupe_points(points)
+    return f"daily:{args.feed}:{start}:{end}:price_forming_1s_close", output, merge_quality_stats(stats_parts, output)
 
 
 def dedupe_points(points: list[PricePoint]) -> list[PricePoint]:
@@ -319,19 +448,36 @@ def adverse_close_price(side: str, price: float, slippage: float) -> float:
     return price - slippage if side == "long" else price + slippage
 
 
+def model_price(action: str, side: str, price: float, execution_model: str, slippage: float) -> float:
+    if execution_model in {"idealized", "next_event"}:
+        return price
+    if action == "open":
+        return adverse_open_price(side, price, slippage)
+    return adverse_close_price(side, price, slippage)
+
+
 def position_pnl(position: SimPosition, close_price: float) -> float:
     if position.side == "long":
         return (close_price - position.entry_price) * position.qty
     return (position.entry_price - close_price) * position.qty
 
 
-def simulate(trader: dict[str, Any], points: list[PricePoint], brick_size: float, slippage: float) -> tuple[SweepRow, list[RenkoBrick]]:
+def simulate(
+    trader: dict[str, Any],
+    points: list[PricePoint],
+    brick_size: float,
+    execution_model: str,
+    slippage: float,
+) -> tuple[SweepRow, list[RenkoBrick], list[SimFill]]:
     config = build_strategy_config(with_brick_size(trader, brick_size))
     if not isinstance(config, RenkoStrategyConfig) or config.strategy_type != "renko_reversal":
         raise RuntimeError(f"{trader.get('id')}: not an E1 renko_reversal trader.")
 
     engine = RenkoStrategyEngine(config)
     position: SimPosition | None = None
+    pending: list[PendingFill] = []
+    seen_fills: set[str] = set()
+    fill_log: list[SimFill] = []
     realized = 0.0
     gross_profit = 0.0
     gross_loss = 0.0
@@ -343,21 +489,16 @@ def simulate(trader: dict[str, Any], points: list[PricePoint], brick_size: float
     max_drawdown = 0.0
     renko_bricks: list[RenkoBrick] = []
 
-    for point in points:
-        # This is the same state transition used by RenkoStrategyEngine.on_tick after the symbol check.
-        bricks, actions = engine._process_price(timestamp=point.timestamp, price=point.close)
-        renko_bricks.extend(bricks)
-        for signal, intent in actions:
-            signals += 1
-            first_signal = first_signal or signal.timestamp
-            last_signal = signal.timestamp
-            next_side = "long" if intent.side == "buy" else "short"
-            target_qty = float(intent.target_qty or config.qty or 1.0)
-
-            if intent.close_position:
-                if position is None:
-                    continue
-                fill_price = adverse_close_price(position.side, signal.price, slippage)
+    def apply_fill(order: PendingFill, point: PricePoint) -> None:
+        nonlocal position, realized, gross_profit, gross_loss
+        nonlocal wins, losses, flats, closed_trades, simulated_fills, equity, peak, max_drawdown
+        if order.order_id in seen_fills:
+            return
+        seen_fills.add(order.order_id)
+        fill_price = model_price(order.action, order.side, point.close, execution_model, slippage)
+        pnl: float | None = None
+        if order.action == "close":
+            if position is not None:
                 pnl = position_pnl(position, fill_price)
                 realized += pnl
                 gross_profit += max(pnl, 0.0)
@@ -366,30 +507,114 @@ def simulate(trader: dict[str, Any], points: list[PricePoint], brick_size: float
                 losses += pnl < 0
                 flats += abs(pnl) < 1e-12
                 closed_trades += 1
-                simulated_fills += 1
                 position = None
-            elif position is not None and position.side != next_side:
-                close_fill = adverse_close_price(position.side, signal.price, slippage)
-                pnl = position_pnl(position, close_fill)
-                realized += pnl
-                gross_profit += max(pnl, 0.0)
-                gross_loss += min(pnl, 0.0)
-                wins += pnl > 0
-                losses += pnl < 0
-                flats += abs(pnl) < 1e-12
-                closed_trades += 1
-                simulated_fills += 1
-                open_fill = adverse_open_price(next_side, signal.price, slippage)
-                position = SimPosition(side=next_side, qty=target_qty, entry_price=open_fill, entry_time=signal.timestamp)
-                simulated_fills += 1
-            elif position is None:
-                open_fill = adverse_open_price(next_side, signal.price, slippage)
-                position = SimPosition(side=next_side, qty=target_qty, entry_price=open_fill, entry_time=signal.timestamp)
-                simulated_fills += 1
+        elif order.action == "open":
+            position = SimPosition(side=order.side, qty=order.qty, entry_price=fill_price, entry_time=point.timestamp)
+        else:
+            raise RuntimeError(f"Unsupported fill action: {order.action}")
+        simulated_fills += 1
+        fill_log.append(
+            SimFill(
+                order_id=order.order_id,
+                action=order.action,
+                side=order.side,
+                qty=order.qty,
+                signal_time=iso_z(order.signal_time),
+                signal_price=order.signal_price,
+                order_submission_time=iso_z(order.order_submission_time),
+                fill_time=iso_z(point.timestamp),
+                fill_price=fill_price,
+                reason=order.reason,
+                pnl=pnl,
+            )
+        )
+        equity = realized
+        peak = max(peak, equity)
+        max_drawdown = min(max_drawdown, equity - peak)
 
-            equity = realized
-            peak = max(peak, equity)
-            max_drawdown = min(max_drawdown, equity - peak)
+    def submit_fill(order: PendingFill, point: PricePoint) -> None:
+        if execution_model == "next_event":
+            pending.append(order)
+        else:
+            apply_fill(order, PricePoint(timestamp=order.order_submission_time, close=order.signal_price))
+
+    for index, point in enumerate(points):
+        if pending:
+            due = pending
+            pending = []
+            for order in due:
+                if point.timestamp <= order.order_submission_time:
+                    raise RuntimeError("next_event fill attempted without a later market event")
+                apply_fill(order, point)
+
+        # This is the same state transition used by RenkoStrategyEngine.on_tick after the symbol check.
+        bricks, actions = engine._process_price(timestamp=point.timestamp, price=point.close)
+        renko_bricks.extend(bricks)
+        for action_index, (signal, intent) in enumerate(actions):
+            signals += 1
+            first_signal = first_signal or signal.timestamp
+            last_signal = signal.timestamp
+            next_side = "long" if intent.side == "buy" else "short"
+            target_qty = float(intent.target_qty or config.qty or 1.0)
+
+            if intent.close_position:
+                if position is not None:
+                    submit_fill(
+                        PendingFill(
+                            order_id=f"{intent.client_order_id}:close:{index}:{action_index}",
+                            action="close",
+                            side=position.side,
+                            qty=position.qty,
+                            signal_time=signal.timestamp,
+                            signal_price=signal.price,
+                            order_submission_time=point.timestamp,
+                            reason=signal.reason,
+                        ),
+                        point,
+                    )
+            elif position is not None and position.side != next_side:
+                close_qty = position.qty
+                close_side = position.side
+                submit_fill(
+                    PendingFill(
+                        order_id=f"{intent.client_order_id}:close:{index}:{action_index}",
+                        action="close",
+                        side=close_side,
+                        qty=close_qty,
+                        signal_time=signal.timestamp,
+                        signal_price=signal.price,
+                        order_submission_time=point.timestamp,
+                        reason=signal.reason,
+                    ),
+                    point,
+                )
+                submit_fill(
+                    PendingFill(
+                        order_id=f"{intent.client_order_id}:open:{index}:{action_index}",
+                        action="open",
+                        side=next_side,
+                        qty=target_qty,
+                        signal_time=signal.timestamp,
+                        signal_price=signal.price,
+                        order_submission_time=point.timestamp,
+                        reason=signal.reason,
+                    ),
+                    point,
+                )
+            elif position is None:
+                submit_fill(
+                    PendingFill(
+                        order_id=f"{intent.client_order_id}:open:{index}:{action_index}",
+                        action="open",
+                        side=next_side,
+                        qty=target_qty,
+                        signal_time=signal.timestamp,
+                        signal_price=signal.price,
+                        order_submission_time=point.timestamp,
+                        reason=signal.reason,
+                    ),
+                    point,
+                )
 
     last_price = points[-1].close
     unrealized = 0.0 if position is None else position_pnl(position, last_price)
@@ -399,9 +624,12 @@ def simulate(trader: dict[str, Any], points: list[PricePoint], brick_size: float
         trader_id=str(trader["id"]),
         symbol=str(trader["symbol"]).upper(),
         brick_size=brick_size,
+        execution_model=execution_model,
+        slippage_per_fill=slippage if execution_model == "slippage" else 0.0,
         renko_bricks=len(renko_bricks),
         signals=signals,
         simulated_fills=simulated_fills,
+        pending_fills=len(pending),
         closed_trades=closed_trades,
         wins=wins,
         losses=losses,
@@ -425,7 +653,7 @@ def simulate(trader: dict[str, Any], points: list[PricePoint], brick_size: float
         first_price=points[0].close,
         last_price=last_price,
     )
-    return row, renko_bricks
+    return row, renko_bricks, fill_log
 
 
 def write_rows(path: Path, rows: list[SweepRow]) -> None:
@@ -461,6 +689,15 @@ def write_renko_bars(path: Path, bricks: list[RenkoBrick]) -> None:
             )
 
 
+def write_fills(path: Path, fills: list[SimFill]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(SimFill.__annotations__))
+        writer.writeheader()
+        for fill in fills:
+            writer.writerow(asdict(fill))
+
+
 def main() -> int:
     args = parse_args()
     start = parse_day(args.start)
@@ -476,6 +713,8 @@ def main() -> int:
 
     metadata: dict[str, Any] = {
         "method": "production_parity_e1_renko_1s_close_v1",
+        "promotion_eligible": False,
+        "promotion_block_reason": "legacy parity sweep builds derived 1-second prices outside persisted Silver prepared-source contract fingerprints",
         "production_parity_notes": [
             "Uses price-forming Alpaca trades only.",
             "Collapses trades to one close per UTC second, matching production renko_source=1s_close input semantics.",
@@ -487,14 +726,15 @@ def main() -> int:
         "start": args.start,
         "end": args.end,
         "feed": args.feed,
-        "slippage_per_fill": args.slippage,
+        "execution_model": args.execution_model,
+        "slippage_per_fill": args.slippage if args.execution_model == "slippage" else 0.0,
         "sources": {},
     }
 
     all_rows: list[SweepRow] = []
     for trader in traders:
         symbol = str(trader["symbol"]).upper()
-        source, points = load_or_fetch(symbol, start, end, args, source_csvs)
+        source, points, dq_stats = load_or_fetch(symbol, start, end, args, source_csvs)
         if len(points) < 2:
             raise RuntimeError(f"{symbol}: need at least two 1-second close points.")
         metadata["sources"][symbol] = {
@@ -502,10 +742,13 @@ def main() -> int:
             "points": len(points),
             "first": iso_z(points[0].timestamp),
             "last": iso_z(points[-1].timestamp),
+            "data_quality": asdict(dq_stats),
         }
-        rows_and_bars = [simulate(trader, points, brick, args.slippage) for brick in brick_grid(points, args)]
-        rows = [item[0] for item in rows_and_bars]
-        rows.sort(key=lambda row: (row.total_pnl, row.realized_pnl, -row.max_drawdown), reverse=True)
+        rows_and_outputs = [
+            simulate(trader, points, brick, args.execution_model, args.slippage) for brick in brick_grid(points, args)
+        ]
+        rows_and_outputs.sort(key=lambda item: (item[0].total_pnl, item[0].realized_pnl, -item[0].max_drawdown), reverse=True)
+        rows = [item[0] for item in rows_and_outputs]
         all_rows.extend(rows)
         trader_dir = output_dir / symbol.lower() / str(trader["id"])
         write_rows(trader_dir / "sweep.csv", rows)
@@ -513,9 +756,10 @@ def main() -> int:
 
         if args.write_renko_bars != "none":
             selected = set(row.brick_size for row in (rows if args.write_renko_bars == "all" else rows[: args.top]))
-            bars_by_brick = {row.brick_size: bars for row, bars in rows_and_bars if row.brick_size in selected}
-            for brick, bars in bars_by_brick.items():
+            outputs_by_brick = {row.brick_size: (bars, fills) for row, bars, fills in rows_and_outputs if row.brick_size in selected}
+            for brick, (bars, fills) in outputs_by_brick.items():
                 write_renko_bars(trader_dir / "renko_bars" / f"brick_{safe_brick_name(brick)}.csv", bars)
+                write_fills(trader_dir / "fills" / f"brick_{safe_brick_name(brick)}.csv", fills)
 
         best = rows[0]
         print(

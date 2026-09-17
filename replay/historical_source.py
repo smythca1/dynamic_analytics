@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import gzip
 import json
 from dataclasses import dataclass
 from datetime import datetime
@@ -26,6 +27,12 @@ class HistoricalSourceResult:
     malformed_rows: int
     raw_trades_in_window: int
     integrity: SourceIntegritySummary
+
+
+@dataclass(frozen=True)
+class HistoricalSourceStreamItem:
+    trade: RawSipTrade | None = None
+    diagnostic: ReplayDiagnostic | None = None
 
 
 def file_sha256(path: str | Path) -> str:
@@ -71,7 +78,8 @@ def read_historical_source(config: ReplayConfig) -> HistoricalSourceResult:
         elif trade.symbol == config.symbol and trade.sip_timestamp > config.end and integrity.out_of_order_records == 0:
             stopped_after_requested_end = True
             break
-    trades.sort(key=lambda trade: trade.ordering_key)
+    if integrity.out_of_order_records:
+        trades.sort(key=lambda trade: trade.ordering_key)
     summary = integrity.summary(
         raw_rows_read=raw_rows_read,
         malformed_rows=malformed_rows,
@@ -91,15 +99,52 @@ def read_historical_source(config: ReplayConfig) -> HistoricalSourceResult:
     )
 
 
+def stream_historical_source(config: ReplayConfig) -> Iterable[HistoricalSourceStreamItem]:
+    path = Path(config.source_data_path)
+    source_hash = file_sha256(path)
+    previous_ordering_key = None
+    for row_order, row in _read_rows(path):
+        try:
+            trade = _row_to_trade(row, row_order=row_order, config=config, source_ref=str(path), source_hash=source_hash)
+        except Exception as exc:
+            yield HistoricalSourceStreamItem(
+                diagnostic=ReplayDiagnostic(
+                    diagnostic_type="malformed_source_row",
+                    message=str(exc),
+                    severity="error",
+                    sequence=row_order,
+                    details={"source": str(path), "row_order": row_order},
+                )
+            )
+            continue
+        if previous_ordering_key is not None and trade.ordering_key < previous_ordering_key:
+            yield HistoricalSourceStreamItem(
+                diagnostic=ReplayDiagnostic(
+                    diagnostic_type="out_of_order_source_rows",
+                    message="Streaming historical source encountered out-of-order rows.",
+                    severity="error",
+                    sequence=row_order,
+                    details={"source": str(path), "row_order": row_order},
+                )
+            )
+            raise ValueError(f"Streaming historical source requires ordered rows: {path}")
+        previous_ordering_key = trade.ordering_key
+        if config.start <= trade.sip_timestamp <= config.end and trade.symbol == config.symbol:
+            yield HistoricalSourceStreamItem(trade=trade)
+        elif trade.symbol == config.symbol and trade.sip_timestamp > config.end:
+            break
+
+
 def _read_rows(path: Path) -> Iterable[tuple[int, dict]]:
-    suffix = path.suffix.lower()
-    if suffix == ".jsonl":
-        with path.open("r", encoding="utf-8") as handle:
+    suffixes = [item.lower() for item in path.suffixes]
+    if suffixes[-2:] == [".jsonl", ".gz"] or path.suffix.lower() == ".jsonl":
+        opener = gzip.open if suffixes[-2:] == [".jsonl", ".gz"] else open
+        with opener(path, "rt", encoding="utf-8") as handle:
             for index, line in enumerate(handle):
                 if line.strip():
                     yield index, json.loads(line)
         return
-    if suffix == ".csv":
+    if path.suffix.lower() == ".csv":
         with path.open("r", encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle)
             for index, row in enumerate(reader):

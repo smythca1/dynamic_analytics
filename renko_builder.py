@@ -7,6 +7,9 @@ from typing import Sequence
 import pandas as pd
 
 
+RENKO_EPSILON = 1e-12
+
+
 @dataclass
 class RenkoBuildState:
     brick_size: float
@@ -37,31 +40,42 @@ def update_renko_build_state(
 
     for ts, price in zip(timestamps[start_index:], prices[start_index:]):
         while True:
-            move = float(price) - float(state.last_brick_close)
-            if state.run_dir == 1:
-                if move >= state.brick_size:
-                    _append_brick(state, ts, direction=1)
-                    continue
-                if move <= -2.0 * state.brick_size:
-                    _append_brick(state, ts, direction=-1, bricks=2)
-                    continue
-            elif state.run_dir == -1:
-                if move <= -state.brick_size:
-                    _append_brick(state, ts, direction=-1)
-                    continue
-                if move >= 2.0 * state.brick_size:
-                    _append_brick(state, ts, direction=1, bricks=2)
-                    continue
-            else:
-                if move >= state.brick_size:
-                    _append_brick(state, ts, direction=1)
-                    continue
-                if move <= -state.brick_size:
-                    _append_brick(state, ts, direction=-1)
-                    continue
+            step = next_renko_step(state, float(price))
+            if step is not None:
+                direction, bricks = step
+                _append_brick(state, ts, direction=direction, bricks=bricks)
+                continue
             break
 
     return state
+
+
+def threshold_gte(value: float, threshold: float) -> bool:
+    return value >= threshold - RENKO_EPSILON
+
+
+def threshold_lte(value: float, threshold: float) -> bool:
+    return value <= threshold + RENKO_EPSILON
+
+
+def next_renko_step(state: RenkoBuildState, price: float) -> tuple[int, int] | None:
+    move = float(price) - float(state.last_brick_close)
+    if state.run_dir == 1:
+        if threshold_gte(move, state.brick_size):
+            return 1, 1
+        if threshold_lte(move, -2.0 * state.brick_size):
+            return -1, 2
+    elif state.run_dir == -1:
+        if threshold_lte(move, -state.brick_size):
+            return -1, 1
+        if threshold_gte(move, 2.0 * state.brick_size):
+            return 1, 2
+    else:
+        if threshold_gte(move, state.brick_size):
+            return 1, 1
+        if threshold_lte(move, -state.brick_size):
+            return -1, 1
+    return None
 
 
 def _append_brick(state: RenkoBuildState, timestamp: object, *, direction: int, bricks: int = 1) -> None:

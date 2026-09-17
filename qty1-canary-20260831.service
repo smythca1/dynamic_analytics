@@ -1,0 +1,15 @@
+[Unit]
+Description=Monday 2026-08-31 Quantity-One Trading Canary Orchestration
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/trading-server
+EnvironmentFile=/root/trading-server/.env
+Environment=PYTHONPATH=/root/trading-server
+TimeoutStartSec=7200
+ExecStart=/root/trading-server/venv/bin/python /root/trading-server/scripts/friday_qty1_canary_orchestration_20260828.py --manifest /root/trading-server/artifacts/shared_sip_validation/20260831/qty1_canary_manifest.json --evidence-root /root/trading-server/artifacts/shared_sip_validation/20260831 --target-day 2026-08-31 --run-label qty1_canary_20260831 --lock-path /run/trading/qty1-canary-20260831.lock
+StandardOutput=journal
+StandardError=journal

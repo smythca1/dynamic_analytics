@@ -1,10 +1,10 @@
 {
-  "fleet_id": "production-camatron-aapl-nvda-tsla-1s-renko-e1-reversal-20260710",
+  "fleet_id": "production-camatron-tp-sl-aapl-nvda-tsla-qty1-v2-20260904",
   "traders": [
     {
       "id": "camatron_aapl_1s_renko_1p3443_e1_reversal_1sh_20260701_live",
-      "enabled": true,
-      "execution_enabled": true,
+      "enabled": false,
+      "execution_enabled": false,
       "symbol": "AAPL",
       "broker": "alpaca",
       "account_alias": "camatron",
@@ -30,7 +30,9 @@
         "backtest_max_drawdown_pct": 5.36,
         "backtest_win_rate_pct": 37.1,
         "backtest_profit_factor": 2.43,
-        "live_qty": 8
+        "live_qty": 8,
+        "disabled_by": "six_strategy_renko_canary_v2_20260904",
+        "disabled_reason": "Superseded by six-strategy V2 topology: Camatron now owns TP/SL only; Megatron owns Reversal only."
       },
       "data": {
         "feed": "sip",
@@ -70,8 +72,8 @@
     },
     {
       "id": "camatron_nvda_1s_renko_1p149851_e1_reversal_1sh_20260701_live",
-      "enabled": true,
-      "execution_enabled": true,
+      "enabled": false,
+      "execution_enabled": false,
       "symbol": "NVDA",
       "broker": "alpaca",
       "account_alias": "camatron",
@@ -92,14 +94,16 @@
         "backtest_end": "2026-06-29",
         "backtest_price_points": 467999,
         "backtest_trades": 38,
-        "backtest_net_pnl_usd_10000_notional": 1057.70,
+        "backtest_net_pnl_usd_10000_notional": 1057.7,
         "backtest_return_pct_10000_notional": 10.58,
         "backtest_max_drawdown_pct": 11.27,
         "backtest_win_rate_pct": 44.7,
-        "backtest_profit_factor": 1.50,
+        "backtest_profit_factor": 1.5,
         "backtest_neighbor_avg_return_pct": 15.79,
         "backtest_neighbor_profitability_pct": 100.0,
-        "live_qty": 11
+        "live_qty": 11,
+        "disabled_by": "six_strategy_renko_canary_v2_20260904",
+        "disabled_reason": "Superseded by six-strategy V2 topology: Camatron now owns TP/SL only; Megatron owns Reversal only."
       },
       "data": {
         "feed": "sip",
@@ -139,8 +143,8 @@
     },
     {
       "id": "camatron_tsla_1s_renko_2p31165_e1_reversal_1sh_20260710_live",
-      "enabled": true,
-      "execution_enabled": true,
+      "enabled": false,
+      "execution_enabled": false,
       "symbol": "TSLA",
       "broker": "alpaca",
       "account_alias": "camatron",
@@ -172,12 +176,14 @@
         "validation_end": "2026-07-09",
         "validation_price_points": 140351,
         "validation_trades": 16,
-        "validation_net_pnl_usd_10000_notional": 873.60,
+        "validation_net_pnl_usd_10000_notional": 873.6,
         "validation_return_pct_10000_notional": 8.74,
         "validation_max_drawdown_pct": 4.35,
         "validation_win_rate_pct": 37.5,
         "validation_profit_factor": 2.02,
-        "live_qty": 7
+        "live_qty": 7,
+        "disabled_by": "six_strategy_renko_canary_v2_20260904",
+        "disabled_reason": "Superseded by six-strategy V2 topology: Camatron now owns TP/SL only; Megatron owns Reversal only."
       },
       "data": {
         "feed": "sip",
@@ -217,8 +223,8 @@
     },
     {
       "id": "camatron_qqq_1s_chop_mean_reversion_w3600_z3_eff035_hold600_1sh_20260720_live",
-      "enabled": true,
-      "execution_enabled": true,
+      "enabled": false,
+      "execution_enabled": false,
       "symbol": "QQQ",
       "broker": "alpaca",
       "account_alias": "camatron",
@@ -232,7 +238,7 @@
         "strategy_logic": "rolling_mean_reversion_low_efficiency_chop_gate",
         "window_seconds": 3600,
         "entry_z": 3.0,
-        "exit_z": 0.10,
+        "exit_z": 0.1,
         "stop_z": 4.0,
         "efficiency_max": 0.35,
         "trend_exit_efficiency": 0.65,
@@ -266,7 +272,9 @@
         "today_20260720_net_pnl_usd_approx_1share": 0.0,
         "replaced_profile": "qqq_1s_chop_mean_reversion_w180_z2_eff035_hold300_1sh_camatron",
         "replacement_reason": "Observed QQQ production parity matched signals, but actual fills underperformed signal PnL by about $7.46 across 478 filled legs on 2026-07-20.",
-        "live_qty": 1
+        "live_qty": 1,
+        "disabled_by": "six_strategy_renko_canary_v2_20260904",
+        "disabled_reason": "Superseded by six-strategy V2 topology: Camatron now owns TP/SL only; Megatron owns Reversal only."
       },
       "data": {
         "feed": "sip",
@@ -276,7 +284,7 @@
         "type": "chop_mean_reversion",
         "window_seconds": 3600,
         "entry_z": 3.0,
-        "exit_z": 0.10,
+        "exit_z": 0.1,
         "stop_z": 4.0,
         "efficiency_max": 0.35,
         "trend_exit_efficiency": 0.65,
@@ -325,11 +333,14 @@
         "entry_bricks": 2,
         "psar_initial_stop_bricks": 3,
         "psar_af_step": 0.04,
-        "psar_af_max": 0.6
+        "psar_af_max": 0.6,
+        "disabled_row_startup_validation_note": "Disabled Renko configs are parsed by fleet_runner startup; source normalized to canonical 1s_close without enabling execution.",
+        "disabled_by": "six_strategy_renko_canary_v2_20260904",
+        "disabled_reason": "Superseded by six-strategy V2 topology: Camatron now owns TP/SL only; Megatron owns Reversal only."
       },
       "data": {
         "feed": "sip",
-        "renko_source": "ticks"
+        "renko_source": "1s_close"
       },
       "strategy": {
         "type": "renko_psar",
@@ -369,6 +380,581 @@
           "broker fill reconciliation",
           "green parity gate"
         ]
+      },
+      "warm_start": {
+        "enabled": false,
+        "days": 0
+      }
+    },
+    {
+      "id": "camatron_aapl_1s_renko_0p73_e1_reversal_2500_20260821_live",
+      "enabled": false,
+      "execution_enabled": false,
+      "symbol": "AAPL",
+      "broker": "alpaca",
+      "account_alias": "camatron",
+      "mode": "live",
+      "event_log": "artifacts/live/fleet_live_events.jsonl",
+      "strategy_name": "aapl_1s_renko_e1_reversal_1p3443_long_short_overnight_1sh_camatron",
+      "profile": {
+        "source": "camatron_selected_2500_deployment_20260821",
+        "trust_status": "user_selected_live_deployment_aug21_shadow_gate_waived",
+        "selection_note": "User-approved Camatron deployment selected from 2026-08-13, 2026-08-14, 2026-08-17, 2026-08-18, 2026-08-19 research window. Modeled slippage included; fees are unknown/not modeled. August 21 shadow-equivalence gate explicitly waived by user for deployment. Not promotion-eligible by prior research gate language.",
+        "research_window": [
+          "2026-08-13",
+          "2026-08-14",
+          "2026-08-17",
+          "2026-08-18",
+          "2026-08-19"
+        ],
+        "candidate_id": "cand_d806ab6d8baa04b7f62c17d6",
+        "candidate_status": "COMPLETED",
+        "strategy_family": "DIRECT_REVERSAL_BASELINE",
+        "optimization_id": "provisional_camatron_renko_20260813_19",
+        "artifact_path": "artifacts/research/camatron_megatron_20260819/provisional-optimization/provisional_camatron_renko_20260813_19/all_candidates.csv",
+        "artifact_sha256": "4d56e505ca5159b7fce4c4239374f9a5a81003b4e03375793e793896c3f9f6b0",
+        "source_preparation_id": "prep_e3c9183471a81dbe61b2c452",
+        "source_combined_hash": "334f7cf9c00408c3466ad86f7df145434f5d65e36ba65117ef96c8a5395c6725",
+        "market_stream_fingerprint": "0761d66b121034dea1c4ab89569a5578084f60e072f7281d38d7a7ea7cdd580a",
+        "renko_strategy_fingerprint": "d65529aa21ff33dd4cb10547a6f39814aa462b71d66cb1cb7d4edaa1479676c6",
+        "promotion_fingerprint": "8a0f40fee0e0a2ee1b58c0a9627912738dceecc655c286ffbba338d9a60e7780",
+        "configuration_hash": "468ef652aeb0e5267ff0f8832df37535f69e614a35d7c504f78ed031e5c0df92",
+        "replay_fingerprint": "cd07ebf5a37a0b3eeca4717d936043a1823d9814106c0bcbc259d7ed0960d0d0",
+        "renko_logic": "canonical_1s_close_tradingview_style_reversal",
+        "strategy_logic": "pure_e1_reversal_hold_overnight",
+        "brick_sizing_mode": "BRICK_DOLLARS",
+        "brick_size": 2.218981,
+        "renko_brick_pct": 0.73,
+        "ltp_reference": 303.97,
+        "reference_price_policy": "SESSION_START_REFERENCE_V1",
+        "entry_bricks": 1,
+        "take_profit_bricks": null,
+        "stop_loss_bricks": null,
+        "backtest_start": "2026-08-13",
+        "backtest_end": "2026-08-19",
+        "backtest_sessions": 5,
+        "backtest_canonical_observations": 104082,
+        "backtest_net_pnl_usd": 102.12,
+        "backtest_return_on_total_account_equity_pct": 1.0212,
+        "backtest_closed_trades": 0,
+        "backtest_profit_factor": "UNKNOWN",
+        "backtest_max_drawdown_usd": 39.52,
+        "backtest_max_drawdown_pct": 0.3904320438801358,
+        "execution_model": "NEXT_CANONICAL_OBSERVATION_V1",
+        "result_quality": "FULL_SESSION_RESEARCH",
+        "approved_canonical_path": "True",
+        "pending_orders_at_end": 0,
+        "production_notional_cap_per_symbol": 2500,
+        "sizing_policy": "floor(2500 / latest_sip_ask_or_documented_conservative_reference) recomputed immediately before activation",
+        "activation_reference_price": 312.14,
+        "activation_reference_timestamp": "2026-08-20T23:59:41.049718829Z",
+        "activation_reference_source": "latest_sip_ask_read_only_predeployment_check_refresh_required_before_service_start",
+        "live_qty": 1,
+        "activation_gross_notional": 2497.12,
+        "fees_modeling_status": "UNKNOWN_NOT_MODELED",
+        "slippage_modeling_status": "MODELED_IN_RESEARCH_ARTIFACT",
+        "production_activation_note": "Service activation remains scheduled for 2026-08-21 09:20 ET; active_start_date preserves the candidate Renko strategy contract fingerprint.",
+        "canary_qty_override": "approved_qty_1_reversal_protection_canary_20260823",
+        "disabled_by": "six_strategy_renko_canary_v2_20260904",
+        "disabled_reason": "Superseded by six-strategy V2 topology: Camatron now owns TP/SL only; Megatron owns Reversal only."
+      },
+      "data": {
+        "feed": "sip",
+        "renko_source": "1s_close",
+        "market_data_source": "shared_canonical_stream"
+      },
+      "strategy": {
+        "type": "renko_reversal",
+        "brick_size": 2.218981,
+        "renko_anchor_mode": "grid",
+        "renko_anchor_price": 0.0,
+        "entry_bricks": 1,
+        "allow_short": true,
+        "order_type": "market",
+        "exit_management": "catastrophic_stop",
+        "candidate_config_fingerprint": "d65529aa21ff33dd4cb10547a6f39814aa462b71d66cb1cb7d4edaa1479676c6",
+        "market_contract_fingerprint": "0761d66b121034dea1c4ab89569a5578084f60e072f7281d38d7a7ea7cdd580a",
+        "protection": {
+          "acknowledgement_timeout_seconds": 2.0,
+          "polling_interval_seconds": 0.25,
+          "max_recovery_attempts": 1,
+          "emergency_flatten_enabled": true
+        },
+        "catastrophic_stop_bricks": 3
+      },
+      "session": {
+        "timezone": "America/New_York",
+        "entry_start": "09:31:00",
+        "entry_end": "15:59:59",
+        "force_flat": null,
+        "active_start_date": "2026-07-01",
+        "active_end_date": null,
+        "allow_overnight": true
+      },
+      "sizing": {
+        "type": "qty",
+        "qty": 1
+      },
+      "risk": {
+        "max_daily_loss": 250,
+        "max_position_notional": 2500
+      },
+      "warm_start": {
+        "enabled": false,
+        "days": 0
+      }
+    },
+    {
+      "id": "camatron_nvda_1s_renko_0p27_e1_tp2_sl3_2500_20260821_live",
+      "enabled": false,
+      "execution_enabled": false,
+      "symbol": "NVDA",
+      "broker": "alpaca",
+      "account_alias": "camatron",
+      "mode": "live",
+      "event_log": "artifacts/live/fleet_live_events.jsonl",
+      "strategy_name": "nvda_renko_tp_sl_e1_tp2_sl2_1sh_megatron_beta",
+      "profile": {
+        "source": "camatron_selected_2500_deployment_20260821",
+        "trust_status": "user_selected_live_deployment_aug21_shadow_gate_waived",
+        "selection_note": "User-approved Camatron deployment selected from 2026-08-13, 2026-08-14, 2026-08-17, 2026-08-18, 2026-08-19 research window. Modeled slippage included; fees are unknown/not modeled. August 21 shadow-equivalence gate explicitly waived by user for deployment. Not promotion-eligible by prior research gate language.",
+        "research_window": [
+          "2026-08-13",
+          "2026-08-14",
+          "2026-08-17",
+          "2026-08-18",
+          "2026-08-19"
+        ],
+        "candidate_id": "cand_8df2c0b2e14c36c2401c239f",
+        "candidate_status": "COMPLETED",
+        "strategy_family": "FLATTENING_TP_SL_STRATEGY",
+        "optimization_id": "provisional_megatron_tp_sl_20260813_19",
+        "artifact_path": "artifacts/research/camatron_megatron_20260819/provisional-optimization/provisional_megatron_tp_sl_20260813_19/all_candidates.csv",
+        "artifact_sha256": "c8849cc921feff9d3763d64bc2ba5fec6da3388ec8484475743878a83e2e95e0",
+        "source_preparation_id": "prep_1a6df8c004d07feaad69d0b4",
+        "source_combined_hash": "dd8f415681782ab89b574729f8542669f11f6006b847bc9a6a9523b7c8b727cd",
+        "market_stream_fingerprint": "83f01df8ed0b3ba105c94d1e042e5d63cf1f888b94d9e70d4ab45236605625d3",
+        "renko_strategy_fingerprint": "2cb9a77691410d9e81b5e7cae127617e430cd8d8a670c5c033d5efd2ddfc9c5e",
+        "promotion_fingerprint": "f4762d5e43be77fff538667593940598a59ccbefa0450abc17872d92dc12af81",
+        "configuration_hash": "a034d0932eef44e8c04cbeaad3c6cd66f77458044f449289dd2b208f30f53c95",
+        "replay_fingerprint": "734f413945496663198d48e890b89d0d18b197bb0e38de201513304dbdcfd058",
+        "renko_logic": "canonical_1s_close_tradingview_style_reversal",
+        "strategy_logic": "flattening_tp_sl",
+        "brick_sizing_mode": "BRICK_DOLLARS",
+        "brick_size": 0.608364,
+        "renko_brick_pct": 0.27,
+        "ltp_reference": 225.32,
+        "reference_price_policy": "SESSION_START_REFERENCE_V1",
+        "entry_bricks": 1,
+        "take_profit_bricks": 2,
+        "stop_loss_bricks": 3,
+        "backtest_start": "2026-08-13",
+        "backtest_end": "2026-08-19",
+        "backtest_sessions": 5,
+        "backtest_canonical_observations": 108717,
+        "backtest_net_pnl_usd": 13.675,
+        "backtest_return_on_total_account_equity_pct": 0.13675,
+        "backtest_closed_trades": 7,
+        "backtest_profit_factor": "Infinity",
+        "backtest_max_drawdown_usd": 3.3793,
+        "backtest_max_drawdown_pct": 0.03377508231882986,
+        "execution_model": "NEXT_CANONICAL_OBSERVATION_V1",
+        "result_quality": "FULL_SESSION_RESEARCH",
+        "approved_canonical_path": "True",
+        "pending_orders_at_end": 0,
+        "production_notional_cap_per_symbol": 2500,
+        "sizing_policy": "floor(2500 / latest_sip_ask_or_documented_conservative_reference) recomputed immediately before activation",
+        "activation_reference_price": 217.05,
+        "activation_reference_timestamp": "2026-08-20T23:59:52.432310032Z",
+        "activation_reference_source": "latest_sip_ask_read_only_predeployment_check_refresh_required_before_service_start",
+        "live_qty": 1,
+        "activation_gross_notional": 2387.55,
+        "fees_modeling_status": "UNKNOWN_NOT_MODELED",
+        "slippage_modeling_status": "MODELED_IN_RESEARCH_ARTIFACT",
+        "production_activation_note": "Service activation remains scheduled for 2026-08-21 09:20 ET; active_start_date preserves the candidate Renko strategy contract fingerprint.",
+        "canary_qty_override": "approved_qty_1_reversal_protection_canary_20260823",
+        "disabled_by": "six_strategy_renko_canary_v2_20260904",
+        "disabled_reason": "Superseded by six-strategy V2 topology: Camatron now owns TP/SL only; Megatron owns Reversal only."
+      },
+      "data": {
+        "feed": "sip",
+        "renko_source": "1s_close",
+        "market_data_source": "shared_canonical_stream"
+      },
+      "strategy": {
+        "type": "renko_tp_sl",
+        "brick_size": 0.608364,
+        "renko_anchor_mode": "grid",
+        "renko_anchor_price": 0.0,
+        "entry_bricks": 1,
+        "allow_short": true,
+        "order_type": "market",
+        "exit_management": "bracket",
+        "take_profit_bricks": 2,
+        "stop_loss_bricks": 3,
+        "candidate_config_fingerprint": "2cb9a77691410d9e81b5e7cae127617e430cd8d8a670c5c033d5efd2ddfc9c5e",
+        "market_contract_fingerprint": "83f01df8ed0b3ba105c94d1e042e5d63cf1f888b94d9e70d4ab45236605625d3",
+        "protection": {
+          "acknowledgement_timeout_seconds": 2.0,
+          "polling_interval_seconds": 0.25,
+          "max_recovery_attempts": 1,
+          "emergency_flatten_enabled": true
+        }
+      },
+      "session": {
+        "timezone": "America/New_York",
+        "entry_start": "09:31:00",
+        "entry_end": "15:59:59",
+        "force_flat": null,
+        "active_start_date": "2026-08-07",
+        "active_end_date": null,
+        "allow_overnight": true
+      },
+      "sizing": {
+        "type": "qty",
+        "qty": 1
+      },
+      "risk": {
+        "max_daily_loss": 250,
+        "max_position_notional": 2500
+      },
+      "warm_start": {
+        "enabled": false,
+        "days": 0
+      }
+    },
+    {
+      "id": "camatron_tsla_1s_renko_0p71_e1_reversal_2500_20260821_live",
+      "enabled": false,
+      "execution_enabled": false,
+      "symbol": "TSLA",
+      "broker": "alpaca",
+      "account_alias": "camatron",
+      "mode": "live",
+      "event_log": "artifacts/live/fleet_live_events.jsonl",
+      "strategy_name": "tsla_1s_renko_e1_reversal_2p31165_long_short_overnight_1sh_camatron",
+      "profile": {
+        "source": "camatron_selected_2500_deployment_20260821",
+        "trust_status": "user_selected_live_deployment_aug21_shadow_gate_waived",
+        "selection_note": "User-approved Camatron deployment selected from 2026-08-13, 2026-08-14, 2026-08-17, 2026-08-18, 2026-08-19 research window. Modeled slippage included; fees are unknown/not modeled. August 21 shadow-equivalence gate explicitly waived by user for deployment. Not promotion-eligible by prior research gate language.",
+        "research_window": [
+          "2026-08-13",
+          "2026-08-14",
+          "2026-08-17",
+          "2026-08-18",
+          "2026-08-19"
+        ],
+        "candidate_id": "cand_5be15cc0e7c0c0e38bbb64f0",
+        "candidate_status": "COMPLETED",
+        "strategy_family": "DIRECT_REVERSAL_BASELINE",
+        "optimization_id": "provisional_camatron_renko_20260813_19",
+        "artifact_path": "artifacts/research/camatron_megatron_20260819/provisional-optimization/provisional_camatron_renko_20260813_19/all_candidates.csv",
+        "artifact_sha256": "4d56e505ca5159b7fce4c4239374f9a5a81003b4e03375793e793896c3f9f6b0",
+        "source_preparation_id": "prep_1ba6bb3cd7e8e1a31eeb1078",
+        "source_combined_hash": "567484be5ea1547e703d7ccf7e35d18787a9c6faf95ebdaa2ddd2e0f0230e84f",
+        "market_stream_fingerprint": "6ff4bc9a603abbde9999a767009a94304646032f458978c6d71cfc31e01b656d",
+        "renko_strategy_fingerprint": "1809bfaba34b9bf4f8c63e68e909aeb48a8ee779ce856ba0e3db129acaefbf28",
+        "promotion_fingerprint": "d2f26610e57ada751b10d3c792aa6131d1aac3d84e126f072746062e06136672",
+        "configuration_hash": "cd72ef181aa418e6024fdb510ecf37b5ad0a08c7b16074f75bb955035a8112bb",
+        "replay_fingerprint": "cede47b409cb38309836d127c305b960566cb030f8f4d9ab5f450e9938ed02dc",
+        "renko_logic": "canonical_1s_close_tradingview_style_reversal",
+        "strategy_logic": "pure_e1_reversal_hold_overnight",
+        "brick_sizing_mode": "BRICK_DOLLARS",
+        "brick_size": 2.32525,
+        "renko_brick_pct": 0.71,
+        "ltp_reference": 327.5,
+        "reference_price_policy": "SESSION_START_REFERENCE_V1",
+        "entry_bricks": 1,
+        "take_profit_bricks": null,
+        "stop_loss_bricks": null,
+        "backtest_start": "2026-08-13",
+        "backtest_end": "2026-08-19",
+        "backtest_sessions": 5,
+        "backtest_canonical_observations": 104130,
+        "backtest_net_pnl_usd": 262.36,
+        "backtest_return_on_total_account_equity_pct": 2.6236,
+        "backtest_closed_trades": 4,
+        "backtest_profit_factor": "11.051391862955033",
+        "backtest_max_drawdown_usd": 75.39,
+        "backtest_max_drawdown_pct": 0.738434233415349,
+        "execution_model": "NEXT_CANONICAL_OBSERVATION_V1",
+        "result_quality": "FULL_SESSION_RESEARCH",
+        "approved_canonical_path": "True",
+        "pending_orders_at_end": 0,
+        "production_notional_cap_per_symbol": 2500,
+        "sizing_policy": "floor(2500 / latest_sip_ask_or_documented_conservative_reference) recomputed immediately before activation",
+        "activation_reference_price": 346.49,
+        "activation_reference_timestamp": "2026-08-20T23:59:58.000600584Z",
+        "activation_reference_source": "latest_sip_ask_read_only_predeployment_check_refresh_required_before_service_start",
+        "live_qty": 1,
+        "activation_gross_notional": 2425.43,
+        "fees_modeling_status": "UNKNOWN_NOT_MODELED",
+        "slippage_modeling_status": "MODELED_IN_RESEARCH_ARTIFACT",
+        "production_activation_note": "Service activation remains scheduled for 2026-08-21 09:20 ET; active_start_date preserves the candidate Renko strategy contract fingerprint.",
+        "canary_qty_override": "approved_qty_1_reversal_protection_canary_20260823",
+        "disabled_by": "six_strategy_renko_canary_v2_20260904",
+        "disabled_reason": "Superseded by six-strategy V2 topology: Camatron now owns TP/SL only; Megatron owns Reversal only."
+      },
+      "data": {
+        "feed": "sip",
+        "renko_source": "1s_close",
+        "market_data_source": "shared_canonical_stream"
+      },
+      "strategy": {
+        "type": "renko_reversal",
+        "brick_size": 2.32525,
+        "renko_anchor_mode": "grid",
+        "renko_anchor_price": 0.0,
+        "entry_bricks": 1,
+        "allow_short": true,
+        "order_type": "market",
+        "exit_management": "catastrophic_stop",
+        "candidate_config_fingerprint": "1809bfaba34b9bf4f8c63e68e909aeb48a8ee779ce856ba0e3db129acaefbf28",
+        "market_contract_fingerprint": "6ff4bc9a603abbde9999a767009a94304646032f458978c6d71cfc31e01b656d",
+        "protection": {
+          "acknowledgement_timeout_seconds": 2.0,
+          "polling_interval_seconds": 0.25,
+          "max_recovery_attempts": 1,
+          "emergency_flatten_enabled": true
+        },
+        "catastrophic_stop_bricks": 3
+      },
+      "session": {
+        "timezone": "America/New_York",
+        "entry_start": "09:31:00",
+        "entry_end": "15:59:59",
+        "force_flat": null,
+        "active_start_date": "2026-07-10",
+        "active_end_date": null,
+        "allow_overnight": true
+      },
+      "sizing": {
+        "type": "qty",
+        "qty": 1
+      },
+      "risk": {
+        "max_daily_loss": 250,
+        "max_position_notional": 2500
+      },
+      "warm_start": {
+        "enabled": false,
+        "days": 0
+      }
+    },
+    {
+      "id": "camatron_aapl_1s_renko_0p10_e2_tp3_sl3_qty1_20260904_live",
+      "enabled": false,
+      "execution_enabled": false,
+      "symbol": "AAPL",
+      "broker": "alpaca",
+      "account_alias": "camatron",
+      "account_namespace": "camatron",
+      "mode": "live",
+      "event_log": "artifacts/live/fleet_live_events.jsonl",
+      "strategy_name": "aapl_1s_renko_tp_sl_0p10_e2_tp3_sl3_qty1_20260904_live",
+      "profile": {
+        "source": "six_strategy_renko_canary_v2_20260904",
+        "trust_status": "operator_approved_qty1_canary_v2",
+        "strategy_logic": "renko_tp_sl_intraday_v2",
+        "renko_logic": "1s_close_tradingview_style_reversal",
+        "renko_brick_pct": 0.1,
+        "brick_sizing_mode": "BRICK_PERCENT",
+        "ltp_reference": 303.97,
+        "live_qty_contract": 1,
+        "canary_topology": "camatron_tp_sl_only",
+        "disabled_by": "single_strategy_kernel_20260917",
+        "disabled_reason": "Single-strategy production kernel permits only Camatron TSLA renko_tp_sl qty1 shared SIP execution."
+      },
+      "data": {
+        "market_data_source": "shared_canonical_stream",
+        "market_data_profile": null,
+        "feed": "sip",
+        "renko_source": "1s_close"
+      },
+      "strategy": {
+        "type": "renko_tp_sl",
+        "brick_sizing_mode": "BRICK_PERCENT",
+        "brick_pct": 0.1,
+        "reference_price": 303.97,
+        "renko_anchor_mode": "grid",
+        "renko_anchor_price": 0.0,
+        "entry_bricks": 2,
+        "take_profit_bricks": 3,
+        "stop_loss_bricks": 3,
+        "allow_short": true,
+        "order_type": "market",
+        "exit_management": "bracket",
+        "candidate_config_fingerprint": "488411c277b85f7848204b7dc416045e55c544e397f2da55107afa53517fa476",
+        "market_contract_fingerprint": "0761d66b121034dea1c4ab89569a5578084f60e072f7281d38d7a7ea7cdd580a",
+        "protection": {
+          "acknowledgement_timeout_seconds": 2.0,
+          "polling_interval_seconds": 0.25,
+          "max_recovery_attempts": 1,
+          "emergency_flatten_enabled": true
+        }
+      },
+      "session": {
+        "timezone": "America/New_York",
+        "entry_start": "09:31:00",
+        "entry_end": "15:59:59",
+        "force_flat": null,
+        "active_start_date": "2026-09-04",
+        "active_end_date": null,
+        "allow_overnight": true
+      },
+      "sizing": {
+        "type": "qty",
+        "qty": 1
+      },
+      "risk": {
+        "max_daily_loss": 250,
+        "max_position_notional": 2500
+      },
+      "warm_start": {
+        "enabled": false,
+        "days": 0
+      }
+    },
+    {
+      "id": "camatron_nvda_1s_renko_0p22_e1_tp3_sl3_qty1_20260904_live",
+      "enabled": false,
+      "execution_enabled": false,
+      "symbol": "NVDA",
+      "broker": "alpaca",
+      "account_alias": "camatron",
+      "account_namespace": "camatron",
+      "mode": "live",
+      "event_log": "artifacts/live/fleet_live_events.jsonl",
+      "strategy_name": "nvda_1s_renko_tp_sl_0p22_e1_tp3_sl3_qty1_20260904_live",
+      "profile": {
+        "source": "six_strategy_renko_canary_v2_20260904",
+        "trust_status": "operator_approved_qty1_canary_v2",
+        "strategy_logic": "renko_tp_sl_intraday_v2",
+        "renko_logic": "1s_close_tradingview_style_reversal",
+        "renko_brick_pct": 0.22,
+        "brick_sizing_mode": "BRICK_PERCENT",
+        "ltp_reference": 225.32,
+        "live_qty_contract": 1,
+        "canary_topology": "camatron_tp_sl_only",
+        "disabled_by": "single_strategy_kernel_20260917",
+        "disabled_reason": "Single-strategy production kernel permits only Camatron TSLA renko_tp_sl qty1 shared SIP execution."
+      },
+      "data": {
+        "market_data_source": "shared_canonical_stream",
+        "market_data_profile": null,
+        "feed": "sip",
+        "renko_source": "1s_close"
+      },
+      "strategy": {
+        "type": "renko_tp_sl",
+        "brick_sizing_mode": "BRICK_PERCENT",
+        "brick_pct": 0.22,
+        "reference_price": 225.32,
+        "renko_anchor_mode": "grid",
+        "renko_anchor_price": 0.0,
+        "entry_bricks": 1,
+        "take_profit_bricks": 3,
+        "stop_loss_bricks": 3,
+        "allow_short": true,
+        "order_type": "market",
+        "exit_management": "bracket",
+        "candidate_config_fingerprint": "fb017e8f8077f465c9d803ac871c1274928c983702ea507df339f7374186187b",
+        "market_contract_fingerprint": "83f01df8ed0b3ba105c94d1e042e5d63cf1f888b94d9e70d4ab45236605625d3",
+        "protection": {
+          "acknowledgement_timeout_seconds": 2.0,
+          "polling_interval_seconds": 0.25,
+          "max_recovery_attempts": 1,
+          "emergency_flatten_enabled": true
+        }
+      },
+      "session": {
+        "timezone": "America/New_York",
+        "entry_start": "09:31:00",
+        "entry_end": "15:59:59",
+        "force_flat": null,
+        "active_start_date": "2026-09-04",
+        "active_end_date": null,
+        "allow_overnight": true
+      },
+      "sizing": {
+        "type": "qty",
+        "qty": 1
+      },
+      "risk": {
+        "max_daily_loss": 250,
+        "max_position_notional": 2500
+      },
+      "warm_start": {
+        "enabled": false,
+        "days": 0
+      }
+    },
+    {
+      "id": "camatron_tsla_1s_renko_0p42_e2_tp1_sl3_qty1_20260917_live",
+      "enabled": true,
+      "execution_enabled": true,
+      "symbol": "TSLA",
+      "broker": "alpaca",
+      "account_alias": "camatron",
+      "account_namespace": "camatron",
+      "mode": "live",
+      "event_log": "artifacts/live/fleet_live_events.jsonl",
+      "strategy_name": "tsla_1s_renko_tp_sl_0p42_e2_tp1_sl3_qty1_20260917_live",
+      "profile": {
+        "source": "six_strategy_renko_canary_v2_20260904",
+        "trust_status": "operator_approved_qty1_canary_v2",
+        "strategy_logic": "renko_tp_sl_intraday_v2",
+        "renko_logic": "1s_close_tradingview_style_reversal",
+        "renko_brick_pct": 0.42,
+        "brick_sizing_mode": "BRICK_PERCENT",
+        "ltp_reference": 327.5,
+        "live_qty_contract": 1,
+        "canary_topology": "camatron_tp_sl_only"
+      },
+      "data": {
+        "market_data_source": "shared_canonical_stream",
+        "market_data_profile": null,
+        "feed": "sip",
+        "renko_source": "1s_close"
+      },
+      "strategy": {
+        "type": "renko_tp_sl",
+        "brick_sizing_mode": "BRICK_PERCENT",
+        "brick_pct": 0.42,
+        "reference_price": 327.5,
+        "renko_anchor_mode": "grid",
+        "renko_anchor_price": 0.0,
+        "entry_bricks": 2,
+        "take_profit_bricks": 1,
+        "stop_loss_bricks": 3,
+        "allow_short": true,
+        "order_type": "market",
+        "exit_management": "bracket",
+        "candidate_config_fingerprint": "fcde1629eda23bb40c753775506658e270ed7846db4dcfe4be8f52172dad1f61",
+        "market_contract_fingerprint": "6ff4bc9a603abbde9999a767009a94304646032f458978c6d71cfc31e01b656d",
+        "protection": {
+          "acknowledgement_timeout_seconds": 2.0,
+          "polling_interval_seconds": 0.25,
+          "max_recovery_attempts": 1,
+          "emergency_flatten_enabled": true
+        }
+      },
+      "session": {
+        "timezone": "America/New_York",
+        "entry_start": "09:31:00",
+        "entry_end": "15:59:59",
+        "force_flat": null,
+        "active_start_date": "2026-09-04",
+        "active_end_date": null,
+        "allow_overnight": true
+      },
+      "sizing": {
+        "type": "qty",
+        "qty": 1
+      },
+      "risk": {
+        "max_daily_loss": 250,
+        "max_position_notional": 2500
       },
       "warm_start": {
         "enabled": false,

@@ -4,11 +4,11 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from fleet_runner import _PENDING_1S_CLOSE_TICKS, TraderRuntime, renko_source_ticks
-from trading_events import MarketTick, is_price_forming_trade
+from trading_events import MarketTick
 
 from .models import CanonicalObservation, RawSipTrade
 from .one_second_sampler import CanonicalOneSecondSipSampler
+from .observation_stream import CanonicalMarketObservationAdapter
 
 
 @dataclass(frozen=True)
@@ -17,24 +17,6 @@ class ShadowParityResult:
     production: tuple[tuple[str, str, float, str], ...]
     canonical: tuple[tuple[str, str, float, str], ...]
     differences: tuple[str, ...]
-
-
-def _runtime(trader_id: str, symbol: str) -> TraderRuntime:
-    return TraderRuntime(
-        trader_id=trader_id,
-        symbol=symbol,
-        mode="live",
-        credential_profile=None,
-        feed="sip",
-        enabled=True,
-        execution_enabled=False,
-        max_position_notional=0.0,
-        max_daily_loss=0.0,
-        engine=object(),
-        execution=object(),
-        log=object(),
-        renko_source="1s_close",
-    )
 
 
 def _market_tick(raw_trade: RawSipTrade) -> MarketTick:
@@ -70,16 +52,15 @@ def compare_with_production_sampler(
     trader_id: str,
     symbol: str,
 ) -> ShadowParityResult:
-    runtime = _runtime(trader_id, symbol)
-    _PENDING_1S_CLOSE_TICKS.pop(trader_id, None)
+    production_adapter = CanonicalMarketObservationAdapter(run_id=run_id)
     sampler = CanonicalOneSecondSipSampler(run_id=run_id)
     production_rows: list[tuple[str, str, float, str]] = []
     canonical_rows: list[tuple[str, str, float, str]] = []
 
     for raw in trades:
         tick = _market_tick(raw)
-        if is_price_forming_trade(tick):
-            production_rows.extend(_production_tuple(row) for row in renko_source_ticks(runtime, tick))
+        production_result = production_adapter.process_tick(tick, trader_id=trader_id)
+        production_rows.extend(_production_tuple(row) for row in production_adapter.observation_ticks(production_result))
         result = sampler.process_trade(raw)
         canonical_rows.extend(_canonical_tuple(row) for row in result.observations)
 

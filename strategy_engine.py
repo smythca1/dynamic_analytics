@@ -9,21 +9,58 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from broker_protection import verify_broker_native_protection
+from exit_plan import build_renko_tp_sl_exit_plan
 from renko_builder import RenkoBuildState, update_renko_build_state
+from reversal_protection import PROTECTION_TYPE, verify_reversal_catastrophic_stop
 from trading_events import MarketBar, MarketTick, OrderIntent, PositionState, RenkoBrick, Signal
 
 
 MAX_CLIENT_ORDER_ID_LENGTH = 48
 TP_SL_LIFECYCLE_FLAT = "FLAT"
-TP_SL_LIFECYCLE_POSITION_OPEN = "POSITION_OPEN"
-TP_SL_LIFECYCLE_TRIGGERED = "TP_OR_SL_TRIGGERED"
+TP_SL_LIFECYCLE_POSITION_OPEN = "OPEN"
+TP_SL_LIFECYCLE_TRIGGERED = "EXIT_PENDING"
 TP_SL_LIFECYCLE_EXIT_PENDING = "EXIT_PENDING"
-TP_SL_LIFECYCLE_CLOSE_SUBMITTED = "CLOSE_SUBMITTED"
-TP_SL_LIFECYCLE_CLOSE_FILLED = "CLOSE_FILLED"
+TP_SL_LIFECYCLE_CLOSE_SUBMITTED = "EXIT_PENDING"
+TP_SL_LIFECYCLE_CLOSE_FILLED = "FLAT"
+TP_SL_LIFECYCLE_ENTRY_PLANNED = "ENTRY_PENDING"
+TP_SL_LIFECYCLE_BRACKET_SUBMITTED = "ENTRY_PENDING"
+TP_SL_LIFECYCLE_ENTRY_PARTIALLY_FILLED = "ENTRY_PENDING"
+TP_SL_LIFECYCLE_ENTRY_FILLED_AWAITING_PROTECTION = "ENTRY_PENDING"
+TP_SL_LIFECYCLE_OCO_RECOVERY_SUBMITTED = "ENTRY_PENDING"
+TP_SL_LIFECYCLE_PROTECTED = "OPEN"
+TP_SL_LIFECYCLE_EXIT_PARTIALLY_FILLED = "EXIT_PENDING"
+TP_SL_LIFECYCLE_PROTECTION_FAILED = "ENTRY_PENDING"
+TP_SL_LIFECYCLE_EMERGENCY_FLATTEN_PENDING = "EXIT_PENDING"
+TP_SL_LIFECYCLE_EMERGENCY_FLATTEN_PLANNED = "EXIT_PENDING"
+TP_SL_LIFECYCLE_EMERGENCY_FLATTEN_SUBMITTED = "EXIT_PENDING"
+TP_SL_LIFECYCLE_EMERGENCY_FLATTEN_PARTIALLY_FILLED = "EXIT_PENDING"
+TP_SL_LIFECYCLE_EMERGENCY_FLATTEN_FILLED = "FLAT"
+TP_SL_LIFECYCLE_EMERGENCY_FLATTEN_FAILED = "EXIT_PENDING"
 TP_SL_EXIT_LOCK_STATES = {
-    TP_SL_LIFECYCLE_TRIGGERED,
+    TP_SL_LIFECYCLE_ENTRY_PLANNED,
     TP_SL_LIFECYCLE_EXIT_PENDING,
-    TP_SL_LIFECYCLE_CLOSE_SUBMITTED,
+}
+_LEGACY_RUNTIME_STATE_MAP = {
+    "POSITION_OPEN": TP_SL_LIFECYCLE_POSITION_OPEN,
+    "TP_OR_SL_TRIGGERED": TP_SL_LIFECYCLE_EXIT_PENDING,
+    "CLOSE_SUBMITTED": TP_SL_LIFECYCLE_EXIT_PENDING,
+    "CLOSE_FILLED": TP_SL_LIFECYCLE_FLAT,
+    "ENTRY_PLANNED": TP_SL_LIFECYCLE_ENTRY_PLANNED,
+    "BRACKET_SUBMITTED": TP_SL_LIFECYCLE_ENTRY_PLANNED,
+    "ENTRY_PARTIALLY_FILLED": TP_SL_LIFECYCLE_ENTRY_PLANNED,
+    "ENTRY_FILLED_AWAITING_PROTECTION": TP_SL_LIFECYCLE_ENTRY_PLANNED,
+    "OCO_RECOVERY_SUBMITTED": TP_SL_LIFECYCLE_ENTRY_PLANNED,
+    "PROTECTED": TP_SL_LIFECYCLE_POSITION_OPEN,
+    "EXIT_PARTIALLY_FILLED": TP_SL_LIFECYCLE_EXIT_PENDING,
+    "PROTECTION_FAILED": TP_SL_LIFECYCLE_ENTRY_PLANNED,
+    "EMERGENCY_FLATTEN_PENDING": TP_SL_LIFECYCLE_EXIT_PENDING,
+    "EMERGENCY_FLATTEN_PLANNED": TP_SL_LIFECYCLE_EXIT_PENDING,
+    "EMERGENCY_FLATTEN_SUBMITTED": TP_SL_LIFECYCLE_EXIT_PENDING,
+    "EMERGENCY_FLATTEN_PARTIALLY_FILLED": TP_SL_LIFECYCLE_EXIT_PENDING,
+    "EMERGENCY_FLATTEN_FILLED": TP_SL_LIFECYCLE_FLAT,
+    "EMERGENCY_FLATTEN_FAILED": TP_SL_LIFECYCLE_EXIT_PENDING,
+    "REVERSAL_EXIT_PLANNED": TP_SL_LIFECYCLE_EXIT_PENDING,
 }
 
 
@@ -35,6 +72,7 @@ class RenkoStrategyConfig:
     strategy_type: Literal["renko_tp_sl", "renko_psar", "renko_reversal"] = "renko_tp_sl"
     take_profit_bricks: int | None = None
     stop_loss_bricks: int | None = None
+    catastrophic_stop_bricks: int | None = None
     psar_initial_stop_bricks: int | None = None
     psar_af_step: float | None = None
     psar_af_max: float | None = None
@@ -48,6 +86,10 @@ class RenkoStrategyConfig:
     exit_management: str = "strategy"
     stop_loss_order_type: str = "stop_market"
     stop_limit_offset_pct: float = 0.0
+    protection_acknowledgement_timeout_seconds: float = 2.0
+    protection_polling_interval_seconds: float = 0.25
+    protection_max_recovery_attempts: int = 1
+    emergency_flatten_enabled: bool = False
     renko_anchor_mode: str = "first_price"
     renko_anchor_price: float | None = None
     timezone: str = "America/New_York"
@@ -57,6 +99,8 @@ class RenkoStrategyConfig:
     active_start_date: str | None = None
     active_end_date: str | None = None
     allow_overnight: bool = False
+    candidate_config_fingerprint: str | None = None
+    market_contract_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         if self.brick_size <= 0:
@@ -89,12 +133,32 @@ class RenkoStrategyConfig:
             raise ValueError("notional must be > 0.")
         if str(self.order_type).lower().strip() not in {"market", "limit"}:
             raise ValueError("order_type must be market or limit.")
-        if str(self.exit_management).lower().strip() not in {"strategy", "oco"}:
-            raise ValueError("exit_management must be strategy or oco.")
+        if str(self.exit_management).lower().strip() not in {"strategy", "oco", "bracket", "catastrophic_stop"}:
+            raise ValueError("exit_management must be strategy, oco, bracket, or catastrophic_stop.")
+        if str(self.exit_management).lower().strip() == "bracket":
+            if not self.candidate_config_fingerprint:
+                raise ValueError("bracket exit_management requires candidate_config_fingerprint.")
+            if not self.market_contract_fingerprint:
+                raise ValueError("bracket exit_management requires market_contract_fingerprint.")
+        if str(self.exit_management).lower().strip() == "catastrophic_stop":
+            if self.strategy_type != "renko_reversal":
+                raise ValueError("catastrophic_stop exit_management is only supported for renko_reversal.")
+            if self.catastrophic_stop_bricks is None or self.catastrophic_stop_bricks <= 0:
+                raise ValueError("catastrophic_stop exit_management requires catastrophic_stop_bricks > 0.")
+            if not self.candidate_config_fingerprint:
+                raise ValueError("catastrophic_stop exit_management requires candidate_config_fingerprint.")
+            if not self.market_contract_fingerprint:
+                raise ValueError("catastrophic_stop exit_management requires market_contract_fingerprint.")
         if str(self.stop_loss_order_type).lower().strip() not in {"stop_market", "stop_limit"}:
             raise ValueError("stop_loss_order_type must be stop_market or stop_limit.")
         if self.stop_limit_offset_pct < 0:
             raise ValueError("stop_limit_offset_pct must be >= 0.")
+        if self.protection_acknowledgement_timeout_seconds <= 0:
+            raise ValueError("protection_acknowledgement_timeout_seconds must be > 0.")
+        if self.protection_polling_interval_seconds <= 0:
+            raise ValueError("protection_polling_interval_seconds must be > 0.")
+        if self.protection_max_recovery_attempts < 0:
+            raise ValueError("protection_max_recovery_attempts must be >= 0.")
         _parse_time(self.entry_start, "entry_start")
         _parse_time(self.entry_end, "entry_end")
         _parse_time(self.force_flat, "force_flat")
@@ -191,6 +255,19 @@ def _parse_date(value: str | None, field_name: str) -> str | None:
     return str(value)
 
 
+def _canonical_runtime_state(value: object, *, has_position: bool = False) -> str:
+    text = str(value or "").strip()
+    if text in {TP_SL_LIFECYCLE_FLAT, TP_SL_LIFECYCLE_ENTRY_PLANNED, TP_SL_LIFECYCLE_POSITION_OPEN, TP_SL_LIFECYCLE_EXIT_PENDING}:
+        return text
+    if text in _LEGACY_RUNTIME_STATE_MAP:
+        return _LEGACY_RUNTIME_STATE_MAP[text]
+    return TP_SL_LIFECYCLE_POSITION_OPEN if has_position else TP_SL_LIFECYCLE_FLAT
+
+
+def _verification_issues(verification: object) -> list[dict[str, Any]]:
+    return [issue.__dict__ for issue in getattr(verification, "issues", ())]
+
+
 class RenkoStrategyEngine:
     def __init__(self, config: RenkoStrategyConfig) -> None:
         self.config = config
@@ -214,6 +291,7 @@ class RenkoStrategyEngine:
         self.tp_sl_lifecycle_state = TP_SL_LIFECYCLE_FLAT
         self.pending_exit: dict[str, Any] | None = None
         self.last_closed_exit: dict[str, Any] | None = None
+        self.protection_state: dict[str, Any] | None = None
         self.reconciliation_unsafe = False
 
     def snapshot(self) -> dict[str, Any]:
@@ -254,6 +332,7 @@ class RenkoStrategyEngine:
             "tp_sl_lifecycle_state": self.tp_sl_lifecycle_state,
             "pending_exit": self.pending_exit,
             "last_closed_exit": self.last_closed_exit,
+            "protection_state": self.protection_state,
             "reconciliation_unsafe": self.reconciliation_unsafe,
         }
 
@@ -310,14 +389,21 @@ class RenkoStrategyEngine:
         self.psar_af = float(snapshot["psar_af"]) if snapshot.get("psar_af") is not None else None
         force_flat_dates = snapshot.get("force_flat_dates")
         self.force_flat_dates = set(force_flat_dates if isinstance(force_flat_dates, list) else [])
-        self.tp_sl_lifecycle_state = str(
-            snapshot.get("tp_sl_lifecycle_state")
-            or (TP_SL_LIFECYCLE_POSITION_OPEN if self.position is not None else TP_SL_LIFECYCLE_FLAT)
+        self.tp_sl_lifecycle_state = _canonical_runtime_state(
+            snapshot.get("tp_sl_lifecycle_state"),
+            has_position=self.position is not None,
         )
         pending_exit = snapshot.get("pending_exit")
         self.pending_exit = dict(pending_exit) if isinstance(pending_exit, dict) else None
         last_closed_exit = snapshot.get("last_closed_exit")
         self.last_closed_exit = dict(last_closed_exit) if isinstance(last_closed_exit, dict) else None
+        protection_state = snapshot.get("protection_state")
+        self.protection_state = dict(protection_state) if isinstance(protection_state, dict) else None
+        if self.protection_state is not None:
+            self.protection_state["state"] = _canonical_runtime_state(
+                self.protection_state.get("state"),
+                has_position=self.position is not None,
+            )
         self.reconciliation_unsafe = bool(snapshot.get("reconciliation_unsafe", False))
 
     def on_bar(self, bar: MarketBar) -> list[tuple[Signal, OrderIntent]]:
@@ -403,6 +489,7 @@ class RenkoStrategyEngine:
             existing_qty = abs(float(self.position.qty or target_qty))
             reversal_qty = existing_qty + target_qty
             reason = f"{side}_entry_e1_reversal"
+            self._mark_reversal_exit_planned(timestamp=timestamp, reason=reason, broker_side=broker_side)
             self.position = PositionState(
                 symbol=self.config.symbol.upper(),
                 side=side,  # type: ignore[arg-type]
@@ -410,6 +497,7 @@ class RenkoStrategyEngine:
                 entry_price=price,
                 qty=target_qty,
             )
+            self._mark_reversal_entry_planned(timestamp=timestamp, side=side, price=price, qty=target_qty)
             signal = self._build_signal(
                 signal_type="entry",
                 timestamp=timestamp,
@@ -441,6 +529,7 @@ class RenkoStrategyEngine:
             entry_price=price,
             qty=target_qty,
         )
+        self._mark_reversal_entry_planned(timestamp=timestamp, side=side, price=price, qty=target_qty)
         signal = self._build_signal(
             signal_type="entry",
             timestamp=timestamp,
@@ -464,7 +553,7 @@ class RenkoStrategyEngine:
         if self.position is not None:
             exit_reason = self._exit_reason(brick_price)
             if exit_reason:
-                if str(self.config.exit_management).lower().strip() == "oco":
+                if str(self.config.exit_management).lower().strip() in {"oco", "bracket"}:
                     return []
                 signal = self._build_signal(
                     signal_type="exit",
@@ -776,6 +865,9 @@ class RenkoStrategyEngine:
     def _mark_tp_sl_position_open(self) -> None:
         if self.config.strategy_type != "renko_tp_sl":
             return
+        if str(self.config.exit_management).lower().strip() == "bracket":
+            self.tp_sl_lifecycle_state = TP_SL_LIFECYCLE_ENTRY_PLANNED
+            return
         self.tp_sl_lifecycle_state = TP_SL_LIFECYCLE_POSITION_OPEN
         self.pending_exit = None
 
@@ -795,7 +887,10 @@ class RenkoStrategyEngine:
         self.tp_sl_lifecycle_state = TP_SL_LIFECYCLE_EXIT_PENDING
 
     def mark_close_submitted(self, intent: OrderIntent, response: object | None = None) -> None:
-        if self.config.strategy_type != "renko_tp_sl" or not intent.close_position:
+        if (
+            self.config.strategy_type != "renko_tp_sl"
+            and not self._reversal_catastrophic_stop_enabled()
+        ) or not intent.close_position:
             return
         if self.pending_exit is None:
             self.pending_exit = {
@@ -821,7 +916,7 @@ class RenkoStrategyEngine:
         order_id: str | None = None,
         source: str = "reconciliation",
     ) -> None:
-        if self.config.strategy_type != "renko_tp_sl":
+        if self.config.strategy_type != "renko_tp_sl" and not self._reversal_catastrophic_stop_enabled():
             return
         self.tp_sl_lifecycle_state = TP_SL_LIFECYCLE_CLOSE_FILLED
         self.last_closed_exit = {
@@ -832,14 +927,314 @@ class RenkoStrategyEngine:
         }
         self.position = None
         self.pending_exit = None
+        self.protection_state = None
         self.tp_sl_lifecycle_state = TP_SL_LIFECYCLE_FLAT
 
-    def mark_reconciliation_unsafe(self, reason: str) -> None:
+    def mark_external_close_filled(
+        self,
+        *,
+        timestamp: object | None,
+        reason: str,
+        order_id: str | None,
+        source: str,
+        fill_price: object | None = None,
+        filled_qty: object | None = None,
+        realized_pnl: object | None = None,
+    ) -> None:
+        if self.config.strategy_type != "renko_tp_sl" and not self._reversal_catastrophic_stop_enabled():
+            return
+        previous_position = self.position
+        self.mark_close_filled(timestamp=timestamp, reason=reason, order_id=order_id, source=source)
+        if self.last_closed_exit is not None:
+            previous_payload = None
+            if previous_position is not None:
+                previous_payload = {
+                    "symbol": previous_position.symbol,
+                    "side": previous_position.side,
+                    "entry_time": previous_position.entry_time.isoformat()
+                    if hasattr(previous_position.entry_time, "isoformat")
+                    else previous_position.entry_time,
+                    "entry_price": previous_position.entry_price,
+                    "qty": previous_position.qty,
+                }
+            self.last_closed_exit.update(
+                {
+                    "external": True,
+                    "fill_price": fill_price,
+                    "filled_qty": filled_qty,
+                    "realized_pnl": realized_pnl,
+                    "previous_position": previous_payload,
+                }
+            )
+
+    def _sync_position_from_broker(self, broker_position: dict[str, Any], timestamp: object | None = None) -> None:
+        side = str(broker_position.get("side") or "").lower().strip()
+        if side not in {"long", "short"}:
+            qty_value = float(broker_position.get("qty") or 0)
+            side = "long" if qty_value >= 0 else "short"
+        self.position = PositionState(
+            symbol=self.config.symbol.upper(),
+            side=side,  # type: ignore[arg-type]
+            entry_time=pd.Timestamp(timestamp if timestamp is not None else pd.Timestamp.now(tz="UTC")),
+            entry_price=float(broker_position.get("avg_entry_price") or broker_position.get("current_price") or 0),
+            qty=abs(float(broker_position.get("qty") or broker_position.get("qty_available") or 0)),
+        )
+
+    def apply_tp_sl_protection_evidence(
+        self,
+        *,
+        exit_plan: dict[str, Any] | None = None,
+        verification: object,
+        broker_position: dict[str, Any] | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        if self.config.strategy_type != "renko_tp_sl":
+            return
+        if isinstance(broker_position, dict):
+            self._sync_position_from_broker(broker_position)
+        prior = dict(self.protection_state or {})
+        plan = exit_plan if isinstance(exit_plan, dict) and exit_plan else prior.get("exit_plan") or {}
+        protected = bool(getattr(verification, "protected", False))
+        protection = {
+            "state": TP_SL_LIFECYCLE_POSITION_OPEN if protected else TP_SL_LIFECYCLE_ENTRY_PLANNED,
+            "protection_type": "broker_native_tp_sl",
+            "order_class": plan.get("order_class") or prior.get("order_class") or "bracket",
+            "lifecycle_id": plan.get("lifecycle_id") or prior.get("lifecycle_id"),
+            "client_order_id": plan.get("client_order_id") or prior.get("client_order_id"),
+            "parent_order_id": getattr(verification, "parent_order_id", None) or prior.get("parent_order_id"),
+            "take_profit_order_id": getattr(verification, "take_profit_order_id", None)
+            or prior.get("take_profit_order_id"),
+            "stop_loss_order_id": getattr(verification, "stop_loss_order_id", None) or prior.get("stop_loss_order_id"),
+            "take_profit_client_order_id": plan.get("take_profit_client_order_id")
+            or prior.get("take_profit_client_order_id"),
+            "stop_loss_client_order_id": plan.get("stop_loss_client_order_id") or prior.get("stop_loss_client_order_id"),
+            "take_profit_limit_price": plan.get("take_profit_limit_price") or prior.get("take_profit_limit_price"),
+            "stop_loss_stop_price": plan.get("stop_loss_trigger_price") or prior.get("stop_loss_stop_price"),
+            "stop_loss_trigger_price": plan.get("stop_loss_trigger_price") or prior.get("stop_loss_trigger_price"),
+            "protected_quantity": getattr(verification, "protected_quantity", None),
+            "exit_plan": plan,
+            "verification_issues": _verification_issues(verification),
+        }
+        if extra:
+            protection.update(extra)
+        self.protection_state = {key: value for key, value in protection.items() if value is not None}
+        self.tp_sl_lifecycle_state = protection["state"]
+        self.pending_exit = None
+
+    def apply_reversal_stop_evidence(
+        self,
+        *,
+        stop_plan: dict[str, Any],
+        verification: object,
+        broker_position: dict[str, Any] | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        if not self._reversal_catastrophic_stop_enabled():
+            return
+        if isinstance(broker_position, dict):
+            self._sync_position_from_broker(broker_position)
+        prior = dict(self.protection_state or {})
+        plan = stop_plan if isinstance(stop_plan, dict) else prior.get("stop_plan") or {}
+        protected = bool(getattr(verification, "protected", False))
+        protection = {
+            "state": TP_SL_LIFECYCLE_POSITION_OPEN if protected else TP_SL_LIFECYCLE_ENTRY_PLANNED,
+            "protection_type": PROTECTION_TYPE,
+            "order_class": "single_stop",
+            "lifecycle_id": plan.get("lifecycle_id") or prior.get("lifecycle_id"),
+            "client_order_id": plan.get("client_order_id") or prior.get("client_order_id"),
+            "stop_order_id": getattr(verification, "stop_order_id", None) or prior.get("stop_order_id"),
+            "stop_client_order_id": getattr(verification, "stop_client_order_id", None)
+            or plan.get("stop_client_order_id")
+            or prior.get("stop_client_order_id"),
+            "stop_price": getattr(verification, "stop_price", None) or plan.get("stop_price") or prior.get("stop_price"),
+            "returned_limit_price": getattr(verification, "returned_limit_price", None),
+            "protected_quantity": getattr(verification, "protected_quantity", None),
+            "stop_plan": plan,
+            "verification_issues": _verification_issues(verification),
+        }
+        if extra:
+            protection.update(extra)
+        self.protection_state = {key: value for key, value in protection.items() if value is not None}
+        self.tp_sl_lifecycle_state = protection["state"]
+        self.pending_exit = None
+
+    def mark_entry_protection_submitted(self, intent: OrderIntent, response: object | None = None) -> None:
+        if self.config.strategy_type != "renko_tp_sl":
+            return
+        exit_plan = intent.exit_plan or {}
+        broker_order = response.get("response") if isinstance(response, dict) and isinstance(response.get("response"), dict) else response
+        entry_side = str(intent.side).lower().strip()
+        position_side = "long" if entry_side == "buy" else "short"
+        synthetic_position = {
+            "symbol": intent.symbol,
+            "side": position_side,
+            "qty": str(intent.qty or (exit_plan or {}).get("quantity") or 0),
+            "avg_entry_price": (exit_plan or {}).get("entry_reference_price") or intent.limit_price,
+        }
+        verification = verify_broker_native_protection(
+            symbol=intent.symbol,
+            broker_position=synthetic_position,
+            nested_orders=[broker_order] if isinstance(broker_order, dict) else [],
+            exit_plan=exit_plan,
+            expected_config_fingerprint=self.config.candidate_config_fingerprint,
+            expected_market_contract_fingerprint=self.config.market_contract_fingerprint,
+        )
+        extra = _broker_leg_ids(response)
+        broker_order_id = _broker_order_id(response)
+        if broker_order_id:
+            extra["parent_order_id"] = broker_order_id
+        self.apply_tp_sl_protection_evidence(exit_plan=exit_plan, verification=verification, extra=extra)
+
+    def mark_reversal_catastrophic_stop_submitted(self, intent: OrderIntent, response: object | None = None) -> None:
+        if not self._reversal_catastrophic_stop_enabled():
+            return
+        payload = response if isinstance(response, dict) else {}
+        stop_response = payload.get("catastrophic_stop_response") if isinstance(payload.get("catastrophic_stop_response"), dict) else {}
+        stop_plan = stop_response.get("stop_plan") if isinstance(stop_response.get("stop_plan"), dict) else {}
+        broker_position = stop_response.get("broker_position") if isinstance(stop_response.get("broker_position"), dict) else None
+        stop_order = stop_response.get("response") if isinstance(stop_response.get("response"), dict) else None
+        verification = verify_reversal_catastrophic_stop(
+            symbol=intent.symbol,
+            broker_position=broker_position,
+            open_orders=[stop_order] if isinstance(stop_order, dict) else [],
+            stop_plan=stop_plan,
+            expected_config_fingerprint=self.config.candidate_config_fingerprint,
+            expected_market_contract_fingerprint=self.config.market_contract_fingerprint,
+        )
+        self.apply_reversal_stop_evidence(stop_plan=stop_plan, verification=verification)
+
+    def mark_position_unprotected(self, reason: str, payload: object | None = None) -> None:
+        if self.config.strategy_type != "renko_tp_sl" and not self._reversal_catastrophic_stop_enabled():
+            return
+        prior_protection = self.protection_state if isinstance(self.protection_state, dict) else {}
+        preserved = {
+            key: value
+            for key, value in prior_protection.items()
+            if key
+            in {
+                "order_class",
+                "lifecycle_id",
+                "client_order_id",
+                "parent_order_id",
+                "take_profit_order_id",
+                "take_profit_client_order_id",
+                "take_profit_limit_price",
+                "stop_loss_order_id",
+                "stop_loss_client_order_id",
+                "stop_loss_stop_price",
+                "stop_loss_trigger_price",
+                "exit_plan",
+                "stop_plan",
+                "stop_order_id",
+                "stop_client_order_id",
+                "stop_price",
+                "protection_type",
+            }
+            and value is not None
+        }
+        broker_position = payload.get("broker_position") if isinstance(payload, dict) else None
+        if isinstance(broker_position, dict):
+            side = str(broker_position.get("side") or "").lower().strip()
+            if side in {"long", "short"}:
+                self.position = PositionState(
+                    symbol=self.config.symbol.upper(),
+                    side=side,  # type: ignore[arg-type]
+                    entry_time=pd.Timestamp.now(tz="UTC"),
+                    entry_price=float(broker_position.get("avg_entry_price") or broker_position.get("current_price") or 0),
+                    qty=abs(float(broker_position.get("qty") or 0)),
+                )
+        self.tp_sl_lifecycle_state = TP_SL_LIFECYCLE_ENTRY_PLANNED
+        self.protection_state = {
+            **preserved,
+            "state": TP_SL_LIFECYCLE_ENTRY_PLANNED,
+            "reason": reason,
+            "payload": payload,
+        }
+
+    def mark_reconciliation_unsafe(self, reason: str, evidence: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        previous = self.reconciliation_unsafe
         self.reconciliation_unsafe = True
         if self.config.strategy_type == "renko_tp_sl":
             pending = dict(self.pending_exit or {})
             pending["unsafe_reason"] = reason
             self.pending_exit = pending or None
+        return self._reconciliation_transition_payload(
+            previous=previous,
+            new=True,
+            reason=reason,
+            evidence=evidence,
+        )
+
+    def mark_reconciliation_safe(self, reason: str, evidence: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        previous = self.reconciliation_unsafe
+        self.reconciliation_unsafe = False
+        return self._reconciliation_transition_payload(
+            previous=previous,
+            new=False,
+            reason=reason,
+            evidence=evidence,
+        )
+
+    def _reconciliation_transition_payload(
+        self,
+        *,
+        previous: bool,
+        new: bool,
+        reason: str,
+        evidence: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if previous == new:
+            return None
+        return {
+            "timestamp": pd.Timestamp.now(tz="UTC").isoformat(),
+            "symbol": self.config.symbol.upper(),
+            "previous_value": previous,
+            "new_value": new,
+            "reason": reason,
+            "evidence": evidence or {},
+        }
+
+    def _reversal_catastrophic_stop_enabled(self) -> bool:
+        return (
+            self.config.strategy_type == "renko_reversal"
+            and str(self.config.exit_management).lower().strip() == "catastrophic_stop"
+        )
+
+    def _mark_reversal_entry_planned(self, *, timestamp: pd.Timestamp, side: str, price: float, qty: float) -> None:
+        if not self._reversal_catastrophic_stop_enabled():
+            return
+        prior_exit = dict(self.protection_state or {}) if isinstance(self.protection_state, dict) else None
+        if prior_exit and prior_exit.get("state") != TP_SL_LIFECYCLE_EXIT_PENDING:
+            prior_exit = None
+        self.tp_sl_lifecycle_state = TP_SL_LIFECYCLE_ENTRY_PLANNED
+        self.pending_exit = None
+        self.protection_state = {
+            "state": TP_SL_LIFECYCLE_ENTRY_PLANNED,
+            "protection_type": PROTECTION_TYPE,
+            "symbol": self.config.symbol.upper(),
+            "side": side,
+            "signal_reference_price": price,
+            "qty": qty,
+            "timestamp": timestamp.isoformat(),
+        }
+        if prior_exit is not None:
+            self.protection_state["reversal_exit_planned"] = prior_exit
+
+    def _mark_reversal_exit_planned(self, *, timestamp: pd.Timestamp, reason: str, broker_side: str) -> None:
+        if not self._reversal_catastrophic_stop_enabled():
+            return
+        prior = dict(self.protection_state or {})
+        prior.update(
+            {
+                "state": TP_SL_LIFECYCLE_EXIT_PENDING,
+                "protection_type": PROTECTION_TYPE,
+                "reason": reason,
+                "broker_side": broker_side,
+                "timestamp": timestamp.isoformat(),
+            }
+        )
+        self.protection_state = prior
+        self.tp_sl_lifecycle_state = TP_SL_LIFECYCLE_EXIT_PENDING
 
     def _tp_sl_entries_and_exits_locked(self) -> bool:
         return (
@@ -930,6 +1325,7 @@ class RenkoStrategyEngine:
         take_profit_limit_price: float | None = None
         stop_loss_stop_price: float | None = None
         stop_loss_limit_price: float | None = None
+        exit_plan: dict[str, Any] | None = None
         exit_management = str(self.config.exit_management or "strategy").lower().strip()
         stop_loss_order_type = str(self.config.stop_loss_order_type or "stop_market").lower().strip()
         order_qty = qty
@@ -938,7 +1334,7 @@ class RenkoStrategyEngine:
             not close_position
             and signal.signal_type == "entry"
             and self.config.strategy_type == "renko_tp_sl"
-            and exit_management == "oco"
+            and exit_management in {"oco", "bracket"}
         ):
             entry_dir = 1 if signal.side == "long" else -1
             take_profit_offset = self._take_profit_bricks() * self.config.brick_size
@@ -958,6 +1354,24 @@ class RenkoStrategyEngine:
             if order_qty is None:
                 order_qty = self._target_qty(signal.price)
                 order_notional = None
+            if exit_management == "bracket":
+                exit_plan = build_renko_tp_sl_exit_plan(
+                    trader_id=self.config.trader_id or self.config.strategy_name,
+                    strategy_id=self.config.strategy_name,
+                    symbol=signal.symbol,
+                    entry_side=signal.broker_side,
+                    quantity=order_qty,
+                    entry_reference_type="signal_price",
+                    entry_reference_price=signal.price,
+                    brick_size=self.config.brick_size,
+                    take_profit_bricks=self._take_profit_bricks(),
+                    stop_loss_bricks=self._stop_loss_bricks(),
+                    time_in_force="day",
+                    order_class="bracket",
+                    client_order_id=self._client_order_id(signal),
+                    candidate_config_fingerprint=self.config.candidate_config_fingerprint,
+                    market_contract_fingerprint=self.config.market_contract_fingerprint,
+                ).to_dict()
 
         intent_qty = None
         if not close_position:
@@ -997,6 +1411,7 @@ class RenkoStrategyEngine:
                 and exit_management == "oco"
             )
             else None,
+            exit_plan=exit_plan,
             close_position=close_position,
             trader_id=self.config.trader_id,
             signal_id=signal.signal_id,
@@ -1004,6 +1419,23 @@ class RenkoStrategyEngine:
             if close_position and self.config.strategy_type == "renko_tp_sl"
             else None,
             account_namespace=self.config.account_namespace,
+            brick_size=self.config.brick_size,
+            catastrophic_stop_bricks=self.config.catastrophic_stop_bricks
+            if (
+                not close_position
+                and signal.signal_type == "entry"
+                and self._reversal_catastrophic_stop_enabled()
+            )
+            else None,
+            protection_type=PROTECTION_TYPE
+            if (
+                not close_position
+                and signal.signal_type == "entry"
+                and self._reversal_catastrophic_stop_enabled()
+            )
+            else None,
+            candidate_config_fingerprint=self.config.candidate_config_fingerprint,
+            market_contract_fingerprint=self.config.market_contract_fingerprint,
         )
 
     def _client_order_id(self, signal: Signal) -> str:
@@ -1024,6 +1456,26 @@ def _broker_order_id(response: object | None) -> str | None:
     if isinstance(child, dict) and child.get("id"):
         return str(child["id"])
     return None
+
+
+def _broker_leg_ids(response: object | None) -> dict[str, str]:
+    if not isinstance(response, dict):
+        return {}
+    order = response.get("response") if isinstance(response.get("response"), dict) else response
+    if not isinstance(order, dict):
+        return {}
+    result: dict[str, str] = {}
+    for leg in order.get("legs") or []:
+        if not isinstance(leg, dict):
+            continue
+        leg_id = leg.get("id")
+        if not leg_id:
+            continue
+        if leg.get("limit_price") is not None and "take_profit_order_id" not in result:
+            result["take_profit_order_id"] = str(leg_id)
+        if leg.get("stop_price") is not None and "stop_loss_order_id" not in result:
+            result["stop_loss_order_id"] = str(leg_id)
+    return result
 
 
 class MeanReversionStrategyEngine:

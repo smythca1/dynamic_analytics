@@ -1,0 +1,22 @@
+[Unit]
+Description=Shared Canonical SIP Market Data Live Service
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=6
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/trading-server
+EnvironmentFile=/root/trading-server/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/usr/bin/mkdir -p /run/trading/market-data /root/trading-server/artifacts/live/market-data
+ExecStart=/root/trading-server/venv/bin/python -m silver.market.shared_service --config /root/trading-server/configs/market-data.live.example.json
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

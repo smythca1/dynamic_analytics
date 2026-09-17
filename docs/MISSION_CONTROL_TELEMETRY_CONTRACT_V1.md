@@ -17,12 +17,43 @@ The exporter may read:
 - Shared canonical journal JSONL through a bounded tail.
 - Fleet event JSONL through bounded tails.
 - Persisted strategy state snapshots.
-- Broker account, position, and open-order data through read-only GET methods.
+- Cached broker account, position, and open-order snapshots.
+
+A Mission Control background broker cache refresher may call only these
+read-only broker methods:
+
+- `get_account()`
+- `get_positions()`
+- `get_orders(status="open", limit=100)`
+
+The `/metrics` request path must not call Alpaca directly. It reads the latest
+atomic broker cache snapshot only.
 
 The exporter must not read full JSONL history during a scrape. First contact
 with a JSONL source starts from a bounded tail window. Subsequent scrapes read
 only newly appended bytes unless the file shrinks or advances beyond the tail
 window.
+
+## Broker Cache
+
+Mission Control owns a read-only background broker cache refresher with a
+production cadence bounded to approximately 2 to 5 seconds by
+`MISSION_CONTROL_BROKER_CACHE_REFRESH_SECONDS` (default `3`). Broker read
+timeouts are bounded by `MISSION_CONTROL_BROKER_CACHE_READ_TIMEOUT_SECONDS`
+(default `2`).
+
+Each refresh builds a complete per-fleet result off the scrape path. The visible
+cache is replaced only after a complete successful fleet refresh, so `/metrics`
+readers never observe partially refreshed broker state. If a refresh fails, the
+last known good snapshot is preserved and `renko_broker_cache_up` becomes `0`
+for that fleet until a fresh successful refresh occurs. Startup with no
+successful snapshot emits `NaN` broker values, cache age `NaN`,
+`renko_broker_cache_up` `0`, and a broker source error.
+
+Broker cache freshness is measured by
+`renko_broker_cache_last_success_timestamp_seconds`; cache age can be derived in
+Prometheus with `time() - renko_broker_cache_last_success_timestamp_seconds`.
+The exporter also emits `renko_broker_cache_age_seconds` for direct inspection.
 
 ## Label Policy
 
@@ -86,8 +117,8 @@ failure. Holiday-aware readiness is not included in V1.
 Fleet readiness is `1` only when all enabled traders in the fleet have valid
 state, acceptable heartbeat freshness for the current market-session state,
 read-only internal-vs-broker position match, safe reconciliation state, broker
-read success, and regular-session market-data freshness when the market is
-open.
+cache freshness/read success, and regular-session market-data freshness when the
+market is open.
 
 ## Metric Inventory
 
@@ -120,10 +151,10 @@ open.
 | `renko_position_state` | gauge | `environment`, `fleet`, `strategy`, `symbol`, `side` | Persisted strategy state snapshot |
 | `renko_position_quantity` | gauge | `environment`, `fleet`, `strategy`, `symbol` | Persisted strategy state snapshot |
 | `renko_position_entry_price` | gauge | `environment`, `fleet`, `strategy`, `symbol` | Persisted strategy state snapshot |
-| `renko_position_unrealized_pnl` | gauge | `environment`, `fleet`, `strategy`, `symbol` | Broker position GET response |
+| `renko_position_unrealized_pnl` | gauge | `environment`, `fleet`, `strategy`, `symbol` | Cached broker positions snapshot |
 | `renko_reconciliation_status` | gauge | `environment`, `fleet`, `strategy`, `symbol` | Read-only internal-vs-broker comparison |
-| `renko_pending_orders` | gauge | `environment`, `fleet`, `strategy`, `symbol` | Broker open orders GET response |
-| `renko_protective_orders_present` | gauge | `environment`, `fleet`, `strategy`, `symbol` | Broker open orders GET response |
+| `renko_pending_orders` | gauge | `environment`, `fleet`, `strategy`, `symbol` | Cached broker open-orders snapshot |
+| `renko_protective_orders_present` | gauge | `environment`, `fleet`, `strategy`, `symbol` | Cached broker open-orders snapshot |
 | `renko_internal_vs_broker_position_match` | gauge | `environment`, `fleet`, `strategy`, `symbol` | Read-only internal-vs-broker comparison |
 | `renko_orphan_broker_position_detected` | gauge | `environment`, `fleet`, `strategy`, `symbol` | Read-only internal-vs-broker comparison |
 | `renko_orphan_internal_position_detected` | gauge | `environment`, `fleet`, `strategy`, `symbol` | Read-only internal-vs-broker comparison |
@@ -133,20 +164,25 @@ open.
 | `renko_last_brick_timestamp_seconds` | gauge | `environment`, `fleet`, `strategy`, `symbol` | Bounded event tail |
 | `renko_bricks_total` | counter | `environment`, `fleet`, `strategy`, `symbol` | Persisted Renko strategy state processed-brick count |
 | `renko_brick_direction` | gauge | `environment`, `fleet`, `strategy`, `symbol` | Persisted Renko strategy state |
-| `renko_broker_connected` | gauge | `environment`, `fleet`, `service` | Broker read-only GET success |
-| `renko_broker_account_equity` | gauge | `environment`, `fleet`, `service` | Broker account GET response |
-| `renko_broker_buying_power` | gauge | `environment`, `fleet`, `service` | Broker account GET response |
-| `renko_broker_cash` | gauge | `environment`, `fleet`, `service` | Broker account GET response |
-| `renko_broker_daytrading_buying_power` | gauge | `environment`, `fleet`, `service` | Broker account GET response |
+| `renko_broker_cache_last_success_timestamp_seconds` | gauge | `environment`, `fleet`, `service` | Background broker cache refresh |
+| `renko_broker_cache_age_seconds` | gauge | `environment`, `fleet`, `service` | Derived from cached broker snapshot success time |
+| `renko_broker_cache_refresh_duration_seconds` | gauge | `environment`, `fleet`, `service` | Background broker refresh wall-clock duration |
+| `renko_broker_cache_refresh_failures_total` | counter | `environment`, `fleet`, `service` | Background broker refresh failures |
+| `renko_broker_cache_up` | gauge | `environment`, `fleet`, `service` | Broker cache freshness and latest refresh health |
+| `renko_broker_connected` | gauge | `environment`, `fleet`, `service` | Fresh broker cache health |
+| `renko_broker_account_equity` | gauge | `environment`, `fleet`, `service` | Cached broker account snapshot |
+| `renko_broker_buying_power` | gauge | `environment`, `fleet`, `service` | Cached broker account snapshot |
+| `renko_broker_cash` | gauge | `environment`, `fleet`, `service` | Cached broker account snapshot |
+| `renko_broker_daytrading_buying_power` | gauge | `environment`, `fleet`, `service` | Cached broker account snapshot |
 | `renko_broker_margin_used` | gauge | `environment`, `fleet`, `service` | Derived from broker account long/short market value and equity |
-| `renko_broker_position_qty` | gauge | `environment`, `fleet`, `symbol`, `service` | Broker positions GET response |
-| `renko_broker_position_market_value` | gauge | `environment`, `fleet`, `symbol`, `service` | Broker positions GET response |
-| `renko_broker_open_orders` | gauge | `environment`, `fleet`, `service` | Broker open orders GET response |
-| `renko_portfolio_total_equity` | gauge | `environment`, `fleet`, `service` | Broker account GET response |
-| `renko_portfolio_gross_exposure` | gauge | `environment`, `fleet`, `service` | Broker account GET response |
-| `renko_portfolio_net_exposure` | gauge | `environment`, `fleet`, `service` | Broker account GET response |
-| `renko_portfolio_cash` | gauge | `environment`, `fleet`, `service` | Broker account GET response |
-| `renko_portfolio_unrealized_pnl` | gauge | `environment`, `fleet`, `service` | Broker positions GET response |
+| `renko_broker_position_qty` | gauge | `environment`, `fleet`, `symbol`, `service` | Cached broker positions snapshot |
+| `renko_broker_position_market_value` | gauge | `environment`, `fleet`, `symbol`, `service` | Cached broker positions snapshot |
+| `renko_broker_open_orders` | gauge | `environment`, `fleet`, `service` | Cached broker open-orders snapshot |
+| `renko_portfolio_total_equity` | gauge | `environment`, `fleet`, `service` | Cached broker account snapshot |
+| `renko_portfolio_gross_exposure` | gauge | `environment`, `fleet`, `service` | Cached broker account snapshot |
+| `renko_portfolio_net_exposure` | gauge | `environment`, `fleet`, `service` | Cached broker account snapshot |
+| `renko_portfolio_cash` | gauge | `environment`, `fleet`, `service` | Cached broker account snapshot |
+| `renko_portfolio_unrealized_pnl` | gauge | `environment`, `fleet`, `service` | Cached broker positions snapshot |
 | `renko_portfolio_realized_pnl_today` | gauge | `environment`, `fleet`, `service` | Intentionally `NaN` in V1 |
 | `renko_activity_events_total` | counter | `environment`, `fleet`, `strategy`, `symbol`, `side`, `event_type` | Bounded event tail |
 | `renko_signals_total` | counter | `environment`, `fleet`, `strategy`, `symbol`, `side` | Bounded event tail |
@@ -163,12 +199,12 @@ open.
 | --- | --- | --- |
 | Executive readiness | Derived from all V1 read-only sources | No trading mutation or reconciliation call |
 | Market data health | Shared market-data health JSON plus canonical journal tail | No websocket subscription by exporter |
-| Positions | Persisted strategy state and broker positions GET | Read-only comparison only |
+| Positions | Persisted strategy state and cached broker positions snapshot | Read-only comparison only |
 | Trading activity | Fleet JSONL event tails | Counters begin from bounded tail on exporter start |
 | Execution quality | Execution JSONL events | Fill latency requires fill timestamps in event payloads |
-| Broker/account | Alpaca read-only account, positions, orders GET methods | Broker failures emit source errors and NaN gauges |
-| Reconciliation | Persisted state plus broker positions and bounded reconciliation events | Does not call live reconciliation functions |
-| Portfolio | Broker account and positions GET methods | Realized PnL intentionally unavailable in V1 |
+| Broker/account | Background cache built from Alpaca read-only account, positions, orders GET methods | `/metrics` uses cache only; failures emit source errors and cache health gauges |
+| Reconciliation | Persisted state plus cached broker positions and bounded reconciliation events | Does not call live reconciliation functions |
+| Portfolio | Cached broker account and positions snapshots | Realized PnL intentionally unavailable in V1 |
 | Infrastructure | Node/systemd exporters outside this app | CPU/RAM/disk/restarts are not emitted by V1 app exporter |
 | Research/optimizer | Future artifact exporter | V1 does not scan optimizer outputs |
 
@@ -186,6 +222,9 @@ open.
 - Holiday-aware market-session readiness is not included.
 - Broker position/order metrics are symbol-scoped. V1 assumes one active
   strategy per fleet/symbol/account for reconciliation display.
+- Broker position/account metrics can represent a preserved last known good
+  snapshot while `renko_broker_cache_up` is `0`; alerting must gate on cache
+  health/freshness before treating broker values as current.
 - Duplicate configured traders with identical bounded `fleet`, `strategy`, and
   `symbol` labels cannot be represented separately without increasing label
   cardinality. V1 collapses them and emits a visible label-collision source
@@ -193,8 +232,8 @@ open.
 
 ## Deployment Notes
 
-Adding `/metrics` does not require changes to fleet services, shared
+Adding or updating `/metrics` does not require changes to fleet services, shared
 market-data services, broker execution, strategy code, Renko code, production
 configuration, Prometheus, or Grafana. A safe production rollout should deploy
-the mission-control code only, scrape it locally, validate read-only metrics,
-then add Prometheus and Grafana in separate approved steps.
+the mission-control code only, scrape it locally, validate read-only metrics and
+cache cadence, then add Prometheus and Grafana in separate approved steps.

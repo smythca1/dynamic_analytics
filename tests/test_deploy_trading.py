@@ -60,11 +60,14 @@ class DeployTradingTests(unittest.TestCase):
     def _write_payload(self, marker: str) -> None:
         for filename in (
             "alpaca_trader.py",
+            "broker_protection.py",
             "execution_engine.py",
+            "exit_plan.py",
             "fleet_runner.py",
             "mission_control_telemetry.py",
             "monitoring_app.py",
             "renko_builder.py",
+            "reversal_protection.py",
             "strategy_engine.py",
             "trading_events.py",
         ):
@@ -74,7 +77,11 @@ class DeployTradingTests(unittest.TestCase):
         self._write("trading-fleet-live.service", "[Service]\nExecStart=fleet\n")
         self._write("shared/__init__.py", "# shared\n")
         self._write("shared/config/__init__.py", "# config\n")
-        self._write("shared/config/trader_config.py", "def build_strategy_config(trader):\n    return trader\n")
+        self._write(
+            "shared/config/trader_config.py",
+            "def build_strategy_config(trader):\n    return trader\n\n"
+            "def validate_single_strategy_kernel_config(data, *, config_path=None):\n    return None\n",
+        )
         self._write("silver/__init__.py", "# silver\n")
         self._write("silver/market/__init__.py", "# market\n")
         self._write("silver/market/one_second_sampler.py", "# sampler\n")
@@ -549,6 +556,7 @@ class DeployTradingTests(unittest.TestCase):
         validation = result.stdout.split("Validation commands:", 1)[1]
         self.assertNotIn("--execute-real", validation)
         self.assertIn("python fleet_runner.py --help", validation)
+        self.assertIn("validate_single_strategy_kernel_config", validation)
 
     def test_backup_excludes_persistent_artifacts_and_venv(self) -> None:
         script = (self.repo / "deploy-trading").read_text()
@@ -574,6 +582,9 @@ class DeployTradingTests(unittest.TestCase):
         self.assertFalse((fake_bin / "scp.log").exists())
 
     def test_missing_required_committed_file_fails_locally(self) -> None:
+        for filename in ("broker_protection.py", "exit_plan.py", "reversal_protection.py"):
+            self._write(filename, "# retained runtime helper\n")
+        self._git("add", "broker_protection.py", "exit_plan.py", "reversal_protection.py")
         self._git("rm", "-r", "silver")
         self._git("commit", "-m", "remove silver")
         bad_commit = self._git("rev-parse", "HEAD").stdout.strip()
@@ -711,6 +722,7 @@ class DeployTradingTests(unittest.TestCase):
         ssh_log = (fake_bin / "ssh.log").read_text(encoding="utf-8")
         scp_log = (fake_bin / "scp.log").read_text(encoding="utf-8")
         self.assertIn("py_compile", ssh_log)
+        self.assertIn("validate_single_strategy_kernel_config", ssh_log)
         self.assertIn("backup_metadata", ssh_log)
         self.assertIn("activate_dir", ssh_log)
         self.assertIn("DEPLOYED_VERSION.json", ssh_log)
@@ -921,27 +933,26 @@ class DeployTradingTests(unittest.TestCase):
         self.assertIn("Remote destination: root@157.230.54.46:/root/path with space", result.stdout)
         self.assertIn("source /root/path with space/venv/bin/activate", result.stdout)
 
-    def test_commit_008b9e4_payload_excludes_current_execution_status_hunk_when_available(self) -> None:
-        commit = "008b9e4dec2cbb4dc09033e55e8d36082ee6b123"
-        if subprocess.run(["git", "rev-parse", "--verify", f"{commit}^{{commit}}"], cwd=REPO_ROOT, capture_output=True).returncode != 0:
-            self.skipTest("repository commit 008b9e4 is not available")
-        committed_fleet_runner = subprocess.run(
-            ["git", "show", f"{commit}:fleet_runner.py"],
-            cwd=REPO_ROOT,
-            text=True,
-            capture_output=True,
-            check=True,
-        ).stdout
-        unstaged_fleet_diff = subprocess.run(
-            ["git", "diff", "--", "fleet_runner.py"],
-            cwd=REPO_ROOT,
-            text=True,
-            capture_output=True,
-            check=True,
-        ).stdout
-        self.assertIn("execution_status_", unstaged_fleet_diff)
+    def test_commit_payload_excludes_dirty_execution_status_runtime_hunk(self) -> None:
+        committed_fleet_runner = self._git("show", f"{self.commit}:fleet_runner.py").stdout
         self.assertNotIn("TERMINAL_EXECUTION_FAILURE_STATUSES", committed_fleet_runner)
         self.assertNotIn("execution_status_", committed_fleet_runner)
+
+        self._write(
+            "fleet_runner.py",
+            "TERMINAL_EXECUTION_FAILURE_STATUSES = {'canceled'}\n"
+            "def record_failure(status):\n"
+            "    return {'error': f'execution_status_{status}'}\n",
+        )
+        self.assertIn("execution_status_", self._git("diff", "--", "fleet_runner.py").stdout)
+
+        fake_bin = self._fake_bin()
+        self._run("--commit", self.commit, "--no-restart", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+
+        deployed_fleet = (fake_bin / "scp_payload/fleet_runner.py").read_text(encoding="utf-8")
+        self.assertEqual(committed_fleet_runner, deployed_fleet)
+        self.assertNotIn("TERMINAL_EXECUTION_FAILURE_STATUSES", deployed_fleet)
+        self.assertNotIn("execution_status_", deployed_fleet)
 
     def test_existing_remote_config_path_preserved_without_deploy_config(self) -> None:
         result = self._run("--commit", self.commit, "--dry-run")
@@ -1052,11 +1063,14 @@ class DeployTradingTests(unittest.TestCase):
     def _write_runtime_payload(self, root: Path, marker: str) -> None:
         for filename in (
             "alpaca_trader.py",
+            "broker_protection.py",
             "execution_engine.py",
+            "exit_plan.py",
             "fleet_runner.py",
             "mission_control_telemetry.py",
             "monitoring_app.py",
             "renko_builder.py",
+            "reversal_protection.py",
             "strategy_engine.py",
             "trading_events.py",
         ):

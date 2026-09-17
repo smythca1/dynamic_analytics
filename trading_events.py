@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
+import math
+import re
 from typing import Any, Literal
 
 import pandas as pd
@@ -13,12 +16,89 @@ ExecutionMode = Literal["shadow", "real"]
 
 PRICE_FORMING_TRADE_CONDITIONS = {frozenset({"@"}), frozenset({"@", "F"})}
 
+_ISO_TIMESTAMP_RE = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})[T ]"
+    r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})"
+    r"(?:\.(?P<fraction>\d{1,9}))?"
+    r"(?P<tz>Z|z|[+-]\d{2}:?\d{2})?$"
+)
 
-def utc_timestamp(value: Any) -> pd.Timestamp:
+
+@dataclass(frozen=True)
+class TimestampParseInfo:
+    input_type: str
+    path: str
+    used_pandas_fallback: bool = False
+
+
+def _raise_invalid_timestamp(value: Any) -> None:
+    raise ValueError(f"Could not parse timestamp: {value}")
+
+
+def _timestamp_from_iso_string(value: str) -> pd.Timestamp | None:
+    stripped = value.strip()
+    match = _ISO_TIMESTAMP_RE.match(stripped)
+    if match is None:
+        return None
+    year, month, day = (int(part) for part in match.group("date").split("-"))
+    fraction = (match.group("fraction") or "").ljust(9, "0")
+    microsecond = int(fraction[:6] or "0")
+    nanosecond = int(fraction[6:] or "0")
+    tz_text = match.group("tz")
+    tzinfo = timezone.utc
+    if tz_text and tz_text not in {"Z", "z"}:
+        sign = 1 if tz_text[0] == "+" else -1
+        offset_text = tz_text[1:].replace(":", "")
+        offset = timedelta(hours=int(offset_text[:2]), minutes=int(offset_text[2:4]))
+        tzinfo = timezone(sign * offset)
+    timestamp = pd.Timestamp(
+        year=year,
+        month=month,
+        day=day,
+        hour=int(match.group("hour")),
+        minute=int(match.group("minute")),
+        second=int(match.group("second")),
+        microsecond=microsecond,
+        nanosecond=nanosecond,
+        tz=tzinfo,
+    )
+    return timestamp.tz_convert("UTC")
+
+
+def utc_timestamp_with_info(value: Any) -> tuple[pd.Timestamp, TimestampParseInfo]:
+    input_type = type(value).__name__
+    if isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            _raise_invalid_timestamp(value)
+        timestamp = value.tz_localize("UTC") if value.tzinfo is None else value.tz_convert("UTC")
+        return pd.Timestamp(timestamp), TimestampParseInfo(input_type=input_type, path="pandas_timestamp")
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            timestamp = pd.Timestamp(value.replace(tzinfo=timezone.utc))
+        else:
+            timestamp = pd.Timestamp(value.astimezone(timezone.utc))
+        if pd.isna(timestamp):
+            _raise_invalid_timestamp(value)
+        return pd.Timestamp(timestamp), TimestampParseInfo(input_type=input_type, path="datetime")
+    if isinstance(value, str):
+        try:
+            timestamp = _timestamp_from_iso_string(value)
+        except (OverflowError, ValueError):
+            _raise_invalid_timestamp(value)
+        if timestamp is not None:
+            return timestamp, TimestampParseInfo(input_type=input_type, path="iso_string_fast")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if not math.isfinite(float(value)):
+            _raise_invalid_timestamp(value)
     timestamp = pd.to_datetime(value, utc=True, errors="coerce")
     if pd.isna(timestamp):
-        raise ValueError(f"Could not parse timestamp: {value}")
-    return pd.Timestamp(timestamp)
+        _raise_invalid_timestamp(value)
+    return pd.Timestamp(timestamp), TimestampParseInfo(input_type=input_type, path="pandas_fallback", used_pandas_fallback=True)
+
+
+def utc_timestamp(value: Any) -> pd.Timestamp:
+    timestamp, _info = utc_timestamp_with_info(value)
+    return timestamp
 
 
 @dataclass(frozen=True)
@@ -133,11 +213,17 @@ class OrderIntent:
     stop_loss_limit_price: float | None = None
     take_profit_offset: float | None = None
     stop_loss_offset: float | None = None
+    exit_plan: dict[str, Any] | None = None
     close_position: bool = False
     trader_id: str | None = None
     signal_id: str | None = None
     lifecycle_state: str | None = None
     account_namespace: str | None = None
+    brick_size: float | None = None
+    catastrophic_stop_bricks: int | None = None
+    protection_type: str | None = None
+    candidate_config_fingerprint: str | None = None
+    market_contract_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)

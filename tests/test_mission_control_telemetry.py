@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import json
 import re
+import threading
 import tempfile
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -12,6 +16,8 @@ from unittest.mock import patch
 from mission_control_telemetry import (
     ALLOWED_DATA_LABELS,
     BoundedJsonlTail,
+    BrokerSnapshotBackgroundCollector,
+    BrokerSnapshotCache,
     MissionControlTelemetryCollector,
     TelemetryConfig,
 )
@@ -59,6 +65,70 @@ class GuardedBroker:
 class RaisingBrokerFactory:
     def __call__(self, mode: str | None, profile: str | None) -> object:
         raise RuntimeError("broker unavailable")
+
+
+class StaticBroker:
+    def __init__(self, *, qty: str = "3", equity: str = "10000", fail_on: str | None = None) -> None:
+        self.calls: list[str] = []
+        self.qty = qty
+        self.equity = equity
+        self.fail_on = fail_on
+
+    def get_account(self) -> dict[str, str]:
+        self.calls.append("get_account")
+        if self.fail_on == "get_account":
+            raise RuntimeError("account failed")
+        return {
+            "equity": self.equity,
+            "buying_power": "20000",
+            "cash": "5000",
+            "daytrading_buying_power": "40000",
+            "long_market_value": "306",
+            "short_market_value": "0",
+        }
+
+    def get_positions(self) -> list[dict[str, str]]:
+        self.calls.append("get_positions")
+        if self.fail_on == "get_positions":
+            raise RuntimeError("positions failed")
+        return [{"symbol": "AAPL", "side": "long", "qty": self.qty, "market_value": "306", "unrealized_pl": "6"}]
+
+    def get_orders(self, *, status: str, limit: int) -> list[dict[str, str]]:
+        self.calls.append(f"get_orders:{status}:{limit}")
+        if self.fail_on == "get_orders":
+            raise RuntimeError("orders failed")
+        return [{"symbol": "AAPL", "type": "stop", "order_class": "", "qty": self.qty}]
+
+    def submit_order(self, *args: object, **kwargs: object) -> None:
+        raise AssertionError("broker mutator called")
+
+    def cancel_order(self, *args: object, **kwargs: object) -> None:
+        raise AssertionError("broker mutator called")
+
+    def replace_order(self, *args: object, **kwargs: object) -> None:
+        raise AssertionError("broker mutator called")
+
+    def delete_order(self, *args: object, **kwargs: object) -> None:
+        raise AssertionError("broker mutator called")
+
+    def close_position(self, *args: object, **kwargs: object) -> None:
+        raise AssertionError("broker mutator called")
+
+    def close_all_positions(self, *args: object, **kwargs: object) -> None:
+        raise AssertionError("broker mutator called")
+
+
+class BlockingBroker(StaticBroker):
+    def __init__(self, *, started: threading.Event, release: threading.Event, qty: str = "5") -> None:
+        super().__init__(qty=qty, equity="11000")
+        self.started = started
+        self.release = release
+
+    def get_positions(self) -> list[dict[str, str]]:
+        self.calls.append("get_positions")
+        self.started.set()
+        self.release.wait(timeout=2.0)
+        return [{"symbol": "AAPL", "side": "long", "qty": self.qty, "market_value": "510", "unrealized_pl": "10"}]
 
 
 class MissionControlTelemetryTests(unittest.TestCase):
@@ -218,6 +288,246 @@ class MissionControlTelemetryTests(unittest.TestCase):
         )
         self.assertIn('renko_trader_up{environment="test",fleet="fleet-a",strategy="strategy_a",symbol="AAPL"} 1', output)
 
+    def test_metrics_can_read_empty_cache_without_broker_gets(self) -> None:
+        paths = self._healthy_workspace()
+        config = paths["config"]
+        cache = BrokerSnapshotCache()
+        forbidden_calls: list[str] = []
+
+        def forbidden_broker_reader(mode: str | None, profile: str | None) -> object:
+            forbidden_calls.append(f"{mode}:{profile}")
+            raise AssertionError("metrics called broker reader")
+
+        output = MissionControlTelemetryCollector(config).collect_prometheus(
+            broker_reader_for=forbidden_broker_reader,
+            broker_snapshot_provider=self._cache_provider(cache, config),
+            now=datetime(2026, 9, 1, 14, 30, 4, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual([], forbidden_calls)
+        self.assertIn('renko_broker_cache_up{environment="test",fleet="fleet-a",service="broker_cache"} 0', output)
+        self.assertIn('renko_broker_connected{environment="test",fleet="fleet-a",service="broker"} 0', output)
+        self.assertIn('renko_telemetry_source_error{environment="test",fleet="fleet-a",service="broker"} 1', output)
+        self.assertIn('renko_readiness{environment="test",fleet="fleet-a",service="readiness"} 0', output)
+
+    def test_metrics_route_uses_cache_not_get_trader(self) -> None:
+        import monitoring_app
+
+        paths = self._healthy_workspace()
+        config = paths["config"]
+        cache = BrokerSnapshotCache()
+        collector = MissionControlTelemetryCollector(config)
+        with (
+            patch.object(monitoring_app, "get_telemetry_config", return_value=config),
+            patch.object(monitoring_app, "get_broker_snapshot_cache", return_value=cache),
+            patch.object(monitoring_app, "get_telemetry_collector", return_value=collector),
+            patch.object(monitoring_app, "get_trader", side_effect=AssertionError("route called get_trader")) as get_trader,
+        ):
+            response = asyncio.run(monitoring_app.metrics())
+
+        self.assertFalse(get_trader.called)
+        body = response.body.decode("utf-8")
+        self.assertIn('renko_broker_cache_up{environment="test",fleet="fleet-a",service="broker_cache"} 0', body)
+
+    def test_background_refresh_uses_only_read_only_broker_gets(self) -> None:
+        paths = self._healthy_workspace()
+        config = paths["config"]
+        broker = StaticBroker()
+        cache = BrokerSnapshotCache()
+        refresher = BrokerSnapshotBackgroundCollector(
+            cache=cache,
+            config=config,
+            broker_reader_for=lambda mode, profile: broker,
+        )
+
+        refresher.refresh_once(now=datetime(2026, 9, 1, 14, 30, 4, tzinfo=timezone.utc))
+
+        self.assertEqual(["get_account", "get_positions", "get_orders:open:100"], broker.calls)
+        output = MissionControlTelemetryCollector(config).collect_prometheus(
+            broker_snapshot_provider=self._cache_provider(cache, config),
+            now=datetime(2026, 9, 1, 14, 30, 5, tzinfo=timezone.utc),
+        )
+        self.assertIn('renko_broker_cache_up{environment="test",fleet="fleet-a",service="broker_cache"} 1', output)
+        self.assertIn('renko_broker_cache_refresh_failures_total{environment="test",fleet="fleet-a",service="broker_cache"} 0', output)
+        self.assertIn('renko_broker_position_qty{environment="test",fleet="fleet-a",symbol="AAPL",service="broker"} 3', output)
+
+    def test_no_broker_or_reconciliation_mutator_call_sites_are_introduced(self) -> None:
+        mutators = {
+            "submit_order",
+            "cancel_order",
+            "replace_order",
+            "delete_order",
+            "cancel_all_orders",
+            "close_position",
+            "close_all_positions",
+            "submit_oco_exit_order",
+            "submit_emergency_flatten",
+            "reconcile",
+            "reconcile_state",
+            "recover_missing_protection",
+            "recover_reversal_protection",
+        }
+        for path in [Path("mission_control_telemetry.py"), Path("monitoring_app.py")]:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            called = sorted(
+                {
+                    node.func.attr
+                    for node in ast.walk(tree)
+                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                }
+            )
+            self.assertEqual([], sorted(mutators.intersection(called)), msg=str(path))
+
+    def test_stale_cache_is_visible_and_not_current_healthy(self) -> None:
+        paths = self._healthy_workspace()
+        config = paths["config"]
+        cache = BrokerSnapshotCache()
+        broker = StaticBroker()
+        BrokerSnapshotBackgroundCollector(
+            cache=cache,
+            config=config,
+            broker_reader_for=lambda mode, profile: broker,
+        ).refresh_once(now=datetime.fromtimestamp(100, tz=timezone.utc))
+
+        output = MissionControlTelemetryCollector(config).collect_prometheus(
+            broker_snapshot_provider=self._cache_provider(cache, config),
+            now=datetime.fromtimestamp(120, tz=timezone.utc),
+        )
+
+        self.assertIn('renko_broker_cache_age_seconds{environment="test",fleet="fleet-a",service="broker_cache"} 20', output)
+        self.assertIn('renko_broker_cache_up{environment="test",fleet="fleet-a",service="broker_cache"} 0', output)
+        self.assertIn('renko_broker_connected{environment="test",fleet="fleet-a",service="broker"} 0', output)
+        self.assertIn('renko_telemetry_source_error{environment="test",fleet="fleet-a",service="broker"} 1', output)
+        self.assertIn('renko_broker_position_qty{environment="test",fleet="fleet-a",symbol="AAPL",service="broker"} 3', output)
+
+    def test_failed_refresh_retains_last_known_good_snapshot(self) -> None:
+        paths = self._healthy_workspace()
+        config = paths["config"]
+        cache = BrokerSnapshotCache()
+        BrokerSnapshotBackgroundCollector(
+            cache=cache,
+            config=config,
+            broker_reader_for=lambda mode, profile: StaticBroker(qty="3", equity="10000"),
+        ).refresh_once(now=datetime.fromtimestamp(100, tz=timezone.utc))
+        failing_broker = StaticBroker(qty="5", equity="11000", fail_on="get_positions")
+
+        BrokerSnapshotBackgroundCollector(
+            cache=cache,
+            config=config,
+            broker_reader_for=lambda mode, profile: failing_broker,
+        ).refresh_once(now=datetime.fromtimestamp(101, tz=timezone.utc))
+
+        output = MissionControlTelemetryCollector(config).collect_prometheus(
+            broker_snapshot_provider=self._cache_provider(cache, config),
+            now=datetime.fromtimestamp(102, tz=timezone.utc),
+        )
+        self.assertEqual(["get_account", "get_positions"], failing_broker.calls)
+        self.assertIn('renko_broker_cache_refresh_failures_total{environment="test",fleet="fleet-a",service="broker_cache"} 1', output)
+        self.assertIn('renko_broker_cache_up{environment="test",fleet="fleet-a",service="broker_cache"} 0', output)
+        self.assertIn('renko_broker_account_equity{environment="test",fleet="fleet-a",service="broker"} 10000', output)
+        self.assertIn('renko_broker_position_qty{environment="test",fleet="fleet-a",symbol="AAPL",service="broker"} 3', output)
+
+    def test_cache_replacement_is_atomic_during_slow_refresh(self) -> None:
+        paths = self._healthy_workspace()
+        config = paths["config"]
+        cache = BrokerSnapshotCache()
+        BrokerSnapshotBackgroundCollector(
+            cache=cache,
+            config=config,
+            broker_reader_for=lambda mode, profile: StaticBroker(qty="3", equity="10000"),
+        ).refresh_once(now=datetime.fromtimestamp(100, tz=timezone.utc))
+        started = threading.Event()
+        release = threading.Event()
+        blocking_broker = BlockingBroker(started=started, release=release, qty="5")
+        refresher = BrokerSnapshotBackgroundCollector(
+            cache=cache,
+            config=config,
+            broker_reader_for=lambda mode, profile: blocking_broker,
+        )
+        thread = threading.Thread(target=lambda: refresher.refresh_once(now=datetime.fromtimestamp(101, tz=timezone.utc)))
+        thread.start()
+        self.assertTrue(started.wait(timeout=1.0))
+        try:
+            before_release_started = time.perf_counter()
+            output = MissionControlTelemetryCollector(config).collect_prometheus(
+                broker_snapshot_provider=self._cache_provider(cache, config),
+                now=datetime.fromtimestamp(101, tz=timezone.utc),
+            )
+            before_release_duration = time.perf_counter() - before_release_started
+            self.assertLess(before_release_duration, 0.2)
+            self.assertIn('renko_broker_account_equity{environment="test",fleet="fleet-a",service="broker"} 10000', output)
+            self.assertIn('renko_broker_position_qty{environment="test",fleet="fleet-a",symbol="AAPL",service="broker"} 3', output)
+        finally:
+            release.set()
+            thread.join(timeout=1.0)
+
+        output = MissionControlTelemetryCollector(config).collect_prometheus(
+            broker_snapshot_provider=self._cache_provider(cache, config),
+            now=datetime.fromtimestamp(102, tz=timezone.utc),
+        )
+        self.assertIn('renko_broker_account_equity{environment="test",fleet="fleet-a",service="broker"} 11000', output)
+        self.assertIn('renko_broker_position_qty{environment="test",fleet="fleet-a",symbol="AAPL",service="broker"} 5', output)
+
+    def test_background_timeout_marks_failure_without_blocking_metrics(self) -> None:
+        paths = self._healthy_workspace()
+        config = paths["config"]
+        cache = BrokerSnapshotCache()
+        started = threading.Event()
+        release = threading.Event()
+        broker = BlockingBroker(started=started, release=release)
+        refresher = BrokerSnapshotBackgroundCollector(
+            cache=cache,
+            config=config,
+            broker_reader_for=lambda mode, profile: broker,
+            refresh_interval_seconds=0.05,
+            read_timeout_seconds=0.01,
+        )
+        refresher.start()
+        try:
+            self.assertTrue(started.wait(timeout=1.0))
+            time.sleep(0.05)
+            started_at = time.perf_counter()
+            output = MissionControlTelemetryCollector(config).collect_prometheus(
+                broker_snapshot_provider=self._cache_provider(cache, config),
+                now=datetime(2026, 9, 1, 14, 30, 5, tzinfo=timezone.utc),
+            )
+            self.assertLess(time.perf_counter() - started_at, 0.2)
+            self.assertIn('renko_broker_cache_up{environment="test",fleet="fleet-a",service="broker_cache"} 0', output)
+            self.assertIn('renko_broker_cache_refresh_failures_total{environment="test",fleet="fleet-a",service="broker_cache"} 1', output)
+            self.assertIn('renko_broker_connected{environment="test",fleet="fleet-a",service="broker"} 0', output)
+        finally:
+            release.set()
+            refresher.stop()
+
+    def test_simultaneous_metrics_scrapes_do_not_call_broker(self) -> None:
+        paths = self._healthy_workspace()
+        config = paths["config"]
+        cache = BrokerSnapshotCache()
+        BrokerSnapshotBackgroundCollector(
+            cache=cache,
+            config=config,
+            broker_reader_for=lambda mode, profile: StaticBroker(),
+        ).refresh_once(now=datetime(2026, 9, 1, 14, 30, 4, tzinfo=timezone.utc))
+        forbidden_calls: list[str] = []
+
+        def forbidden_broker_reader(mode: str | None, profile: str | None) -> object:
+            forbidden_calls.append(f"{mode}:{profile}")
+            raise AssertionError("metrics called broker reader")
+
+        def scrape() -> str:
+            return MissionControlTelemetryCollector(config).collect_prometheus(
+                broker_reader_for=forbidden_broker_reader,
+                broker_snapshot_provider=self._cache_provider(cache, config),
+                now=datetime(2026, 9, 1, 14, 30, 5, tzinfo=timezone.utc),
+            )
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            outputs = list(executor.map(lambda _: scrape(), range(16)))
+
+        self.assertEqual([], forbidden_calls)
+        for output in outputs:
+            self.assertIn('renko_broker_cache_up{environment="test",fleet="fleet-a",service="broker_cache"} 1', output)
+
     def test_metrics_route_returns_emergency_payload_on_collector_failure(self) -> None:
         import monitoring_app
 
@@ -358,6 +668,13 @@ class MissionControlTelemetryTests(unittest.TestCase):
             event_tail_max_lines=100,
         )
         return {"config": config}
+
+    def _cache_provider(self, cache: BrokerSnapshotCache, config: TelemetryConfig):
+        return lambda specs, now: cache.read_for_specs(
+            specs,
+            now,
+            stale_after_seconds=config.broker_cache_stale_seconds,
+        )
 
     def _write_json(self, path: Path, payload: object) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

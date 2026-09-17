@@ -1,0 +1,11 @@
+[Unit]
+Description=Start Megatron AAPL/TSLA qty4 TP/SL fleet for 2026-08-24 regular session
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/bash -lc 'test "$(date -u +%%H%%M)" -lt 1330'
+ExecStartPre=/bin/bash -lc 'test "$(systemctl is-active trading-fleet-megatron-live.service || true)" = inactive'
+ExecStartPre=/bin/bash -lc 'cd /root/trading-server && echo "02a478ef498c0b2b07a1f4ae9122001a6ca97d7b8f0a488996edbf5463c58231  configs/accounts/megatron.live.json" | sha256sum -c -'
+ExecStart=/bin/systemctl start trading-fleet-megatron-live.service

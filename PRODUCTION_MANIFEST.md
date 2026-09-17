@@ -1,6 +1,6 @@
 # Production Manifest
 
-Date: 2026-06-22
+Date: 2026-07-21
 
 This repo has been cleaned after the Renko backtester alignment. Old generated
 backtest artifacts, raw-tick backtest code, replay validators, and quarantined
@@ -18,9 +18,11 @@ Runtime and execution:
 - `alpaca_trader.py`
 - `monitoring_app.py`
 
-Current aligned backtester:
+Backtesting and validation:
 
 - `validated_renko_backtest.cpp`
+- `scripts/e1_renko_production_parity_sweep.py`
+- `RENKO_SPEC.md`
 
 Deployment and config:
 
@@ -43,6 +45,9 @@ Tests:
 - `tests/test_alpaca_trader.py`
 - `tests/test_execution_engine.py`
 - `tests/test_renko_anchor.py`
+- `tests/test_renko_golden_vectors.py`
+- `tests/test_renko_cpp_parity.py`
+- `tests/test_e1_sweep_execution_models.py`
 - `tests/test_strategy_engine.py`
 
 Docs and controls:
@@ -75,6 +80,9 @@ make compile
 make test
 ```
 
-No stale backtest artifact should be used as evidence. New backtests should be
-generated from `validated_renko_backtest.cpp` using the 1-second-close
-continuation-case standard described in `VERSION_CONTRACT.md`.
+No stale backtest artifact should be used as evidence. New production E1
+reversal sweeps should be generated from
+`scripts/e1_renko_production_parity_sweep.py` using the canonical Renko standard
+in `RENKO_SPEC.md`. `validated_renko_backtest.cpp` remains in production root for
+the historical continuation-case TP/SL backtester and for Python/C++ Renko
+parity validation.

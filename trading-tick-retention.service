@@ -1,0 +1,11 @@
+[Unit]
+Description=Trading Tick Archive Retention
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/trading-server
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/root/trading-server/venv/bin/python /root/trading-server/scripts/tick_retention.py --tick-root /root/trading-server/artifacts/live/ticks --retention-trading-days 15 --execute --json
+StandardOutput=journal
+StandardError=journal

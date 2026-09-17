@@ -1,13 +1,14 @@
+import asyncio
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 
 from fleet_runner import (
     _BROKER_FORCE_FLAT_DATES,
-    _PENDING_1S_CLOSE_TICKS,
     BrokerEngineStateMismatch,
     TraderRuntime,
     archive_tick,
@@ -19,22 +20,32 @@ from fleet_runner import (
     market_archive_root,
     migrate_renko_brick_change_state,
     process_market_tick_for_runtime,
-    renko_source_ticks,
+    close_stream_after_pending_read,
+    reconcile_broker_state_if_due_or_halt,
     reconcile_engine_with_broker,
     should_block_for_risk,
 )
 from execution_engine import AlpacaExecutionEngine
+from exit_plan import build_renko_tp_sl_exit_plan
+from reversal_protection import build_reversal_catastrophic_stop_plan, catastrophic_stop_order_payload
 from silver.market import (
+    CanonicalMarketObservationAdapter,
     LocalArchiveMarketDataTail,
     live_market_event_from_alpaca_message,
     live_market_event_from_archive_payload,
 )
+from shared.config.trader_config import TraderConfigError, validate_single_strategy_kernel_config
 from scripts.live_signal_parity import iter_source_ticks
 from strategy_engine import (
     MAX_CLIENT_ORDER_ID_LENGTH,
+    TP_SL_LIFECYCLE_BRACKET_SUBMITTED,
     TP_SL_LIFECYCLE_CLOSE_SUBMITTED,
+    TP_SL_LIFECYCLE_ENTRY_FILLED_AWAITING_PROTECTION,
+    TP_SL_LIFECYCLE_ENTRY_PLANNED,
     TP_SL_LIFECYCLE_EXIT_PENDING,
     TP_SL_LIFECYCLE_FLAT,
+    TP_SL_LIFECYCLE_PROTECTION_FAILED,
+    TP_SL_LIFECYCLE_PROTECTED,
     TP_SL_LIFECYCLE_TRIGGERED,
     MeanReversionStrategyConfig,
     MeanReversionStrategyEngine,
@@ -119,6 +130,193 @@ class FakeRiskTrader:
         }
 
 
+class FakeProtectionTrader:
+    def __init__(self, *, position=None, orders=None, fills=None, parent=None):
+        self.position = position
+        self.orders = orders or []
+        self.fills = fills or []
+        self.parent = parent
+        self.cancelled = []
+        self.recovery_orders = []
+
+    def _get_position(self, symbol):
+        return self.position
+
+    def get_position(self, symbol):
+        return self.position
+
+    def get_open_orders_nested(self):
+        return self.orders
+
+    def get_order_nested(self, order_id):
+        return self.parent or (self.orders[0] if self.orders else {"id": order_id, "status": "filled", "filled_qty": "0", "qty": "0"})
+
+    def get_order(self, order_id):
+        if self.parent and self.parent.get("id") == order_id:
+            return self.parent
+        for order in self.orders:
+            if order.get("id") == order_id:
+                return order
+        return {"id": order_id, "status": "filled", "filled_qty": "0", "qty": "0"}
+
+    def cancel_order(self, order_id):
+        self.cancelled.append(order_id)
+        return {"id": order_id, "status": "pending_cancel"}
+
+    def submit_recovery_oco(self, order):
+        self.recovery_orders.append(order)
+        self.orders = [test_oco_order_from_payload(order)]
+        return {"id": "recovery-oco-1", "status": "accepted", "client_order_id": order["client_order_id"]}
+
+    def submit_catastrophic_stop(self, order):
+        self.recovery_orders.append(order)
+        acknowledged = dict(order)
+        acknowledged.update({"id": "recovery-stop-1", "status": "accepted", "filled_qty": "0"})
+        self.orders = [acknowledged]
+        return {"id": "recovery-stop-1", "status": "accepted", "client_order_id": order["client_order_id"]}
+
+    def replace_order(self, order_id, patch):
+        self.cancelled.append(f"replace:{order_id}")
+        for order in self.orders:
+            if order.get("id") == order_id:
+                order.update(patch)
+        return {"id": order_id, "status": "accepted", **patch}
+
+    def get_recent_fills(self, symbol):
+        return self.fills
+
+
+class FailingCatastrophicStopTrader(FakeProtectionTrader):
+    def submit_catastrophic_stop(self, order):
+        self.recovery_orders.append(order)
+        raise RuntimeError("catastrophic stop rejected")
+
+
+def test_exit_plan(symbol="AAPL"):
+    return build_renko_tp_sl_exit_plan(
+        trader_id=f"megatron_{symbol.lower()}",
+        strategy_id=f"{symbol.lower()}_tp_sl",
+        symbol=symbol,
+        entry_side="buy",
+        quantity=4,
+        entry_reference_type="signal_price",
+        entry_reference_price="100",
+        brick_size="1",
+        take_profit_bricks=2,
+        stop_loss_bricks=1,
+        time_in_force="day",
+        order_class="bracket",
+        client_order_id=f"{symbol.lower()}-entry",
+        candidate_config_fingerprint=f"config-{symbol.lower()}",
+        market_contract_fingerprint=f"market-{symbol.lower()}",
+    ).to_dict()
+
+
+def test_bracket_order(symbol="AAPL"):
+    plan = test_exit_plan(symbol)
+    return {
+        "id": "parent-1",
+        "symbol": symbol,
+        "side": "buy",
+        "qty": "4",
+        "filled_qty": "4",
+        "status": "filled",
+        "order_class": "bracket",
+        "client_order_id": plan["client_order_id"],
+        "legs": [
+            {
+                "id": "tp-1",
+                "parent_order_id": "parent-1",
+                "client_order_id": plan["take_profit_client_order_id"],
+                "symbol": symbol,
+                "side": "sell",
+                "qty": "4",
+                "filled_qty": "0",
+                "status": "accepted",
+                "limit_price": plan["take_profit_limit_price"],
+            },
+            {
+                "id": "sl-1",
+                "parent_order_id": "parent-1",
+                "client_order_id": plan["stop_loss_client_order_id"],
+                "symbol": symbol,
+                "side": "sell",
+                "qty": "4",
+                "filled_qty": "0",
+                "status": "accepted",
+                "stop_price": plan["stop_loss_trigger_price"],
+            },
+        ],
+    }
+
+
+def test_oco_order_from_payload(order):
+    return {
+        "id": "recovery-oco-1",
+        "symbol": order["symbol"],
+        "side": order["side"],
+        "qty": order["qty"],
+        "filled_qty": "0",
+        "status": "accepted",
+        "order_class": "oco",
+        "client_order_id": order["client_order_id"],
+        "legs": [
+            {
+                "id": "recovery-tp-1",
+                "parent_order_id": "recovery-oco-1",
+                "symbol": order["symbol"],
+                "side": order["side"],
+                "qty": order["qty"],
+                "filled_qty": "0",
+                "status": "accepted",
+                "limit_price": order["take_profit"]["limit_price"],
+            },
+            {
+                "id": "recovery-sl-1",
+                "parent_order_id": "recovery-oco-1",
+                "symbol": order["symbol"],
+                "side": order["side"],
+                "qty": order["qty"],
+                "filled_qty": "0",
+                "status": "accepted",
+                "stop_price": order["stop_loss"]["stop_price"],
+            },
+        ],
+    }
+
+
+def test_reversal_stop_plan(symbol="TSLA"):
+    return build_reversal_catastrophic_stop_plan(
+        trader_id=f"camatron_{symbol.lower()}",
+        strategy_id=f"{symbol.lower()}_reversal",
+        symbol=symbol,
+        entry_side="sell",
+        quantity="1",
+        entry_reference_price="353.2751",
+        brick_size="2.32525",
+        catastrophic_stop_bricks=3,
+        client_order_id=f"{symbol.lower()}-entry",
+        candidate_config_fingerprint=f"config-{symbol.lower()}",
+        market_contract_fingerprint=f"market-{symbol.lower()}",
+    )
+
+
+def test_reversal_stop_order(symbol="TSLA", *, order_id="stop-1", status="filled", filled_qty="1"):
+    plan = test_reversal_stop_plan(symbol)
+    order = catastrophic_stop_order_payload(plan)
+    order.update(
+        {
+            "id": order_id,
+            "client_order_id": plan["stop_client_order_id"],
+            "status": status,
+            "filled_qty": filled_qty,
+            "filled_avg_price": "366.50" if status == "filled" else None,
+            "filled_at": "2026-09-03T13:30:00.568Z" if status == "filled" else None,
+        }
+    )
+    return plan, order
+
+
 def live_config_trader(trader_id: str) -> dict:
     config = json.loads(Path("configs/traders.live.example.json").read_text(encoding="utf-8"))
     return next(trader for trader in config["traders"] if trader["id"] == trader_id)
@@ -127,7 +325,6 @@ def live_config_trader(trader_id: str) -> dict:
 class StrategyEngineOrderIntentTests(unittest.TestCase):
     def setUp(self):
         _BROKER_FORCE_FLAT_DATES.clear()
-        _PENDING_1S_CLOSE_TICKS.clear()
 
     def migration_runtime(
         self,
@@ -237,9 +434,10 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
             size=1.0,
         )
 
-        self.assertEqual(renko_source_ticks(runtime, first), [])
-        self.assertEqual(renko_source_ticks(runtime, second), [])
-        emitted = renko_source_ticks(runtime, third)
+        adapter = CanonicalMarketObservationAdapter(run_id="unit_1s_source")
+        self.assertEqual(adapter.observation_ticks(adapter.process_tick(first, trader_id=runtime.trader_id)), ())
+        self.assertEqual(adapter.observation_ticks(adapter.process_tick(second, trader_id=runtime.trader_id)), ())
+        emitted = adapter.observation_ticks(adapter.process_tick(third, trader_id=runtime.trader_id))
 
         self.assertEqual(len(emitted), 1)
         self.assertEqual(emitted[0].timestamp, pd.Timestamp("2026-06-23T13:30:00Z"))
@@ -430,68 +628,38 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
         self.assertEqual(reversal_intent.qty, 2)
         self.assertEqual(reversal_intent.target_qty, 1)
 
-    def test_live_config_aapl_reversal_is_enabled_and_parseable(self):
-        trader = live_config_trader("camatron_aapl_1s_renko_1p3443_e1_reversal_1sh_20260701_live")
+    def test_single_strategy_kernel_config_has_exact_enabled_topology_and_effective_runtime_values(self):
+        camatron = json.loads(Path("configs/traders.live.example.json").read_text(encoding="utf-8"))
+        megatron = json.loads(Path("configs/accounts/megatron.live.json").read_text(encoding="utf-8"))
+        enabled_camatron = {trader["id"]: trader for trader in camatron["traders"] if trader.get("enabled")}
+        enabled_megatron = {trader["id"]: trader for trader in megatron["traders"] if trader.get("enabled")}
 
-        self.assertTrue(trader["enabled"])
-        self.assertTrue(trader["execution_enabled"])
-        self.assertEqual(trader["symbol"], "AAPL")
-        self.assertEqual(trader["sizing"]["qty"], 8)
-        self.assertEqual(trader["risk"]["max_position_notional"], 3500)
-        self.assertTrue(trader["session"]["allow_overnight"])
+        expected_camatron = {
+            "camatron_tsla_1s_renko_0p42_e2_tp1_sl3_qty1_20260917_live": ("TSLA", "renko_tp_sl", 1.3755, 2, 1, 3),
+        }
+        self.assertEqual(set(enabled_camatron), set(expected_camatron))
+        self.assertEqual(enabled_megatron, {})
 
-        config = build_strategy_config(trader)
-
-        self.assertEqual(config.strategy_type, "renko_reversal")
-        self.assertEqual(config.symbol, "AAPL")
-        self.assertEqual(config.brick_size, 2.161965)
-        self.assertEqual(config.entry_bricks, 1)
-        self.assertEqual(config.qty, 8)
-        self.assertEqual(config.take_profit_bricks, None)
-        self.assertEqual(config.stop_loss_bricks, None)
-        self.assertTrue(config.allow_overnight)
-
-    def test_live_config_nvda_reversal_is_enabled_and_parseable(self):
-        trader = live_config_trader("camatron_nvda_1s_renko_1p149851_e1_reversal_1sh_20260701_live")
-
-        self.assertTrue(trader["enabled"])
-        self.assertTrue(trader["execution_enabled"])
-        self.assertEqual(trader["symbol"], "NVDA")
-        self.assertEqual(trader["sizing"]["qty"], 11)
-        self.assertEqual(trader["risk"]["max_position_notional"], 3500)
-        self.assertTrue(trader["session"]["allow_overnight"])
-
-        config = build_strategy_config(trader)
-
-        self.assertEqual(config.strategy_type, "renko_reversal")
-        self.assertEqual(config.symbol, "NVDA")
-        self.assertEqual(config.brick_size, 0.8841015)
-        self.assertEqual(config.entry_bricks, 1)
-        self.assertEqual(config.qty, 11)
-        self.assertEqual(config.take_profit_bricks, None)
-        self.assertEqual(config.stop_loss_bricks, None)
-        self.assertTrue(config.allow_overnight)
-
-    def test_live_config_tsla_reversal_is_enabled_and_parseable(self):
-        trader = live_config_trader("camatron_tsla_1s_renko_2p31165_e1_reversal_1sh_20260710_live")
-
-        self.assertTrue(trader["enabled"])
-        self.assertTrue(trader["execution_enabled"])
-        self.assertEqual(trader["symbol"], "TSLA")
-        self.assertEqual(trader["sizing"]["qty"], 7)
-        self.assertEqual(trader["risk"]["max_position_notional"], 3500)
-        self.assertTrue(trader["session"]["allow_overnight"])
-
-        config = build_strategy_config(trader)
-
-        self.assertEqual(config.strategy_type, "renko_reversal")
-        self.assertEqual(config.symbol, "TSLA")
-        self.assertEqual(config.brick_size, 1.62183)
-        self.assertEqual(config.entry_bricks, 1)
-        self.assertEqual(config.qty, 7)
-        self.assertEqual(config.take_profit_bricks, None)
-        self.assertEqual(config.stop_loss_bricks, None)
-        self.assertTrue(config.allow_overnight)
+        for trader_id, (symbol, strategy_type, brick_size, entry, tp, sl) in expected_camatron.items():
+            trader = enabled_camatron[trader_id]
+            config = build_strategy_config(trader)
+            self.assertTrue(trader["execution_enabled"])
+            self.assertEqual(trader["account_namespace"], "camatron")
+            self.assertEqual(trader["data"]["market_data_source"], "shared_canonical_stream")
+            self.assertEqual(trader["data"]["renko_source"], "1s_close")
+            self.assertEqual(trader["sizing"]["qty"], 1)
+            self.assertEqual(config.symbol, symbol)
+            self.assertEqual(config.strategy_type, strategy_type)
+            self.assertAlmostEqual(config.brick_size, brick_size)
+            self.assertEqual(config.entry_bricks, entry)
+            self.assertEqual(config.take_profit_bricks, tp)
+            self.assertEqual(config.stop_loss_bricks, sl)
+            self.assertEqual(config.qty, 1)
+            if strategy_type == "renko_tp_sl":
+                self.assertEqual(config.entry_start, "09:30:15")
+                self.assertEqual(config.entry_end, "15:50:15")
+                self.assertEqual(config.force_flat, "15:59:30")
+                self.assertFalse(config.allow_overnight)
 
     def test_renko_reversal_emits_one_share_reversal_intent(self):
         engine = RenkoStrategyEngine(
@@ -1112,6 +1280,2633 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
                 }
             )
 
+    def test_bracket_strategy_rejects_fractional_qty_sizing(self):
+        with self.assertRaisesRegex(ValueError, "does not support fractional qty"):
+            build_strategy_config(
+                {
+                    "id": "megatron_fractional_bracket",
+                    "symbol": "AAPL",
+                    "strategy": {
+                        "type": "renko_tp_sl",
+                        "brick_size": 1.0,
+                        "entry_bricks": 1,
+                        "take_profit_bricks": 2,
+                        "stop_loss_bricks": 2,
+                        "exit_management": "bracket",
+                    },
+                    "sizing": {
+                        "qty": 0.25,
+                    },
+                }
+            )
+
+    def test_tp_sl_config_inherits_intraday_family_session_contract(self):
+        config = build_strategy_config(
+            {
+                "id": "stale_tp_sl_session",
+                "symbol": "TSLA",
+                "strategy": {
+                    "type": "renko_tp_sl",
+                    "brick_size": 1.0,
+                    "entry_bricks": 1,
+                    "take_profit_bricks": 3,
+                    "stop_loss_bricks": 1,
+                    "exit_management": "bracket",
+                    "candidate_config_fingerprint": "config-tsla",
+                    "market_contract_fingerprint": "market-tsla",
+                },
+                "session": {
+                    "timezone": "America/Chicago",
+                    "entry_start": "09:31:00",
+                    "entry_end": "15:59:59",
+                    "force_flat": None,
+                    "allow_overnight": True,
+                },
+                "sizing": {
+                    "qty": 1,
+                },
+            }
+        )
+
+        self.assertEqual(config.timezone, "America/New_York")
+        self.assertEqual(config.entry_start, "09:30:15")
+        self.assertEqual(config.entry_end, "15:50:15")
+        self.assertEqual(config.force_flat, "15:59:30")
+        self.assertFalse(config.allow_overnight)
+
+    def test_tp_sl_config_without_session_inherits_intraday_family_session_contract(self):
+        config = build_strategy_config(
+            {
+                "id": "missing_tp_sl_session",
+                "symbol": "AAPL",
+                "strategy": {
+                    "type": "renko_tp_sl",
+                    "brick_size": 1.0,
+                    "entry_bricks": 1,
+                    "take_profit_bricks": 3,
+                    "stop_loss_bricks": 3,
+                    "exit_management": "bracket",
+                    "candidate_config_fingerprint": "config-aapl",
+                    "market_contract_fingerprint": "market-aapl",
+                },
+                "sizing": {
+                    "qty": 1,
+                },
+            }
+        )
+
+        self.assertEqual(config.timezone, "America/New_York")
+        self.assertEqual(config.entry_start, "09:30:15")
+        self.assertEqual(config.entry_end, "15:50:15")
+        self.assertEqual(config.force_flat, "15:59:30")
+        self.assertFalse(config.allow_overnight)
+
+    def test_reversal_config_keeps_profile_session_contract(self):
+        config = build_strategy_config(
+            {
+                "id": "overnight_reversal",
+                "symbol": "AAPL",
+                "strategy": {
+                    "type": "renko_reversal",
+                    "brick_size": 1.0,
+                    "entry_bricks": 1,
+                    "exit_management": "catastrophic_stop",
+                    "catastrophic_stop_bricks": 3,
+                    "candidate_config_fingerprint": "config-aapl",
+                    "market_contract_fingerprint": "market-aapl",
+                },
+                "session": {
+                    "timezone": "America/New_York",
+                    "entry_start": "09:31:00",
+                    "entry_end": "15:59:59",
+                    "force_flat": None,
+                    "allow_overnight": True,
+                },
+                "sizing": {
+                    "qty": 1,
+                },
+            }
+        )
+
+        self.assertEqual(config.strategy_type, "renko_reversal")
+        self.assertEqual(config.entry_start, "09:31:00")
+        self.assertEqual(config.entry_end, "15:59:59")
+        self.assertIsNone(config.force_flat)
+        self.assertTrue(config.allow_overnight)
+
+    def test_bracket_strategy_builds_signal_price_exit_plan(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="megatron_aapl",
+                symbol="AAPL",
+                brick_size=0.8511,
+                entry_bricks=1,
+                take_profit_bricks=3,
+                stop_loss_bricks=3,
+                qty=4,
+                strategy_name="aapl_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-aapl",
+                market_contract_fingerprint="market-aapl",
+                renko_anchor_mode="grid",
+                renko_anchor_price=0,
+            )
+        )
+
+        signal = Signal(
+            signal_id="signal-1",
+            signal_type="entry",
+            timestamp=pd.Timestamp("2026-08-21T14:54:15Z"),
+            symbol="AAPL",
+            side="long",
+            broker_side="buy",
+            price=308.9493,
+            reason="renko_run_1_long",
+            strategy="aapl_tp_sl",
+            trader_id="megatron_aapl",
+        )
+        intent = engine._build_order_intent(signal, close_position=False)
+        self.assertEqual(intent.exit_management, "bracket")
+        self.assertEqual(intent.qty, 4)
+        self.assertEqual(intent.take_profit_limit_price, 311.5026)
+        self.assertEqual(intent.stop_loss_stop_price, 306.396)
+        self.assertIsNotNone(intent.exit_plan)
+        self.assertEqual(intent.exit_plan["entry_reference_type"], "signal_price")
+        self.assertEqual(intent.exit_plan["take_profit_limit_price"], "311.50")
+        self.assertEqual(intent.exit_plan["stop_loss_trigger_price"], "306.40")
+
+    def test_intraday_tp_sl_entry_window_boundaries(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="intraday_tp_sl",
+                symbol="TSLA",
+                strategy_type="renko_tp_sl",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=3,
+                stop_loss_bricks=1,
+                qty=1,
+                entry_start="09:30:15",
+                entry_end="15:50:15",
+                force_flat="15:59:30",
+                timezone="America/New_York",
+                allow_overnight=False,
+            )
+        )
+
+        self.assertFalse(engine._entry_allowed(pd.Timestamp("2026-09-03T13:30:14Z")))
+        self.assertTrue(engine._entry_allowed(pd.Timestamp("2026-09-03T13:30:15Z")))
+        self.assertTrue(engine._entry_allowed(pd.Timestamp("2026-09-03T19:50:15Z")))
+        self.assertFalse(engine._entry_allowed(pd.Timestamp("2026-09-03T19:50:16Z")))
+
+    def test_intraday_tp_sl_position_after_entry_cutoff_remains_protected_until_force_flat(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="intraday_tp_sl_protected",
+                symbol="TSLA",
+                strategy_type="renko_tp_sl",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=3,
+                stop_loss_bricks=1,
+                qty=1,
+                exit_management="bracket",
+                candidate_config_fingerprint="config-tsla",
+                market_contract_fingerprint="market-tsla",
+                entry_start="09:30:15",
+                entry_end="15:50:15",
+                force_flat="15:59:30",
+                timezone="America/New_York",
+                allow_overnight=False,
+            )
+        )
+        engine.position = PositionState(
+            symbol="TSLA",
+            side="short",
+            entry_time=pd.Timestamp("2026-09-03T19:49:00Z"),
+            entry_price=380.0,
+            qty=1,
+        )
+        engine.tp_sl_lifecycle_state = TP_SL_LIFECYCLE_PROTECTED
+        engine.protection_state = {"state": "PROTECTED", "stop_loss_order_id": "sl-1", "take_profit_order_id": "tp-1"}
+
+        action = engine._force_flat_action(timestamp=pd.Timestamp("2026-09-03T19:50:16Z"), price=379.0)
+
+        self.assertIsNone(action)
+        self.assertEqual(engine.tp_sl_lifecycle_state, TP_SL_LIFECYCLE_PROTECTED)
+        self.assertEqual(engine.protection_state["stop_loss_order_id"], "sl-1")
+
+    def test_reversal_catastrophic_stop_entry_intent_preserves_reversal_signal_logic(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                symbol="AAPL",
+                brick_size=2.218981,
+                entry_bricks=1,
+                strategy_type="renko_reversal",
+                qty=1,
+                exit_management="catastrophic_stop",
+                catastrophic_stop_bricks=3,
+                trader_id="camatron_aapl",
+                strategy_name="aapl_reversal",
+                candidate_config_fingerprint="config-aapl",
+                market_contract_fingerprint="market-aapl",
+            )
+        )
+
+        actions = engine._on_brick_reversal(
+            {
+                "timestamp": pd.Timestamp("2026-08-24T13:31:00Z"),
+                "brick_close": 300.0,
+                "direction": 1,
+                "run_len": 1,
+            }
+        )
+
+        self.assertEqual(len(actions), 1)
+        signal, intent = actions[0]
+        self.assertEqual(signal.reason, "long_entry_e1")
+        self.assertEqual(intent.exit_management, "catastrophic_stop")
+        self.assertEqual(intent.catastrophic_stop_bricks, 3)
+        self.assertEqual(intent.protection_type, "reversal_catastrophic_stop")
+        self.assertEqual(intent.brick_size, 2.218981)
+        self.assertEqual(engine.protection_state["state"], TP_SL_LIFECYCLE_ENTRY_PLANNED)
+
+    def test_reversal_catastrophic_stop_records_exit_planned_before_reversal(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                symbol="TSLA",
+                brick_size=2.32525,
+                entry_bricks=1,
+                strategy_type="renko_reversal",
+                qty=1,
+                exit_management="catastrophic_stop",
+                catastrophic_stop_bricks=3,
+                trader_id="camatron_tsla",
+                strategy_name="tsla_reversal",
+                candidate_config_fingerprint="config-tsla",
+                market_contract_fingerprint="market-tsla",
+            )
+        )
+        engine.position = PositionState(
+            symbol="TSLA",
+            side="long",
+            entry_time=pd.Timestamp("2026-08-24T13:31:00Z"),
+            entry_price=250.0,
+            qty=1,
+        )
+
+        actions = engine._on_brick_reversal(
+            {
+                "timestamp": pd.Timestamp("2026-08-24T13:32:00Z"),
+                "brick_close": 247.67475,
+                "direction": -1,
+                "run_len": 1,
+            }
+        )
+
+        self.assertEqual(len(actions), 1)
+        _, intent = actions[0]
+        self.assertEqual(intent.reason, "short_entry_e1_reversal")
+        self.assertEqual(intent.target_qty, 1)
+        self.assertEqual(intent.qty, 2)
+        self.assertEqual(engine.protection_state["state"], TP_SL_LIFECYCLE_ENTRY_PLANNED)
+        self.assertEqual(engine.protection_state["reversal_exit_planned"]["state"], TP_SL_LIFECYCLE_EXIT_PENDING)
+
+    def test_mark_reversal_catastrophic_stop_submitted_promotes_only_after_stop_verified(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                symbol="AAPL",
+                brick_size=2.218981,
+                entry_bricks=1,
+                strategy_type="renko_reversal",
+                qty=1,
+                exit_management="catastrophic_stop",
+                catastrophic_stop_bricks=3,
+                trader_id="camatron_aapl",
+                strategy_name="aapl_reversal",
+                candidate_config_fingerprint="config-aapl",
+                market_contract_fingerprint="market-aapl",
+            )
+        )
+        _, intent = engine._on_brick_reversal(
+            {
+                "timestamp": pd.Timestamp("2026-08-24T13:31:00Z"),
+                "brick_close": 300.0,
+                "direction": 1,
+                "run_len": 1,
+            }
+        )[0]
+        stop_plan = build_reversal_catastrophic_stop_plan(
+            trader_id="camatron_aapl",
+            strategy_id="aapl_reversal",
+            symbol="AAPL",
+            entry_side="buy",
+            quantity="1",
+            entry_reference_price="300.00",
+            brick_size="2.218981",
+            catastrophic_stop_bricks=3,
+            client_order_id=intent.client_order_id,
+            candidate_config_fingerprint="config-aapl",
+            market_contract_fingerprint="market-aapl",
+        )
+        stop_order = catastrophic_stop_order_payload(stop_plan)
+        stop_order.update({"id": "stop-1", "status": "accepted", "filled_qty": "0"})
+
+        engine.mark_reversal_catastrophic_stop_submitted(
+            intent,
+            response={
+                "catastrophic_stop_response": {
+                    "broker_position": {
+                        "symbol": "AAPL",
+                        "side": "long",
+                        "qty": "1",
+                        "avg_entry_price": "300.00",
+                    },
+                    "stop_plan": stop_plan,
+                    "response": stop_order,
+                }
+            },
+        )
+
+        self.assertEqual(engine.tp_sl_lifecycle_state, TP_SL_LIFECYCLE_PROTECTED)
+        self.assertEqual(engine.protection_state["stop_order_id"], "stop-1")
+        self.assertEqual(engine.protection_state["stop_price"], "293.34")
+
+    def test_mark_entry_protection_submitted_promotes_to_protected_with_child_legs(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="megatron_tsla",
+                symbol="TSLA",
+                brick_size=1.5392,
+                entry_bricks=1,
+                take_profit_bricks=3,
+                stop_loss_bricks=1,
+                qty=4,
+                strategy_name="tsla_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-tsla",
+                market_contract_fingerprint="market-tsla",
+            )
+        )
+        signal = Signal(
+            signal_id="signal-1",
+            signal_type="entry",
+            timestamp=pd.Timestamp("2026-08-21T14:55:15Z"),
+            symbol="TSLA",
+            side="long",
+            broker_side="buy",
+            price=361.712,
+            reason="renko_run_1_long",
+            strategy="tsla_tp_sl",
+            trader_id="megatron_tsla",
+        )
+        intent = engine._build_order_intent(signal, close_position=False)
+
+        engine.mark_entry_protection_submitted(
+            intent,
+            response={
+                "response": {
+                    "id": "parent-1",
+                    "symbol": "TSLA",
+                    "side": "buy",
+                    "qty": "4",
+                    "filled_qty": "4",
+                    "status": "filled",
+                    "order_class": "bracket",
+                    "client_order_id": intent.client_order_id,
+                    "legs": [
+                        {
+                            "id": "tp-1",
+                            "parent_order_id": "parent-1",
+                            "client_order_id": intent.exit_plan["take_profit_client_order_id"],
+                            "symbol": "TSLA",
+                            "side": "sell",
+                            "qty": "4",
+                            "filled_qty": "0",
+                            "status": "accepted",
+                            "limit_price": intent.exit_plan["take_profit_limit_price"],
+                        },
+                        {
+                            "id": "sl-1",
+                            "parent_order_id": "parent-1",
+                            "client_order_id": intent.exit_plan["stop_loss_client_order_id"],
+                            "symbol": "TSLA",
+                            "side": "sell",
+                            "qty": "4",
+                            "filled_qty": "0",
+                            "status": "accepted",
+                            "stop_price": intent.exit_plan["stop_loss_trigger_price"],
+                        },
+                    ],
+                }
+            },
+        )
+
+        self.assertEqual(engine.tp_sl_lifecycle_state, TP_SL_LIFECYCLE_PROTECTED)
+        self.assertEqual(engine.protection_state["parent_order_id"], "parent-1")
+        self.assertEqual(engine.protection_state["take_profit_order_id"], "tp-1")
+        self.assertEqual(engine.protection_state["stop_loss_order_id"], "sl-1")
+
+    def test_mark_entry_protection_submitted_without_child_legs_stays_submitted(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="megatron_tsla",
+                symbol="TSLA",
+                brick_size=1.5392,
+                entry_bricks=1,
+                take_profit_bricks=3,
+                stop_loss_bricks=1,
+                qty=4,
+                strategy_name="tsla_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-tsla",
+                market_contract_fingerprint="market-tsla",
+            )
+        )
+        signal = Signal(
+            signal_id="signal-1",
+            signal_type="entry",
+            timestamp=pd.Timestamp("2026-08-21T14:55:15Z"),
+            symbol="TSLA",
+            side="long",
+            broker_side="buy",
+            price=361.712,
+            reason="renko_run_1_long",
+            strategy="tsla_tp_sl",
+            trader_id="megatron_tsla",
+        )
+        intent = engine._build_order_intent(signal, close_position=False)
+
+        engine.mark_entry_protection_submitted(intent, response={"response": {"id": "parent-1"}})
+
+        self.assertEqual(engine.tp_sl_lifecycle_state, TP_SL_LIFECYCLE_BRACKET_SUBMITTED)
+        self.assertEqual(engine.protection_state["parent_order_id"], "parent-1")
+
+    def test_mark_position_unprotected_preserves_bracket_reverification_lineage(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_nvda",
+                symbol="NVDA",
+                brick_size=0.5123,
+                entry_bricks=1,
+                take_profit_bricks=3,
+                stop_loss_bricks=3,
+                qty=1,
+                strategy_name="nvda_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-nvda",
+                market_contract_fingerprint="market-nvda",
+            )
+        )
+        signal = Signal(
+            signal_id="signal-1",
+            signal_type="entry",
+            timestamp=pd.Timestamp("2026-09-04T14:11:09Z"),
+            symbol="NVDA",
+            side="short",
+            broker_side="sell",
+            price=233.4703,
+            reason="renko_run_1_short",
+            strategy="nvda_tp_sl",
+            trader_id="camatron_nvda",
+        )
+        intent = engine._build_order_intent(signal, close_position=False)
+        engine.mark_entry_protection_submitted(
+            intent,
+            response={
+                "response": {
+                    "id": "parent-1",
+                    "symbol": "NVDA",
+                    "side": "sell",
+                    "qty": "1",
+                    "filled_qty": "1",
+                    "status": "filled",
+                    "order_class": "bracket",
+                    "client_order_id": intent.client_order_id,
+                    "legs": [
+                        {
+                            "id": "tp-1",
+                            "parent_order_id": "parent-1",
+                            "client_order_id": intent.exit_plan["take_profit_client_order_id"],
+                            "symbol": "NVDA",
+                            "side": "buy",
+                            "qty": "1",
+                            "filled_qty": "0",
+                            "status": "accepted",
+                            "limit_price": intent.exit_plan["take_profit_limit_price"],
+                        },
+                        {
+                            "id": "sl-1",
+                            "parent_order_id": "parent-1",
+                            "client_order_id": intent.exit_plan["stop_loss_client_order_id"],
+                            "symbol": "NVDA",
+                            "side": "buy",
+                            "qty": "1",
+                            "filled_qty": "0",
+                            "status": "accepted",
+                            "stop_price": intent.exit_plan["stop_loss_trigger_price"],
+                        },
+                    ],
+                }
+            },
+        )
+
+        engine.mark_position_unprotected(
+            "broker_native_protection_verification_failed",
+            payload={
+                "broker_position": {
+                    "symbol": "NVDA",
+                    "side": "short",
+                    "qty": "1",
+                    "avg_entry_price": "233.4703",
+                },
+                "issues": ["transient_missing_leg"],
+            },
+        )
+
+        self.assertEqual(engine.tp_sl_lifecycle_state, TP_SL_LIFECYCLE_ENTRY_FILLED_AWAITING_PROTECTION)
+        self.assertEqual(engine.protection_state["state"], TP_SL_LIFECYCLE_ENTRY_FILLED_AWAITING_PROTECTION)
+        self.assertEqual(engine.protection_state["reason"], "broker_native_protection_verification_failed")
+        self.assertEqual(engine.protection_state["parent_order_id"], "parent-1")
+        self.assertEqual(engine.protection_state["take_profit_order_id"], "tp-1")
+        self.assertEqual(engine.protection_state["stop_loss_order_id"], "sl-1")
+        self.assertEqual(engine.protection_state["exit_plan"], intent.exit_plan)
+
+    def test_bracket_managed_position_does_not_emit_engine_close_order(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="megatron_aapl",
+                symbol="AAPL",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=1,
+                stop_loss_bricks=1,
+                qty=4,
+                strategy_name="aapl_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-aapl",
+                market_contract_fingerprint="market-aapl",
+            )
+        )
+        engine.position = PositionState(
+            symbol="AAPL",
+            side="long",
+            entry_time=pd.Timestamp("2026-08-21T14:54:15Z"),
+            entry_price=100.0,
+            qty=4,
+        )
+
+        emitted = engine._on_brick_tp_sl(
+            {
+                "timestamp": pd.Timestamp("2026-08-21T14:55:15Z"),
+                "brick_close": 101.0,
+                "direction": 1,
+                "run_len": 2,
+            }
+        )
+
+        self.assertEqual(emitted, [])
+
+    def test_handle_action_records_bracket_protection_state(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="megatron_aapl",
+                symbol="AAPL",
+                brick_size=0.8511,
+                entry_bricks=1,
+                take_profit_bricks=3,
+                stop_loss_bricks=3,
+                qty=4,
+                strategy_name="aapl_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-aapl",
+                market_contract_fingerprint="market-aapl",
+            )
+        )
+        signal = Signal(
+            signal_id="signal-1",
+            signal_type="entry",
+            timestamp=pd.Timestamp("2026-08-21T14:54:15Z"),
+            symbol="AAPL",
+            side="long",
+            broker_side="buy",
+            price=308.9493,
+            reason="renko_run_1_long",
+            strategy="aapl_tp_sl",
+            trader_id="megatron_aapl",
+        )
+        intent = engine._build_order_intent(signal, close_position=False)
+        execution = RecordingExecution()
+        execution.event = ExecutionEvent(
+            timestamp=pd.Timestamp("2026-08-21T14:54:16Z"),
+            mode="real",
+            broker="alpaca",
+            status="order sent",
+            intent=intent,
+            response={
+                "response": {
+                    "id": "parent-1",
+                    "symbol": "AAPL",
+                    "side": "buy",
+                    "qty": "4",
+                    "filled_qty": "4",
+                    "status": "filled",
+                    "order_class": "bracket",
+                    "client_order_id": intent.client_order_id,
+                    "legs": [
+                        {
+                            "id": "tp-1",
+                            "parent_order_id": "parent-1",
+                            "client_order_id": intent.exit_plan["take_profit_client_order_id"],
+                            "symbol": "AAPL",
+                            "side": "sell",
+                            "qty": "4",
+                            "filled_qty": "0",
+                            "status": "accepted",
+                            "limit_price": intent.exit_plan["take_profit_limit_price"],
+                        },
+                        {
+                            "id": "sl-1",
+                            "parent_order_id": "parent-1",
+                            "client_order_id": intent.exit_plan["stop_loss_client_order_id"],
+                            "symbol": "AAPL",
+                            "side": "sell",
+                            "qty": "4",
+                            "filled_qty": "0",
+                            "status": "accepted",
+                            "stop_price": intent.exit_plan["stop_loss_trigger_price"],
+                        },
+                    ],
+                }
+            },
+        )
+        runtime = TraderRuntime(
+            trader_id="megatron_aapl",
+            symbol="AAPL",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=MemoryLog(),
+        )
+
+        self.assertTrue(handle_action(runtime, signal, intent))
+
+        self.assertEqual(engine.tp_sl_lifecycle_state, TP_SL_LIFECYCLE_PROTECTED)
+        self.assertEqual(engine.protection_state["parent_order_id"], "parent-1")
+        self.assertEqual(runtime.log.events[-1][0], "broker_native_protection_submitted")
+
+    def test_current_bracket_entry_plan_does_not_block_itself(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="megatron_aapl",
+                symbol="AAPL",
+                brick_size=0.8511,
+                entry_bricks=1,
+                take_profit_bricks=3,
+                stop_loss_bricks=3,
+                qty=1,
+                strategy_name="aapl_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-aapl",
+                market_contract_fingerprint="market-aapl",
+                renko_anchor_mode="grid",
+                renko_anchor_price=0.0,
+            )
+        )
+        runtime = TraderRuntime(
+            trader_id="megatron_aapl",
+            symbol="AAPL",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=RecordingExecution(),
+            log=MemoryLog(),
+        )
+
+        actions = engine._on_brick_tp_sl(
+            {
+                "timestamp": pd.Timestamp("2026-09-01T15:04:02Z"),
+                "brick_close": 323.418,
+                "direction": -1,
+                "run_len": 1,
+            }
+        )
+
+        self.assertEqual(len(actions), 1)
+        signal, intent = actions[0]
+        self.assertEqual(engine.tp_sl_lifecycle_state, TP_SL_LIFECYCLE_ENTRY_PLANNED)
+        self.assertIsNone(should_block_for_risk(runtime, signal, intent))
+        self.assertTrue(handle_action(runtime, signal, intent))
+        self.assertEqual(runtime.execution.intents, [intent])
+
+    def test_stale_bracket_entry_plan_still_blocks_new_entry(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="megatron_aapl",
+                symbol="AAPL",
+                brick_size=0.8511,
+                entry_bricks=1,
+                take_profit_bricks=3,
+                stop_loss_bricks=3,
+                qty=1,
+                strategy_name="aapl_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-aapl",
+                market_contract_fingerprint="market-aapl",
+            )
+        )
+        engine.tp_sl_lifecycle_state = TP_SL_LIFECYCLE_ENTRY_PLANNED
+        engine.position = PositionState(
+            symbol="AAPL",
+            side="long",
+            entry_time=pd.Timestamp("2026-09-01T15:04:02Z"),
+            entry_price=323.418,
+            qty=1,
+        )
+        signal = Signal(
+            signal_id="signal-2",
+            signal_type="entry",
+            timestamp=pd.Timestamp("2026-09-01T15:20:17Z"),
+            symbol="AAPL",
+            side="long",
+            broker_side="buy",
+            price=325.1202,
+            reason="renko_run_1_long",
+            strategy="aapl_tp_sl",
+            trader_id="megatron_aapl",
+        )
+        intent = engine._build_order_intent(signal, close_position=False)
+        runtime = TraderRuntime(
+            trader_id="megatron_aapl",
+            symbol="AAPL",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=RecordingExecution(),
+            log=MemoryLog(),
+        )
+
+        self.assertEqual(should_block_for_risk(runtime, signal, intent), "tp_sl_exit_pending")
+
+    def test_unresolved_bracket_lifecycle_still_blocks_entry(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="megatron_tsla",
+                symbol="TSLA",
+                brick_size=1.5392,
+                entry_bricks=1,
+                take_profit_bricks=3,
+                stop_loss_bricks=1,
+                qty=1,
+                strategy_name="tsla_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-tsla",
+                market_contract_fingerprint="market-tsla",
+            )
+        )
+        engine.tp_sl_lifecycle_state = TP_SL_LIFECYCLE_BRACKET_SUBMITTED
+        engine.protection_state = {"state": TP_SL_LIFECYCLE_BRACKET_SUBMITTED, "parent_order_id": "parent-1"}
+        signal = Signal(
+            signal_id="signal-1",
+            signal_type="entry",
+            timestamp=pd.Timestamp("2026-09-02T13:31:53Z"),
+            symbol="TSLA",
+            side="short",
+            broker_side="sell",
+            price=355.5552,
+            reason="renko_run_1_short",
+            strategy="tsla_tp_sl",
+            trader_id="megatron_tsla",
+        )
+        intent = engine._build_order_intent(signal, close_position=False)
+        runtime = TraderRuntime(
+            trader_id="megatron_tsla",
+            symbol="TSLA",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=RecordingExecution(),
+            log=MemoryLog(),
+        )
+
+        self.assertEqual(should_block_for_risk(runtime, signal, intent), "tp_sl_exit_pending")
+
+    def test_stale_market_data_block_prevents_new_entry_order(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="megatron_aapl",
+                symbol="AAPL",
+                brick_size=0.8511,
+                entry_bricks=1,
+                take_profit_bricks=3,
+                stop_loss_bricks=3,
+                qty=1,
+                strategy_name="aapl_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-aapl",
+                market_contract_fingerprint="market-aapl",
+            )
+        )
+        signal = Signal(
+            signal_id="signal-stale",
+            signal_type="entry",
+            timestamp=pd.Timestamp("2026-08-27T14:00:00Z"),
+            symbol="AAPL",
+            side="long",
+            broker_side="buy",
+            price=308.9493,
+            reason="renko_run_1_long",
+            strategy="aapl_tp_sl",
+            trader_id="megatron_aapl",
+        )
+        intent = engine._build_order_intent(signal, close_position=False)
+        execution = RecordingExecution()
+        runtime = TraderRuntime(
+            trader_id="megatron_aapl",
+            symbol="AAPL",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=MemoryLog(),
+            market_data_signal_block_reason="shared_market_data_stale_6.000s",
+        )
+
+        self.assertEqual(should_block_for_risk(runtime, signal, intent), "shared_market_data_stale_6.000s")
+        self.assertFalse(handle_action(runtime, signal, intent))
+        self.assertEqual(execution.intents, [])
+        self.assertEqual(runtime.log.events[-1][0], "risk_block")
+
+    def test_replay_catchup_block_prevents_live_entry_order(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="megatron_aapl",
+                symbol="AAPL",
+                brick_size=0.8511,
+                entry_bricks=1,
+                take_profit_bricks=3,
+                stop_loss_bricks=3,
+                qty=1,
+                strategy_name="aapl_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-aapl",
+                market_contract_fingerprint="market-aapl",
+            )
+        )
+        signal = Signal(
+            signal_id="signal-replay",
+            signal_type="entry",
+            timestamp=pd.Timestamp("2026-08-27T14:00:00Z"),
+            symbol="AAPL",
+            side="long",
+            broker_side="buy",
+            price=308.9493,
+            reason="renko_run_1_long",
+            strategy="aapl_tp_sl",
+            trader_id="megatron_aapl",
+        )
+        intent = engine._build_order_intent(signal, close_position=False)
+        execution = RecordingExecution()
+        runtime = TraderRuntime(
+            trader_id="megatron_aapl",
+            symbol="AAPL",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=MemoryLog(),
+            market_data_signal_block_reason="shared_market_data_not_caught_up",
+        )
+
+        self.assertEqual(should_block_for_risk(runtime, signal, intent), "shared_market_data_not_caught_up")
+        self.assertFalse(handle_action(runtime, signal, intent))
+        self.assertEqual(execution.intents, [])
+
+    def test_existing_broker_protection_state_survives_stale_feed_block(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="megatron_aapl",
+                symbol="AAPL",
+                brick_size=0.8511,
+                entry_bricks=1,
+                take_profit_bricks=3,
+                stop_loss_bricks=3,
+                qty=1,
+                strategy_name="aapl_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-aapl",
+                market_contract_fingerprint="market-aapl",
+            )
+        )
+        engine.position = PositionState(
+            symbol="AAPL",
+            side="long",
+            entry_time=pd.Timestamp("2026-08-27T14:00:00Z"),
+            entry_price=308.9493,
+            qty=1,
+        )
+        engine.protection_state = {
+            "state": TP_SL_LIFECYCLE_PROTECTED,
+            "parent_order_id": "parent-1",
+            "take_profit_order_id": "tp-1",
+            "stop_loss_order_id": "sl-1",
+        }
+        signal = Signal(
+            signal_id="signal-stale-second-entry",
+            signal_type="entry",
+            timestamp=pd.Timestamp("2026-08-27T14:01:00Z"),
+            symbol="AAPL",
+            side="long",
+            broker_side="buy",
+            price=309.0,
+            reason="renko_run_1_long",
+            strategy="aapl_tp_sl",
+            trader_id="megatron_aapl",
+        )
+        intent = engine._build_order_intent(signal, close_position=False)
+        execution = RecordingExecution()
+        runtime = TraderRuntime(
+            trader_id="megatron_aapl",
+            symbol="AAPL",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=MemoryLog(),
+            market_data_signal_block_reason="shared_market_data_stale_6.000s",
+        )
+
+        self.assertFalse(handle_action(runtime, signal, intent))
+        self.assertEqual(execution.intents, [])
+        self.assertEqual(engine.protection_state["state"], TP_SL_LIFECYCLE_PROTECTED)
+        self.assertEqual(engine.protection_state["take_profit_order_id"], "tp-1")
+        self.assertEqual(engine.protection_state["stop_loss_order_id"], "sl-1")
+
+    def test_external_manual_close_lifecycle_clears_tp_sl_state_without_unsafe(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="megatron_aapl",
+                symbol="AAPL",
+                brick_size=0.8511,
+                entry_bricks=1,
+                take_profit_bricks=3,
+                stop_loss_bricks=3,
+                qty=4,
+                strategy_name="aapl_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-aapl",
+                market_contract_fingerprint="market-aapl",
+            )
+        )
+        engine.position = PositionState(
+            symbol="AAPL",
+            side="long",
+            entry_time=pd.Timestamp("2026-08-21T14:54:15Z"),
+            entry_price=308.9493,
+            qty=4,
+        )
+        engine.protection_state = {"state": TP_SL_LIFECYCLE_PROTECTED, "parent_order_id": "parent-1"}
+
+        engine.mark_external_close_filled(
+            timestamp=pd.Timestamp("2026-08-21T15:07:41.936Z"),
+            reason="manual_external_close",
+            order_id="66a377bd-6f80-4157-8dfc-2f278d65a5d4",
+            source="alpaca_manual_close_reconciliation",
+            fill_price="309.7875",
+            filled_qty="4",
+            realized_pnl="3.47",
+        )
+
+        self.assertIsNone(engine.position)
+        self.assertIsNone(engine.pending_exit)
+        self.assertIsNone(engine.protection_state)
+        self.assertEqual(engine.tp_sl_lifecycle_state, TP_SL_LIFECYCLE_FLAT)
+        self.assertFalse(engine.reconciliation_unsafe)
+        self.assertEqual(engine.last_closed_exit["order_id"], "66a377bd-6f80-4157-8dfc-2f278d65a5d4")
+        self.assertEqual(engine.last_closed_exit["realized_pnl"], "3.47")
+
+    def test_reconcile_adopts_broker_position_with_valid_bracket_protection(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="megatron_aapl",
+                symbol="AAPL",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=2,
+                stop_loss_bricks=1,
+                qty=4,
+                strategy_name="aapl_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-aapl",
+                market_contract_fingerprint="market-aapl",
+            )
+        )
+        engine.protection_state = {"exit_plan": test_exit_plan("AAPL")}
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader = FakeProtectionTrader(
+            position={"symbol": "AAPL", "side": "long", "qty": "4", "avg_entry_price": "100"},
+            orders=[test_bracket_order("AAPL")],
+        )
+        execution.log = None
+        runtime = TraderRuntime(
+            trader_id="megatron_aapl",
+            symbol="AAPL",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=MemoryLog(),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertIsNotNone(engine.position)
+        self.assertEqual(engine.tp_sl_lifecycle_state, TP_SL_LIFECYCLE_PROTECTED)
+        self.assertEqual(engine.protection_state["parent_order_id"], "parent-1")
+        self.assertEqual(runtime.log.events[0][1]["reason"], "broker_position_valid_protection_adopted")
+
+    def test_reconcile_clears_unsafe_when_broker_and_local_are_flat_with_no_owned_orders(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_tsla",
+                symbol="TSLA",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=2,
+                stop_loss_bricks=1,
+                qty=1,
+                strategy_name="tsla_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-tsla",
+                market_contract_fingerprint="market-tsla",
+            )
+        )
+        engine.mark_reconciliation_unsafe("previous_orphan_protection")
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader = FakeProtectionTrader(position=None, orders=[])
+        execution.log = None
+        log = MemoryLog()
+        runtime = TraderRuntime(
+            trader_id="camatron_tsla",
+            symbol="TSLA",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=log,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertFalse(engine.reconciliation_unsafe)
+        self.assertIn("reconciliation_safety_transition", [event_type for event_type, _payload in log.events])
+        transition = next(payload for event_type, payload in log.events if event_type == "reconciliation_safety_transition")
+        self.assertEqual(transition["previous_value"], True)
+        self.assertEqual(transition["new_value"], False)
+        self.assertEqual(transition["reason"], "broker_local_flat_no_owned_orders")
+
+    def test_reconcile_clears_unsafe_when_matching_open_position_has_valid_protection(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_tsla",
+                symbol="TSLA",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=2,
+                stop_loss_bricks=1,
+                qty=4,
+                strategy_name="tsla_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-tsla",
+                market_contract_fingerprint="market-tsla",
+            )
+        )
+        engine.position = PositionState(
+            symbol="TSLA",
+            side="long",
+            entry_time=pd.Timestamp("2026-09-11T16:00:00Z"),
+            entry_price=100.0,
+            qty=4,
+        )
+        engine.protection_state = {"exit_plan": test_exit_plan("TSLA"), "parent_order_id": "parent-1"}
+        engine.mark_reconciliation_unsafe("previous_transient_broker_error")
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader = FakeProtectionTrader(
+            position={"symbol": "TSLA", "side": "long", "qty": "4", "avg_entry_price": "100"},
+            orders=[test_bracket_order("TSLA")],
+        )
+        execution.log = None
+        log = MemoryLog()
+        runtime = TraderRuntime(
+            trader_id="camatron_tsla",
+            symbol="TSLA",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=log,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertFalse(engine.reconciliation_unsafe)
+        transition = next(payload for event_type, payload in log.events if event_type == "reconciliation_safety_transition")
+        self.assertEqual(transition["previous_value"], True)
+        self.assertEqual(transition["new_value"], False)
+        self.assertEqual(transition["reason"], "broker_local_open_valid_protection")
+
+    def test_reconcile_keeps_unsafe_for_orphan_owned_protection(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_tsla",
+                symbol="TSLA",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=2,
+                stop_loss_bricks=1,
+                qty=4,
+                strategy_name="tsla_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-tsla",
+                market_contract_fingerprint="market-tsla",
+            )
+        )
+        engine.protection_state = {"exit_plan": test_exit_plan("TSLA"), "parent_order_id": "parent-1"}
+        engine.mark_reconciliation_unsafe("previous_orphan_protection")
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader = FakeProtectionTrader(position=None, orders=[test_bracket_order("TSLA")])
+        execution.log = None
+        runtime = TraderRuntime(
+            trader_id="camatron_tsla",
+            symbol="TSLA",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=MemoryLog(),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaises(BrokerEngineStateMismatch):
+                reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertTrue(engine.reconciliation_unsafe)
+
+    def test_reconcile_keeps_unsafe_for_local_flat_broker_open_even_with_valid_protection(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_tsla",
+                symbol="TSLA",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=2,
+                stop_loss_bricks=1,
+                qty=4,
+                strategy_name="tsla_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-tsla",
+                market_contract_fingerprint="market-tsla",
+            )
+        )
+        engine.protection_state = {"exit_plan": test_exit_plan("TSLA"), "parent_order_id": "parent-1"}
+        engine.mark_reconciliation_unsafe("broker_position_exists_engine_flat")
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader = FakeProtectionTrader(
+            position={"symbol": "TSLA", "side": "long", "qty": "4", "avg_entry_price": "100"},
+            orders=[test_bracket_order("TSLA")],
+        )
+        execution.log = None
+        runtime = TraderRuntime(
+            trader_id="camatron_tsla",
+            symbol="TSLA",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=MemoryLog(),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertTrue(engine.reconciliation_unsafe)
+        self.assertIsNotNone(engine.position)
+
+    def test_reconcile_keeps_unsafe_for_local_open_broker_flat(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_tsla",
+                symbol="TSLA",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=2,
+                stop_loss_bricks=1,
+                qty=4,
+                strategy_name="tsla_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-tsla",
+                market_contract_fingerprint="market-tsla",
+            )
+        )
+        engine.position = PositionState(
+            symbol="TSLA",
+            side="long",
+            entry_time=pd.Timestamp("2026-09-11T16:00:00Z"),
+            entry_price=100.0,
+            qty=4,
+        )
+        engine.mark_reconciliation_unsafe("broker_flat_engine_position_without_pending_close")
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader = FakeProtectionTrader(position=None, orders=[], fills=[])
+        execution.log = None
+        runtime = TraderRuntime(
+            trader_id="camatron_tsla",
+            symbol="TSLA",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=MemoryLog(),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertTrue(engine.reconciliation_unsafe)
+        self.assertIsNone(engine.position)
+
+    def test_reconcile_keeps_unsafe_for_unexpected_symbol_open_order(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_tsla",
+                symbol="TSLA",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=2,
+                stop_loss_bricks=1,
+                qty=1,
+                strategy_name="tsla_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-tsla",
+                market_contract_fingerprint="market-tsla",
+            )
+        )
+        engine.mark_reconciliation_unsafe("unexpected_order")
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader = FakeProtectionTrader(
+            position=None,
+            orders=[
+                {
+                    "id": "unexpected-1",
+                    "symbol": "TSLA",
+                    "side": "buy",
+                    "type": "market",
+                    "qty": "1",
+                    "filled_qty": "0",
+                    "status": "accepted",
+                    "client_order_id": "unknown-tsla-order",
+                }
+            ],
+        )
+        execution.log = None
+        runtime = TraderRuntime(
+            trader_id="camatron_tsla",
+            symbol="TSLA",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=MemoryLog(),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaises(BrokerEngineStateMismatch):
+                reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertTrue(engine.reconciliation_unsafe)
+
+    def test_reconciliation_unsafe_persists_across_restart_until_authoritative_safe_reconcile(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_tsla",
+                symbol="TSLA",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=2,
+                stop_loss_bricks=1,
+                qty=1,
+                strategy_name="tsla_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-tsla",
+                market_contract_fingerprint="market-tsla",
+            )
+        )
+        engine.mark_reconciliation_unsafe("previous_orphan_protection")
+        restored = RenkoStrategyEngine(engine.config)
+        restored.restore_snapshot(engine.snapshot())
+        self.assertTrue(restored.reconciliation_unsafe)
+
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader = FakeProtectionTrader(position=None, orders=[])
+        execution.log = None
+        runtime = TraderRuntime(
+            trader_id="camatron_tsla",
+            symbol="TSLA",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=restored,
+            execution=execution,
+            log=MemoryLog(),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        safe_restored = RenkoStrategyEngine(restored.config)
+        safe_restored.restore_snapshot(restored.snapshot())
+        self.assertFalse(safe_restored.reconciliation_unsafe)
+
+    def test_reconcile_verifies_nested_parent_protection_with_broker_generated_child_client_ids(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="megatron_tsla",
+                symbol="TSLA",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=2,
+                stop_loss_bricks=1,
+                qty=4,
+                strategy_name="tsla_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-tsla",
+                market_contract_fingerprint="market-tsla",
+            )
+        )
+        plan = test_exit_plan("TSLA")
+        parent = test_bracket_order("TSLA")
+        parent["legs"][0]["client_order_id"] = "broker-generated-tp-client-id"
+        parent["legs"][0]["status"] = "held"
+        parent["legs"][1]["client_order_id"] = "broker-generated-sl-client-id"
+        parent["legs"][1]["status"] = "held"
+        engine.protection_state = {
+            "state": TP_SL_LIFECYCLE_ENTRY_FILLED_AWAITING_PROTECTION,
+            "parent_order_id": "parent-1",
+            "take_profit_order_id": "tp-1",
+            "stop_loss_order_id": "sl-1",
+            "exit_plan": plan,
+        }
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader = FakeProtectionTrader(
+            position={"symbol": "TSLA", "side": "long", "qty": "4", "avg_entry_price": "100"},
+            orders=[],
+            parent=parent,
+        )
+        execution.log = None
+        runtime = TraderRuntime(
+            trader_id="megatron_tsla",
+            symbol="TSLA",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=MemoryLog(),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertEqual(engine.tp_sl_lifecycle_state, TP_SL_LIFECYCLE_PROTECTED)
+        self.assertEqual(engine.protection_state["parent_order_id"], "parent-1")
+        self.assertEqual(engine.protection_state["take_profit_order_id"], "tp-1")
+        self.assertEqual(engine.protection_state["stop_loss_order_id"], "sl-1")
+        self.assertEqual(runtime.log.events[0][1]["reason"], "broker_position_valid_protection_adopted")
+
+    def test_repeated_tp_sl_reverify_preserves_exit_plan(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_aapl",
+                symbol="AAPL",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=2,
+                stop_loss_bricks=1,
+                qty=4,
+                strategy_name="aapl_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-aapl",
+                market_contract_fingerprint="market-aapl",
+            )
+        )
+        plan = test_exit_plan("AAPL")
+        engine.position = PositionState(
+            symbol="AAPL",
+            side="long",
+            entry_time=pd.Timestamp("2026-09-09T13:30:00Z"),
+            entry_price=100.0,
+            qty=4,
+        )
+        engine.protection_state = {"state": TP_SL_LIFECYCLE_PROTECTED, "parent_order_id": "parent-1", "exit_plan": plan}
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader = FakeProtectionTrader(
+            position={"symbol": "AAPL", "side": "long", "qty": "4", "avg_entry_price": "100"},
+            orders=[test_bracket_order("AAPL")],
+        )
+        execution.log = None
+        runtime = TraderRuntime(
+            trader_id="camatron_aapl",
+            symbol="AAPL",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=MemoryLog(),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reconcile_engine_with_broker(Path(temp_dir), runtime)
+            reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertEqual(engine.tp_sl_lifecycle_state, TP_SL_LIFECYCLE_PROTECTED)
+        self.assertEqual(engine.protection_state["exit_plan"], plan)
+        self.assertNotIn(
+            "missing_exit_plan",
+            {
+                issue["code"]
+                for _event_type, payload in runtime.log.events
+                for issue in payload.get("issues", [])
+                if isinstance(issue, dict)
+            },
+        )
+
+    def test_apply_tp_sl_evidence_omitted_exit_plan_preserves_prior_plan(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_aapl",
+                symbol="AAPL",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=2,
+                stop_loss_bricks=1,
+                qty=4,
+                strategy_name="aapl_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-aapl",
+                market_contract_fingerprint="market-aapl",
+            )
+        )
+        plan = test_exit_plan("AAPL")
+        engine.protection_state = {"state": TP_SL_LIFECYCLE_PROTECTED, "exit_plan": plan}
+        verification = SimpleNamespace(
+            protected=True,
+            parent_order_id="parent-2",
+            take_profit_order_id="tp-2",
+            stop_loss_order_id="sl-2",
+            protected_quantity="4",
+            issues=(),
+        )
+
+        engine.apply_tp_sl_protection_evidence(verification=verification)
+
+        self.assertEqual(engine.protection_state["exit_plan"], plan)
+
+    def test_apply_tp_sl_evidence_empty_exit_plan_preserves_prior_plan(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_aapl",
+                symbol="AAPL",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=2,
+                stop_loss_bricks=1,
+                qty=4,
+                strategy_name="aapl_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-aapl",
+                market_contract_fingerprint="market-aapl",
+            )
+        )
+        plan = test_exit_plan("AAPL")
+        engine.protection_state = {"state": TP_SL_LIFECYCLE_PROTECTED, "exit_plan": plan}
+        verification = SimpleNamespace(
+            protected=True,
+            parent_order_id="parent-2",
+            take_profit_order_id="tp-2",
+            stop_loss_order_id="sl-2",
+            protected_quantity="4",
+            issues=(),
+        )
+
+        engine.apply_tp_sl_protection_evidence(exit_plan={}, verification=verification)
+
+        self.assertEqual(engine.protection_state["exit_plan"], plan)
+
+    def test_apply_tp_sl_evidence_none_exit_plan_preserves_prior_plan(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_aapl",
+                symbol="AAPL",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=2,
+                stop_loss_bricks=1,
+                qty=4,
+                strategy_name="aapl_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-aapl",
+                market_contract_fingerprint="market-aapl",
+            )
+        )
+        plan = test_exit_plan("AAPL")
+        engine.protection_state = {"state": TP_SL_LIFECYCLE_PROTECTED, "exit_plan": plan}
+        verification = SimpleNamespace(
+            protected=True,
+            parent_order_id="parent-2",
+            take_profit_order_id="tp-2",
+            stop_loss_order_id="sl-2",
+            protected_quantity="4",
+            issues=(),
+        )
+
+        engine.apply_tp_sl_protection_evidence(exit_plan=None, verification=verification)
+
+        self.assertEqual(engine.protection_state["exit_plan"], plan)
+
+    def test_apply_tp_sl_evidence_repeated_empty_plan_is_idempotent_for_exit_plan(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_aapl",
+                symbol="AAPL",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=2,
+                stop_loss_bricks=1,
+                qty=4,
+                strategy_name="aapl_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-aapl",
+                market_contract_fingerprint="market-aapl",
+            )
+        )
+        plan = test_exit_plan("AAPL")
+        engine.protection_state = {"state": TP_SL_LIFECYCLE_PROTECTED, "exit_plan": plan}
+        verification = SimpleNamespace(
+            protected=True,
+            parent_order_id="parent-2",
+            take_profit_order_id="tp-2",
+            stop_loss_order_id="sl-2",
+            protected_quantity="4",
+            issues=(),
+        )
+
+        for _ in range(10):
+            engine.apply_tp_sl_protection_evidence(exit_plan={}, verification=verification)
+
+        self.assertEqual(engine.protection_state["exit_plan"], plan)
+
+    def test_apply_tp_sl_evidence_preserves_plan_while_updating_broker_evidence(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_aapl",
+                symbol="AAPL",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=2,
+                stop_loss_bricks=1,
+                qty=4,
+                strategy_name="aapl_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-aapl",
+                market_contract_fingerprint="market-aapl",
+            )
+        )
+        plan = test_exit_plan("AAPL")
+        engine.protection_state = {
+            "state": TP_SL_LIFECYCLE_PROTECTED,
+            "exit_plan": plan,
+            "parent_order_id": "parent-1",
+            "take_profit_order_id": "tp-1",
+            "stop_loss_order_id": "sl-1",
+        }
+        verification = SimpleNamespace(
+            protected=True,
+            parent_order_id="parent-2",
+            take_profit_order_id="tp-2",
+            stop_loss_order_id="sl-2",
+            protected_quantity="4",
+            issues=(),
+        )
+
+        engine.apply_tp_sl_protection_evidence(exit_plan={}, verification=verification)
+
+        self.assertEqual(engine.protection_state["exit_plan"], plan)
+        self.assertEqual(engine.protection_state["parent_order_id"], "parent-2")
+        self.assertEqual(engine.protection_state["take_profit_order_id"], "tp-2")
+        self.assertEqual(engine.protection_state["stop_loss_order_id"], "sl-2")
+
+    def test_reconcile_reverifies_bracket_after_unprotected_marker_preserves_lineage(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_nvda",
+                symbol="NVDA",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=3,
+                stop_loss_bricks=3,
+                qty=1,
+                strategy_name="nvda_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-nvda",
+                market_contract_fingerprint="market-nvda",
+            )
+        )
+        plan = build_renko_tp_sl_exit_plan(
+            trader_id="camatron_nvda",
+            strategy_id="nvda_tp_sl",
+            symbol="NVDA",
+            entry_side="sell",
+            quantity=1,
+            entry_reference_type="signal_price",
+            entry_reference_price="100",
+            brick_size="1",
+            take_profit_bricks=3,
+            stop_loss_bricks=3,
+            time_in_force="day",
+            order_class="bracket",
+            client_order_id="nvda-entry",
+            candidate_config_fingerprint="config-nvda",
+            market_contract_fingerprint="market-nvda",
+        ).to_dict()
+        parent = test_bracket_order("NVDA")
+        parent["qty"] = "1"
+        parent["filled_qty"] = "1"
+        parent["side"] = "sell"
+        parent["client_order_id"] = plan["client_order_id"]
+        for leg in parent["legs"]:
+            leg["qty"] = "1"
+            leg["side"] = "buy"
+            leg["status"] = "held"
+        parent["legs"][0]["client_order_id"] = "broker-generated-tp-client-id"
+        parent["legs"][0]["limit_price"] = plan["take_profit_limit_price"]
+        parent["legs"][1]["client_order_id"] = "broker-generated-sl-client-id"
+        parent["legs"][1]["stop_price"] = plan["stop_loss_trigger_price"]
+        engine.protection_state = {
+            "state": TP_SL_LIFECYCLE_BRACKET_SUBMITTED,
+            "parent_order_id": "parent-1",
+            "exit_plan": plan,
+        }
+        engine.mark_position_unprotected(
+            "broker_native_protection_verification_failed",
+            payload={
+                "broker_position": {
+                    "symbol": "NVDA",
+                    "side": "short",
+                    "qty": "1",
+                    "avg_entry_price": "100",
+                },
+                "issues": ["transient_missing_leg"],
+            },
+        )
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader = FakeProtectionTrader(
+            position={"symbol": "NVDA", "side": "short", "qty": "1", "avg_entry_price": "100"},
+            orders=[],
+            parent=parent,
+        )
+        execution.log = None
+        runtime = TraderRuntime(
+            trader_id="camatron_nvda",
+            symbol="NVDA",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=MemoryLog(),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertEqual(engine.tp_sl_lifecycle_state, TP_SL_LIFECYCLE_PROTECTED)
+        self.assertEqual(engine.protection_state["parent_order_id"], "parent-1")
+        self.assertEqual(engine.protection_state["take_profit_order_id"], "tp-1")
+        self.assertEqual(engine.protection_state["stop_loss_order_id"], "sl-1")
+        self.assertEqual(runtime.log.events[0][0], "broker_native_protection_verified")
+
+    def test_reconcile_broker_position_without_valid_protection_fails_closed(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="megatron_aapl",
+                symbol="AAPL",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=2,
+                stop_loss_bricks=1,
+                qty=4,
+                strategy_name="aapl_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-aapl",
+                market_contract_fingerprint="market-aapl",
+            )
+        )
+        engine.protection_state = {"exit_plan": test_exit_plan("AAPL")}
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader = FakeProtectionTrader(
+            position={"symbol": "AAPL", "side": "long", "qty": "4", "avg_entry_price": "100"},
+            orders=[],
+        )
+        execution.log = None
+        runtime = TraderRuntime(
+            trader_id="megatron_aapl",
+            symbol="AAPL",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=MemoryLog(),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaises(BrokerEngineStateMismatch):
+                reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertEqual(engine.tp_sl_lifecycle_state, TP_SL_LIFECYCLE_ENTRY_PLANNED)
+        self.assertIn("critical_protection_invariant_violation", [event_type for event_type, _ in runtime.log.events])
+
+    def test_reconcile_broker_position_without_protection_submits_recovery_oco_when_parent_terminal(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="megatron_aapl",
+                symbol="AAPL",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=2,
+                stop_loss_bricks=1,
+                qty=4,
+                strategy_name="aapl_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-aapl",
+                market_contract_fingerprint="market-aapl",
+            )
+        )
+        plan = test_exit_plan("AAPL")
+        engine.protection_state = {
+            "state": "ENTRY_FILLED_AWAITING_PROTECTION",
+            "parent_order_id": "parent-1",
+            "lifecycle_id": plan["lifecycle_id"],
+            "exit_plan": plan,
+            "recovery_state": {
+                "lifecycle_id": plan["lifecycle_id"],
+                "state": "ENTRY_FILLED_AWAITING_PROTECTION",
+                "parent_order_id": "parent-1",
+                "recovery_attempt": 0,
+                "deadline_epoch_seconds": "1",
+                "audit": [],
+            },
+        }
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        trader = FakeProtectionTrader(
+            position={
+                "symbol": "AAPL",
+                "side": "long",
+                "qty": "4",
+                "qty_available": "4",
+                "avg_entry_price": "100",
+                "current_price": "100",
+            },
+            orders=[],
+            parent={
+                "id": "parent-1",
+                "symbol": "AAPL",
+                "side": "buy",
+                "qty": "4",
+                "filled_qty": "4",
+                "status": "filled",
+                "order_class": "bracket",
+                "client_order_id": plan["client_order_id"],
+                "legs": [],
+            },
+        )
+        execution.trader = trader
+        execution.log = None
+        runtime = TraderRuntime(
+            trader_id="megatron_aapl",
+            symbol="AAPL",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=MemoryLog(),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertEqual(engine.tp_sl_lifecycle_state, TP_SL_LIFECYCLE_PROTECTED)
+        self.assertEqual(len(trader.recovery_orders), 1)
+        self.assertEqual(trader.recovery_orders[0]["order_class"], "oco")
+        self.assertEqual(trader.recovery_orders[0]["qty"], "4")
+        self.assertEqual(engine.protection_state["state"], TP_SL_LIFECYCLE_PROTECTED)
+        self.assertEqual(engine.protection_state["recovery_attempt"], 1)
+        self.assertIn("broker_native_protection_recovery", [event_type for event_type, _ in runtime.log.events])
+
+    def test_reconcile_broker_flat_stale_position_uses_manual_close_fill(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="megatron_aapl",
+                symbol="AAPL",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=2,
+                stop_loss_bricks=1,
+                qty=4,
+                strategy_name="aapl_tp_sl",
+            )
+        )
+        engine.position = PositionState(
+            symbol="AAPL",
+            side="long",
+            entry_time=pd.Timestamp("2026-08-21T14:54:15Z"),
+            entry_price=100.0,
+            qty=4,
+        )
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader = FakeProtectionTrader(
+            position=None,
+            fills=[
+                {
+                    "id": "fill-1",
+                    "order_id": "manual-close-1",
+                    "symbol": "AAPL",
+                    "side": "sell",
+                    "qty": "4",
+                    "price": "101.25",
+                    "transaction_time": "2026-08-21T15:07:41.936Z",
+                }
+            ],
+        )
+        execution.log = None
+        runtime = TraderRuntime(
+            trader_id="megatron_aapl",
+            symbol="AAPL",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=MemoryLog(),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertIsNone(engine.position)
+        self.assertEqual(engine.tp_sl_lifecycle_state, TP_SL_LIFECYCLE_FLAT)
+        self.assertEqual(engine.last_closed_exit["order_id"], "manual-close-1")
+        self.assertEqual(engine.last_closed_exit["realized_pnl"], "5.00")
+
+    def test_reconcile_broker_flat_orphan_protection_fails_closed(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="megatron_aapl",
+                symbol="AAPL",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=2,
+                stop_loss_bricks=1,
+                qty=4,
+                strategy_name="aapl_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-aapl",
+                market_contract_fingerprint="market-aapl",
+            )
+        )
+        engine.protection_state = {"exit_plan": test_exit_plan("AAPL")}
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader = FakeProtectionTrader(position=None, orders=[test_bracket_order("AAPL")])
+        execution.log = None
+        runtime = TraderRuntime(
+            trader_id="megatron_aapl",
+            symbol="AAPL",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=MemoryLog(),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaises(BrokerEngineStateMismatch):
+                reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertIn("critical_protection_invariant_violation", [event_type for event_type, _ in runtime.log.events])
+
+    def test_reconcile_broker_flat_reversal_catastrophic_stop_fill_clears_state(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_tsla",
+                symbol="TSLA",
+                brick_size=2.32525,
+                entry_bricks=1,
+                strategy_type="renko_reversal",
+                take_profit_bricks=1,
+                stop_loss_bricks=1,
+                qty=1,
+                strategy_name="tsla_reversal",
+                exit_management="catastrophic_stop",
+                catastrophic_stop_bricks=3,
+                candidate_config_fingerprint="config-tsla",
+                market_contract_fingerprint="market-tsla",
+            )
+        )
+        engine.position = PositionState(
+            symbol="TSLA",
+            side="short",
+            entry_time=pd.Timestamp("2026-09-02T13:37:14Z"),
+            entry_price=353.438,
+            qty=1,
+        )
+        plan, order = test_reversal_stop_order("TSLA", order_id="stop-1", status="filled", filled_qty="1")
+        engine.protection_state = {
+            "state": TP_SL_LIFECYCLE_PROTECTED,
+            "protection_type": "reversal_catastrophic_stop",
+            "stop_order_id": "stop-1",
+            "stop_client_order_id": plan["stop_client_order_id"],
+            "stop_plan": plan,
+        }
+        engine.tp_sl_lifecycle_state = TP_SL_LIFECYCLE_PROTECTED
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader = FakeProtectionTrader(
+            position=None,
+            orders=[order],
+            fills=[
+                {
+                    "id": "fill-1",
+                    "order_id": "stop-1",
+                    "symbol": "TSLA",
+                    "side": "buy",
+                    "qty": "1",
+                    "price": "366.50",
+                    "transaction_time": "2026-09-03T13:30:00.568Z",
+                }
+            ],
+        )
+        execution.log = None
+        runtime = TraderRuntime(
+            trader_id="camatron_tsla",
+            symbol="TSLA",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=MemoryLog(),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reconcile_engine_with_broker(Path(temp_dir), runtime)
+            reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertIsNone(engine.position)
+        self.assertIsNone(engine.pending_exit)
+        self.assertIsNone(engine.protection_state)
+        self.assertEqual(engine.tp_sl_lifecycle_state, TP_SL_LIFECYCLE_FLAT)
+        self.assertFalse(engine.reconciliation_unsafe)
+        self.assertEqual(engine.last_closed_exit["reason"], "reversal_catastrophic_stop_broker_native")
+        self.assertEqual(engine.last_closed_exit["order_id"], "stop-1")
+        self.assertEqual(engine.last_closed_exit["source"], "alpaca_reconciliation_reversal_catastrophic_stop_fill")
+        self.assertEqual(engine.last_closed_exit["fill_price"], "366.50")
+        self.assertEqual(engine.last_closed_exit["filled_qty"], "1")
+        self.assertEqual(engine.last_closed_exit["realized_pnl"], "-13.2249")
+        self.assertEqual(runtime.log.events[0][0], "state_reconciled")
+        self.assertEqual(runtime.log.events[0][1]["reason"], "broker_flat_reversal_catastrophic_stop_fill_reconciled")
+
+    def test_stale_reversal_stop_visibility_after_terminal_fill_does_not_orphan(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_tsla",
+                symbol="TSLA",
+                brick_size=2.32525,
+                entry_bricks=1,
+                strategy_type="renko_reversal",
+                qty=1,
+                strategy_name="tsla_reversal",
+                exit_management="catastrophic_stop",
+                catastrophic_stop_bricks=3,
+                candidate_config_fingerprint="config-tsla",
+                market_contract_fingerprint="market-tsla",
+            )
+        )
+        plan, active_order = test_reversal_stop_order("TSLA", order_id="stop-1", status="accepted", filled_qty="0")
+        _, filled_order = test_reversal_stop_order("TSLA", order_id="stop-1", status="filled", filled_qty="1")
+        engine.last_closed_exit = {
+            "reason": "reversal_catastrophic_stop_broker_native",
+            "order_id": "stop-1",
+            "source": "alpaca_reconciliation_reversal_catastrophic_stop_fill",
+        }
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader = FakeProtectionTrader(position=None, orders=[active_order], parent=filled_order)
+        execution.log = None
+        runtime = TraderRuntime(
+            trader_id="camatron_tsla",
+            symbol="TSLA",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=MemoryLog(),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertIsNone(engine.position)
+        self.assertNotIn("critical_protection_invariant_violation", [event_type for event_type, _ in runtime.log.events])
+
+    def test_reversal_active_stop_while_flat_still_fails_closed(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_tsla",
+                symbol="TSLA",
+                brick_size=2.32525,
+                entry_bricks=1,
+                strategy_type="renko_reversal",
+                qty=1,
+                strategy_name="tsla_reversal",
+                exit_management="catastrophic_stop",
+                catastrophic_stop_bricks=3,
+                candidate_config_fingerprint="config-tsla",
+                market_contract_fingerprint="market-tsla",
+            )
+        )
+        plan, active_order = test_reversal_stop_order("TSLA", order_id="stop-1", status="accepted", filled_qty="0")
+        engine.protection_state = {"stop_plan": plan}
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader = FakeProtectionTrader(position=None, orders=[active_order])
+        execution.log = None
+        runtime = TraderRuntime(
+            trader_id="camatron_tsla",
+            symbol="TSLA",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=MemoryLog(),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaises(BrokerEngineStateMismatch):
+                reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertIn("critical_protection_invariant_violation", [event_type for event_type, _ in runtime.log.events])
+
+    def test_reconcile_after_protected_reversal_crash_windows_recovers_catastrophic_stop_from_broker_truth(self):
+        cases = [
+            (
+                "after_protection_cancel_before_reversal_submission",
+                "long",
+                {
+                    "state": TP_SL_LIFECYCLE_PROTECTED,
+                    "stop_plan": build_reversal_catastrophic_stop_plan(
+                        trader_id="megatron_aapl",
+                        strategy_id="aapl_reversal",
+                        symbol="AAPL",
+                        entry_side="buy",
+                        quantity="1",
+                        entry_reference_price="300.00",
+                        brick_size="2.218981",
+                        catastrophic_stop_bricks=3,
+                        client_order_id="aapl-entry",
+                        candidate_config_fingerprint="config-aapl",
+                        market_contract_fingerprint="market-aapl",
+                    ),
+                },
+            ),
+            (
+                "after_reversal_submission_before_new_protection",
+                "short",
+                {"state": TP_SL_LIFECYCLE_ENTRY_PLANNED},
+            ),
+            (
+                "after_reversal_fill_before_new_protection",
+                "short",
+                None,
+            ),
+        ]
+        for name, side, protection_state in cases:
+            with self.subTest(name=name):
+                engine = RenkoStrategyEngine(
+                    RenkoStrategyConfig(
+                        trader_id="megatron_aapl",
+                        symbol="AAPL",
+                        brick_size=2.218981,
+                        entry_bricks=1,
+                        strategy_type="renko_reversal",
+                        qty=1,
+                        strategy_name="aapl_reversal",
+                        exit_management="catastrophic_stop",
+                        catastrophic_stop_bricks=3,
+                        candidate_config_fingerprint="config-aapl",
+                        market_contract_fingerprint="market-aapl",
+                    )
+                )
+                engine.position = PositionState(
+                    symbol="AAPL",
+                    side=side,
+                    entry_time=pd.Timestamp("2026-09-16T15:00:00Z"),
+                    entry_price=300.0,
+                    qty=1,
+                )
+                engine.protection_state = protection_state
+                engine.tp_sl_lifecycle_state = (
+                    TP_SL_LIFECYCLE_PROTECTED
+                    if protection_state and protection_state.get("state") == TP_SL_LIFECYCLE_PROTECTED
+                    else TP_SL_LIFECYCLE_ENTRY_FILLED_AWAITING_PROTECTION
+                )
+                execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+                broker_side = "long" if side == "long" else "short"
+                broker_qty = "1" if broker_side == "long" else "-1"
+                execution.trader = FakeProtectionTrader(
+                    position={
+                        "symbol": "AAPL",
+                        "side": broker_side,
+                        "qty": broker_qty,
+                        "qty_available": broker_qty,
+                        "avg_entry_price": "300.00",
+                    },
+                    orders=[],
+                )
+                execution.log = None
+                runtime = TraderRuntime(
+                    trader_id="megatron_aapl",
+                    symbol="AAPL",
+                    mode="live",
+                    credential_profile=None,
+                    feed="sip",
+                    enabled=True,
+                    execution_enabled=True,
+                    max_position_notional=2500,
+                    max_daily_loss=0,
+                    engine=engine,
+                    execution=execution,
+                    log=MemoryLog(),
+                )
+
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+                self.assertEqual(engine.tp_sl_lifecycle_state, TP_SL_LIFECYCLE_PROTECTED)
+                self.assertEqual(len(execution.trader.recovery_orders), 1)
+                self.assertEqual(execution.trader.recovery_orders[0]["type"], "stop")
+                self.assertEqual(execution.trader.recovery_orders[0]["side"], "sell" if side == "long" else "buy")
+                self.assertEqual(runtime.log.events[-1][0], "reversal_catastrophic_stop_recovery")
+
+    def test_reconcile_after_reversal_fill_fails_closed_when_new_catastrophic_stop_cannot_be_created(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="megatron_tsla",
+                symbol="TSLA",
+                brick_size=1.7685,
+                entry_bricks=1,
+                strategy_type="renko_reversal",
+                qty=1,
+                strategy_name="tsla_reversal",
+                exit_management="catastrophic_stop",
+                catastrophic_stop_bricks=3,
+                candidate_config_fingerprint="config-tsla",
+                market_contract_fingerprint="market-tsla",
+            )
+        )
+        engine.position = PositionState(
+            symbol="TSLA",
+            side="short",
+            entry_time=pd.Timestamp("2026-09-16T15:00:00Z"),
+            entry_price=330.0,
+            qty=1,
+        )
+        engine.tp_sl_lifecycle_state = TP_SL_LIFECYCLE_ENTRY_FILLED_AWAITING_PROTECTION
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader = FailingCatastrophicStopTrader(
+            position={
+                "symbol": "TSLA",
+                "side": "short",
+                "qty": "-1",
+                "qty_available": "-1",
+                "avg_entry_price": "330.00",
+            },
+            orders=[],
+        )
+        execution.log = None
+        runtime = TraderRuntime(
+            trader_id="megatron_tsla",
+            symbol="TSLA",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=MemoryLog(),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaises(BrokerEngineStateMismatch):
+                reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertEqual(len(execution.trader.recovery_orders), 1)
+        self.assertEqual(engine.tp_sl_lifecycle_state, TP_SL_LIFECYCLE_PROTECTION_FAILED)
+        self.assertIn(
+            "critical_reversal_catastrophic_stop_recovery_error",
+            [event_type for event_type, _ in runtime.log.events],
+        )
+
+    def test_symbol_broker_mismatch_halts_only_that_runtime(self):
+        aapl_engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_aapl_isolation",
+                symbol="AAPL",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=2,
+                stop_loss_bricks=1,
+                qty=4,
+                strategy_name="aapl_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-aapl",
+                market_contract_fingerprint="market-aapl",
+            )
+        )
+        aapl_execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        aapl_execution.trader = FakeProtectionTrader(
+            position={"symbol": "AAPL", "side": "long", "qty": "4", "avg_entry_price": "100"},
+            orders=[],
+        )
+        aapl_execution.log = None
+        aapl = TraderRuntime(
+            trader_id="camatron_aapl_isolation",
+            symbol="AAPL",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=aapl_engine,
+            execution=aapl_execution,
+            log=MemoryLog(),
+        )
+        nvda_engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_nvda_isolation",
+                symbol="NVDA",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=2,
+                stop_loss_bricks=1,
+                qty=4,
+            )
+        )
+        nvda = TraderRuntime(
+            trader_id="camatron_nvda_isolation",
+            symbol="NVDA",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=nvda_engine,
+            execution=RecordingExecution(),
+            log=MemoryLog(),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reconcile_broker_state_if_due_or_halt(Path(temp_dir), aapl)
+
+        self.assertFalse(aapl.enabled)
+        self.assertTrue(aapl_engine.reconciliation_unsafe)
+        self.assertTrue(nvda.enabled)
+
+    def test_stream_cleanup_awaits_pending_read_before_close(self):
+        closed = False
+
+        async def scenario():
+            started = asyncio.Event()
+
+            async def stream():
+                nonlocal closed
+                try:
+                    started.set()
+                    await asyncio.sleep(10)
+                    yield "event"
+                finally:
+                    closed = True
+
+            iterator = stream().__aiter__()
+            pending = asyncio.create_task(iterator.__anext__())
+            await started.wait()
+            await close_stream_after_pending_read(iterator, pending)
+
+        asyncio.run(scenario())
+        self.assertTrue(closed)
+
+    def test_reconcile_broker_flat_reversal_stop_unknown_flatness_still_fails_closed(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_tsla",
+                symbol="TSLA",
+                brick_size=2.32525,
+                entry_bricks=1,
+                strategy_type="renko_reversal",
+                take_profit_bricks=1,
+                stop_loss_bricks=1,
+                qty=1,
+                strategy_name="tsla_reversal",
+                exit_management="catastrophic_stop",
+                catastrophic_stop_bricks=3,
+                candidate_config_fingerprint="config-tsla",
+                market_contract_fingerprint="market-tsla",
+            )
+        )
+        engine.position = PositionState(
+            symbol="TSLA",
+            side="short",
+            entry_time=pd.Timestamp("2026-09-02T13:37:14Z"),
+            entry_price=353.438,
+            qty=1,
+        )
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader = FakeProtectionTrader(position=None, orders=[], fills=[])
+        execution.log = None
+        runtime = TraderRuntime(
+            trader_id="camatron_tsla",
+            symbol="TSLA",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=MemoryLog(),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaises(BrokerEngineStateMismatch):
+                reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertIsNotNone(engine.position)
+        self.assertEqual(runtime.log.events[0][1]["reason"], "broker_flat_engine_position_without_pending_close")
+
+    def test_reconcile_broker_flat_reversal_stop_wrong_order_id_fails_closed(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_tsla",
+                symbol="TSLA",
+                brick_size=2.32525,
+                entry_bricks=1,
+                strategy_type="renko_reversal",
+                take_profit_bricks=1,
+                stop_loss_bricks=1,
+                qty=1,
+                strategy_name="tsla_reversal",
+                exit_management="catastrophic_stop",
+                catastrophic_stop_bricks=3,
+                candidate_config_fingerprint="config-tsla",
+                market_contract_fingerprint="market-tsla",
+            )
+        )
+        engine.position = PositionState(
+            symbol="TSLA",
+            side="short",
+            entry_time=pd.Timestamp("2026-09-02T13:37:14Z"),
+            entry_price=353.438,
+            qty=1,
+        )
+        plan, order = test_reversal_stop_order("TSLA", order_id="stop-1", status="filled", filled_qty="1")
+        engine.protection_state = {
+            "state": TP_SL_LIFECYCLE_PROTECTED,
+            "protection_type": "reversal_catastrophic_stop",
+            "stop_order_id": "different-stop",
+            "stop_client_order_id": plan["stop_client_order_id"],
+            "stop_plan": plan,
+        }
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader = FakeProtectionTrader(position=None, orders=[order], fills=[])
+        execution.log = None
+        runtime = TraderRuntime(
+            trader_id="camatron_tsla",
+            symbol="TSLA",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=MemoryLog(),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaises(BrokerEngineStateMismatch):
+                reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertIsNotNone(engine.position)
+
+    def test_reconcile_broker_flat_reversal_stop_partial_or_canceled_fill_fails_closed(self):
+        for status, filled_qty in [("filled", "0.5"), ("canceled", "0")]:
+            with self.subTest(status=status, filled_qty=filled_qty):
+                engine = RenkoStrategyEngine(
+                    RenkoStrategyConfig(
+                        trader_id="camatron_tsla",
+                        symbol="TSLA",
+                        brick_size=2.32525,
+                        entry_bricks=1,
+                        strategy_type="renko_reversal",
+                        take_profit_bricks=1,
+                        stop_loss_bricks=1,
+                        qty=1,
+                        strategy_name="tsla_reversal",
+                        exit_management="catastrophic_stop",
+                        catastrophic_stop_bricks=3,
+                        candidate_config_fingerprint="config-tsla",
+                        market_contract_fingerprint="market-tsla",
+                    )
+                )
+                engine.position = PositionState(
+                    symbol="TSLA",
+                    side="short",
+                    entry_time=pd.Timestamp("2026-09-02T13:37:14Z"),
+                    entry_price=353.438,
+                    qty=1,
+                )
+                plan, order = test_reversal_stop_order("TSLA", order_id="stop-1", status=status, filled_qty=filled_qty)
+                engine.protection_state = {
+                    "state": TP_SL_LIFECYCLE_PROTECTED,
+                    "protection_type": "reversal_catastrophic_stop",
+                    "stop_order_id": "stop-1",
+                    "stop_client_order_id": plan["stop_client_order_id"],
+                    "stop_plan": plan,
+                }
+                execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+                execution.trader = FakeProtectionTrader(position=None, orders=[order], fills=[])
+                execution.log = None
+                runtime = TraderRuntime(
+                    trader_id="camatron_tsla",
+                    symbol="TSLA",
+                    mode="live",
+                    credential_profile=None,
+                    feed="sip",
+                    enabled=True,
+                    execution_enabled=True,
+                    max_position_notional=2500,
+                    max_daily_loss=0,
+                    engine=engine,
+                    execution=execution,
+                    log=MemoryLog(),
+                )
+
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    with self.assertRaises(BrokerEngineStateMismatch):
+                        reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+                self.assertIsNotNone(engine.position)
+
     def test_behavior_profile_block_reason_checks_generated_profile_caps(self):
         reason = behavior_profile_block_reason(
             {
@@ -1242,36 +4037,90 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
         self.assertEqual(list(grouped), [("alpaca", "camatron", "live", "sip")])
         self.assertEqual(len(grouped[("alpaca", "camatron", "live", "sip")]), 2)
 
-    def test_megatron_config_is_disabled_qty_one_and_archive_tailed(self):
-        config = json.loads(Path("configs/accounts/megatron.live.json").read_text(encoding="utf-8"))
-        by_symbol = {trader["symbol"]: trader for trader in config["traders"]}
+    def test_camatron_config_is_single_tsla_tp_sl_kernel(self):
+        config = json.loads(Path("configs/traders.live.example.json").read_text(encoding="utf-8"))
+        validate_single_strategy_kernel_config(config, config_path="configs/traders.live.example.json")
+        active = [
+            trader
+            for trader in config["traders"]
+            if trader.get("enabled") and trader.get("execution_enabled")
+        ]
 
-        self.assertEqual(set(by_symbol), {"NVDA", "TSLA"})
-        for symbol, expected_candidate in {
-            "NVDA": "cand_5ec9dc51a344ca30117b545a",
-            "TSLA": "cand_729d38dc283ac03c8f171939",
-        }.items():
-            trader = by_symbol[symbol]
+        self.assertEqual(len(active), 1)
+        trader = active[0]
+        strategy = build_strategy_config(trader)
+        self.assertEqual(trader["id"], "camatron_tsla_1s_renko_0p42_e2_tp1_sl3_qty1_20260917_live")
+        self.assertEqual(trader["symbol"], "TSLA")
+        self.assertEqual(trader["account_namespace"], "camatron")
+        self.assertEqual(trader["data"]["market_data_source"], "shared_canonical_stream")
+        self.assertEqual(trader["data"]["feed"], "sip")
+        self.assertEqual(trader["data"]["renko_source"], "1s_close")
+        self.assertEqual(strategy.strategy_type, "renko_tp_sl")
+        self.assertEqual(strategy.qty, 1)
+        self.assertEqual(strategy.exit_management, "bracket")
+        self.assertEqual(strategy.take_profit_bricks, 1)
+        self.assertEqual(strategy.stop_loss_bricks, 3)
+
+    def test_single_strategy_kernel_validator_rejects_extra_active_renko_trader(self):
+        config = json.loads(Path("configs/traders.live.example.json").read_text(encoding="utf-8"))
+        for trader in config["traders"]:
+            if trader["id"] == "camatron_aapl_1s_renko_0p10_e2_tp3_sl3_qty1_20260904_live":
+                trader["enabled"] = True
+                trader["execution_enabled"] = True
+
+        with self.assertRaisesRegex(TraderConfigError, "exactly one active execution trader"):
+            validate_single_strategy_kernel_config(config)
+
+    def test_single_strategy_kernel_validator_rejects_reversal_or_megatron_authority(self):
+        config = json.loads(Path("configs/traders.live.example.json").read_text(encoding="utf-8"))
+        active = next(trader for trader in config["traders"] if trader.get("enabled") and trader.get("execution_enabled"))
+        active["account_namespace"] = "megatron"
+        active["credential_profile"] = "megatron"
+        active["strategy"]["type"] = "renko_reversal"
+
+        with self.assertRaisesRegex(TraderConfigError, "single-strategy kernel violation"):
+            validate_single_strategy_kernel_config(config)
+
+    def test_megatron_config_preserved_but_has_no_active_renko_execution(self):
+        config = json.loads(Path("configs/accounts/megatron.live.json").read_text(encoding="utf-8"))
+        active = [trader for trader in config["traders"] if trader.get("enabled") or trader.get("execution_enabled")]
+        preserved_reversal = [
+            trader
+            for trader in config["traders"]
+            if trader.get("strategy", {}).get("type") == "renko_reversal"
+        ]
+
+        self.assertEqual(active, [])
+        self.assertEqual({trader["symbol"] for trader in preserved_reversal}, {"AAPL", "NVDA", "TSLA"})
+        for trader in preserved_reversal:
             strategy = build_strategy_config(trader)
             self.assertFalse(trader["enabled"])
             self.assertFalse(trader["execution_enabled"])
             self.assertEqual(trader["credential_profile"], "megatron")
             self.assertEqual(trader["account_namespace"], "megatron")
             self.assertEqual(trader["expected_account_id"], "71d38ca0-82d3-44a8-b79f-d48f72211c6c")
-            self.assertEqual(trader["data"]["market_data_source"], "local_archive_tail")
+            self.assertEqual(trader["data"]["market_data_source"], "shared_canonical_stream")
             self.assertIsNone(trader["data"]["market_data_profile"])
-            self.assertEqual(trader["profile"]["candidate_id"], expected_candidate)
+            self.assertEqual(trader["data"]["feed"], "sip")
+            self.assertEqual(trader["data"]["renko_source"], "1s_close")
+            self.assertEqual(strategy.strategy_type, "renko_reversal")
             self.assertEqual(strategy.qty, 1)
+            self.assertEqual(strategy.entry_bricks, 1)
+            self.assertEqual(strategy.take_profit_bricks, None)
+            self.assertEqual(strategy.stop_loss_bricks, None)
+            self.assertEqual(strategy.exit_management, "catastrophic_stop")
+            self.assertEqual(strategy.catastrophic_stop_bricks, 3)
             self.assertTrue(strategy.allow_short)
-            self.assertNotEqual(trader["profile"]["research_backtest_qty"], strategy.qty)
+            self.assertTrue(strategy.allow_overnight)
 
         service = Path("trading-fleet-megatron-live.service").read_text(encoding="utf-8")
         self.assertIn("--config /root/trading-server/configs/accounts/megatron.live.json", service)
-        self.assertIn("--market-data-source local_archive_tail", service)
-        self.assertIn("--market-archive-root /root/trading-server/artifacts/live", service)
+        self.assertIn("--market-data-source shared_canonical_stream", service)
+        self.assertIn("--shared-market-data-config /root/trading-server/configs/market-data.live.example.json", service)
         self.assertIn("--archive-root /root/trading-server/artifacts/live/megatron", service)
+        self.assertNotIn("--market-archive-root /root/trading-server/artifacts/live", service)
+        self.assertNotIn("--evidence-enabled", service)
         self.assertNotIn("--data-credential-profile", service)
-        self.assertNotIn("--market-data-profile megatron", service)
 
     def test_market_archive_root_can_be_separate_from_runtime_archive_root(self):
         class Args:
@@ -1282,6 +4131,59 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
             market_archive_root(Args()),
             Path("/root/trading-server/artifacts/live"),
         )
+
+    def test_shared_canonical_duplicate_after_checkpoint_is_not_processed_again(self):
+        class Args:
+            log_ticks = False
+
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="shared_aapl",
+                symbol="AAPL",
+                brick_size=1.0,
+                entry_bricks=1,
+                strategy_type="renko_reversal",
+                qty=1,
+                strategy_name="shared_aapl",
+            )
+        )
+        runtime = TraderRuntime(
+            trader_id="shared_aapl",
+            symbol="AAPL",
+            mode="live",
+            credential_profile="camatron",
+            feed="sip",
+            enabled=True,
+            execution_enabled=False,
+            max_position_notional=1000,
+            max_daily_loss=0,
+            engine=engine,
+            execution=RecordingExecution(),
+            log=MemoryLog(),
+            account_namespace="camatron",
+            market_data_source="shared_canonical_stream",
+            market_data_profile=None,
+        )
+        tick = MarketTick(
+            timestamp=pd.Timestamp("2026-08-21T14:00:00Z"),
+            symbol="AAPL",
+            price=100.0,
+            size=1,
+            trade_id="canonical-event-1",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            process_market_tick_for_runtime(root=root, args=Args(), runtime=runtime, tick=tick)
+            snapshot = json.loads((root / "state" / "shared_aapl.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                snapshot["canonical_market_checkpoints"]["processed_event_ids"]["AAPL"],
+                "canonical-event-1",
+            )
+            process_market_tick_for_runtime(root=root, args=Args(), runtime=runtime, tick=tick)
+
+        event_types = [event_type for event_type, _payload in runtime.log.events]
+        self.assertIn("duplicate_shared_canonical_event_skipped", event_types)
 
     def test_alpaca_market_event_identity_is_stable_and_archived(self):
         message = {
@@ -1413,6 +4315,7 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
             account_namespace="camatron",
             market_data_source="alpaca",
             market_data_profile="camatron",
+            market_adapter=CanonicalMarketObservationAdapter(run_id="camatron_nvda"),
         )
         megatron = TraderRuntime(
             trader_id="megatron_nvda",
@@ -1430,6 +4333,7 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
             account_namespace="megatron",
             market_data_source="local_archive_tail",
             market_data_profile=None,
+            market_adapter=CanonicalMarketObservationAdapter(run_id="megatron_nvda"),
         )
         first = live_market_event_from_archive_payload(
             {
@@ -1457,9 +4361,22 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
             },
             source_sequence=2,
         )
+        third = live_market_event_from_archive_payload(
+            {
+                "timestamp": "2026-08-07T13:30:02.001Z",
+                "symbol": "NVDA",
+                "price": 102.0,
+                "size": 100,
+                "exchange": "V",
+                "trade_id": "sip-trade-3",
+                "tape": "C",
+                "conditions": ["@"],
+            },
+            source_sequence=3,
+        )
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            for event in (first, second):
+            for event in (first, second, third):
                 for runtime in (camatron, megatron):
                     process_market_tick_for_runtime(
                         root=Path(temp_dir),
@@ -1471,8 +4388,8 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
 
         camatron_market = [payload for event_type, payload in camatron_log.events if event_type == "market_tick"]
         megatron_market = [payload for event_type, payload in megatron_log.events if event_type == "market_tick"]
-        self.assertEqual(camatron_market[-1]["source_record_id"], second.source_record_id)
-        self.assertEqual(megatron_market[-1]["source_record_id"], second.source_record_id)
+        self.assertEqual(camatron_market[-1]["source_record_id"], third.source_record_id)
+        self.assertEqual(megatron_market[-1]["source_record_id"], third.source_record_id)
         self.assertEqual(len(camatron_engine.renko_state.bricks), 1)
         self.assertEqual(len(megatron_engine.renko_state.bricks), 2)
         self.assertIsNot(camatron_engine.renko_state, megatron_engine.renko_state)
@@ -1531,6 +4448,7 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
             account_namespace="camatron",
             market_data_source="alpaca",
             market_data_profile="camatron",
+            market_adapter=CanonicalMarketObservationAdapter(run_id="camatron_nvda"),
         )
         megatron = TraderRuntime(
             trader_id="megatron_nvda",
@@ -1548,12 +4466,15 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
             account_namespace="megatron",
             market_data_source="local_archive_tail",
             market_data_profile=None,
+            market_adapter=CanonicalMarketObservationAdapter(run_id="megatron_nvda"),
         )
-        tick = MarketTick(pd.Timestamp("2026-08-07T13:30:00.001Z"), "NVDA", 100.0, 100, trade_id="sip-trade-1")
+        first_tick = MarketTick(pd.Timestamp("2026-08-07T13:30:00.001Z"), "NVDA", 100.0, 100, trade_id="sip-trade-1")
+        second_tick = MarketTick(pd.Timestamp("2026-08-07T13:30:01.001Z"), "NVDA", 101.0, 100, trade_id="sip-trade-2")
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            process_market_tick_for_runtime(root=Path(temp_dir), args=Args(), runtime=megatron, tick=tick)
-            process_market_tick_for_runtime(root=Path(temp_dir), args=Args(), runtime=camatron, tick=tick)
+            for tick in (first_tick, second_tick):
+                process_market_tick_for_runtime(root=Path(temp_dir), args=Args(), runtime=megatron, tick=tick)
+                process_market_tick_for_runtime(root=Path(temp_dir), args=Args(), runtime=camatron, tick=tick)
 
         self.assertFalse(megatron.enabled)
         self.assertTrue(camatron.enabled)
@@ -1618,6 +4539,83 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
         self.assertIn("2026-06-08", engine.trade_state_snapshot()["force_flat_dates"])
         self.assertIn("broker_force_flat", [event_type for event_type, _payload in log.events])
         self.assertIn("signal", [event_type for event_type, _payload in log.events])
+
+    def test_broker_force_flat_runs_for_locked_tp_sl_lifecycle_states(self):
+        for lifecycle_state in [
+            TP_SL_LIFECYCLE_PROTECTED,
+            TP_SL_LIFECYCLE_ENTRY_FILLED_AWAITING_PROTECTION,
+            TP_SL_LIFECYCLE_PROTECTION_FAILED,
+        ]:
+            with self.subTest(lifecycle_state=lifecycle_state):
+                _BROKER_FORCE_FLAT_DATES.clear()
+                engine = RenkoStrategyEngine(
+                    RenkoStrategyConfig(
+                        trader_id=f"tp_sl_force_flat_{lifecycle_state.lower()}",
+                        symbol="TSLA",
+                        brick_size=1.0,
+                        entry_bricks=1,
+                        take_profit_bricks=1,
+                        stop_loss_bricks=1,
+                        qty=1,
+                        exit_management="bracket",
+                        candidate_config_fingerprint="config-tsla",
+                        market_contract_fingerprint="market-tsla",
+                        force_flat="15:59:30",
+                        timezone="America/New_York",
+                        allow_overnight=False,
+                    )
+                )
+                engine.position = PositionState(
+                    symbol="TSLA",
+                    side="short",
+                    entry_time=pd.Timestamp("2026-06-08T19:26:16Z"),
+                    entry_price=380.175,
+                    qty=1,
+                )
+                engine.tp_sl_lifecycle_state = lifecycle_state
+                engine.protection_state = {"state": lifecycle_state, "stop_loss_order_id": "sl-1"}
+                execution = RecordingExecution()
+                log = MemoryLog()
+                runtime = TraderRuntime(
+                    trader_id=engine.config.trader_id,
+                    symbol="TSLA",
+                    mode="live",
+                    credential_profile=None,
+                    feed="sip",
+                    enabled=True,
+                    execution_enabled=True,
+                    max_position_notional=1000,
+                    max_daily_loss=0,
+                    engine=engine,
+                    execution=execution,
+                    log=log,
+                )
+
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    did_force_flat = broker_force_flat_if_due(
+                        Path(temp_dir),
+                        runtime,
+                        pd.Timestamp("2026-06-08T19:59:30Z"),
+                        price=377.3,
+                        source="test",
+                    )
+                    did_repeat = broker_force_flat_if_due(
+                        Path(temp_dir),
+                        runtime,
+                        pd.Timestamp("2026-06-08T19:59:31Z"),
+                        price=377.2,
+                        source="test",
+                    )
+
+                self.assertTrue(did_force_flat)
+                self.assertFalse(did_repeat)
+                self.assertEqual(len(execution.intents), 1)
+                intent = execution.intents[0]
+                self.assertTrue(intent.close_position)
+                self.assertEqual(intent.side, "buy")
+                self.assertEqual(intent.reason, "session_force_flat")
+                self.assertEqual(engine.tp_sl_lifecycle_state, TP_SL_LIFECYCLE_CLOSE_SUBMITTED)
+                self.assertIn("broker_force_flat", [event_type for event_type, _payload in log.events])
 
     def test_handle_action_reject_status_is_not_accepted(self):
         engine = RenkoStrategyEngine(
@@ -1867,6 +4865,80 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
         self.assertIsNone(engine.position)
         self.assertEqual(engine.tp_sl_lifecycle_state, TP_SL_LIFECYCLE_FLAT)
         self.assertEqual(engine.last_closed_exit["reason"], "take_profit_1_bricks")
+        self.assertEqual(log.events[0][0], "state_reconciled")
+        self.assertEqual(log.events[0][1]["reason"], "broker_flat_tp_sl_close_confirmed")
+
+    def test_reconcile_marks_tp_sl_flat_after_stop_loss_broker_flat_confirmation(self):
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="tp_sl_sl_fill_test",
+                symbol="TSLA",
+                brick_size=1.0,
+                entry_bricks=1,
+                take_profit_bricks=1,
+                stop_loss_bricks=1,
+                qty=10,
+            )
+        )
+        engine.position = PositionState(
+            symbol="TSLA",
+            side="long",
+            entry_time=pd.Timestamp("2026-07-01T14:00:00Z"),
+            entry_price=100.0,
+            qty=10,
+        )
+        signal = Signal(
+            signal_id="sl-signal",
+            signal_type="exit",
+            timestamp=pd.Timestamp("2026-07-01T14:00:01Z"),
+            symbol="TSLA",
+            side="long",
+            broker_side="sell",
+            price=99.0,
+            reason="stop_loss_1_bricks",
+            strategy="unit",
+            trader_id="tp_sl_sl_fill_test",
+        )
+        intent = OrderIntent(
+            client_order_id="sl-order",
+            timestamp=signal.timestamp,
+            symbol="TSLA",
+            side="sell",
+            signal_type="exit",
+            order_type="market",
+            strategy="unit",
+            reason="stop_loss_1_bricks",
+            target_qty=0,
+            close_position=True,
+            trader_id="tp_sl_sl_fill_test",
+        )
+        engine._mark_tp_sl_exit_pending(signal, intent)
+        engine.mark_close_submitted(intent, response={"id": "alpaca-close-sl-1"})
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader = FakeMigrationTrader(position=None)
+        execution.log = None
+        log = MemoryLog()
+        runtime = TraderRuntime(
+            trader_id="tp_sl_sl_fill_test",
+            symbol="TSLA",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=1000,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=log,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertIsNone(engine.position)
+        self.assertEqual(engine.tp_sl_lifecycle_state, TP_SL_LIFECYCLE_FLAT)
+        self.assertEqual(engine.last_closed_exit["reason"], "stop_loss_1_bricks")
         self.assertEqual(log.events[0][0], "state_reconciled")
         self.assertEqual(log.events[0][1]["reason"], "broker_flat_tp_sl_close_confirmed")
 

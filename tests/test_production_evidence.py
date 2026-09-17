@@ -11,20 +11,20 @@ from pathlib import Path
 import pandas as pd
 
 from fleet_runner import (
-    _PENDING_1S_CLOSE_TICKS,
     TraderRuntime,
     build_evidence_logger,
     build_shadow_sampler,
     production_sampler_checkpoint,
     record_evidence_checkpoint,
     record_shadow_for_eligible_tick,
-    renko_source_ticks,
     safe_evidence_call,
+    source_observations_for_runtime,
 )
 import silver.evidence.logger as evidence_logger_module
 from silver.evidence.logger import EvidenceLogger, EvidenceLoggerSettings
 from silver.evidence.models import EVIDENCE_SCHEMA_VERSION, EvidenceCheckpoint
 from silver.evidence.shadow_sampler import EvidenceShadowSampler, ShadowSamplerSettings, source_record_id_for_tick
+from silver.market import CanonicalMarketObservationAdapter
 from trading_events import MarketTick, OrderIntent, RenkoBrick, Signal
 
 
@@ -94,6 +94,7 @@ class ProductionEvidenceLoggerTests(unittest.TestCase):
             execution=object(),
             log=object(),
             renko_source=renko_source,
+            market_adapter=CanonicalMarketObservationAdapter(run_id="production-evidence-test"),
             evidence=evidence,
             shadow_sampler=shadow_sampler,
         )
@@ -467,8 +468,7 @@ class ProductionEvidenceLoggerTests(unittest.TestCase):
         self.assertEqual(runtime.engine.on_tick_calls, 0)
         self.assertEqual(shadow.counters.trades_processed, 1)
 
-    def test_production_sampler_remains_authoritative_and_shadow_cannot_replace_source_ticks(self) -> None:
-        _PENDING_1S_CLOSE_TICKS.clear()
+    def test_production_adapter_remains_authoritative_and_shadow_cannot_replace_observations(self) -> None:
         evidence = self.logger()
         shadow = EvidenceShadowSampler(ShadowSamplerSettings(enabled=True, session_id="session-a", process_id="process-a"))
         runtime = self.runtime(evidence=evidence, shadow_sampler=shadow)
@@ -476,12 +476,12 @@ class ProductionEvidenceLoggerTests(unittest.TestCase):
         second = self.tick("2026-07-10T14:20:01.100Z", 101, "t1")
 
         record_shadow_for_eligible_tick(runtime, first)
-        self.assertEqual(renko_source_ticks(runtime, first), [])
+        self.assertEqual(source_observations_for_runtime(runtime, first, None), ())
         record_shadow_for_eligible_tick(runtime, second)
-        production = renko_source_ticks(runtime, second)
+        production = source_observations_for_runtime(runtime, second, None)
 
         self.assertEqual(len(production), 1)
-        self.assertEqual(production[0].price, 100)
+        self.assertEqual(production[0][0].price, 100)
 
     def test_shadow_state_is_isolated_by_session_trader_and_symbol(self) -> None:
         first = EvidenceShadowSampler(ShadowSamplerSettings(enabled=True, session_id="s1", process_id="p"))
@@ -647,25 +647,25 @@ class ProductionEvidenceLoggerTests(unittest.TestCase):
             production_failure()
 
     def test_checkpoint_contains_shadow_and_production_sampler_state(self) -> None:
-        _PENDING_1S_CLOSE_TICKS.clear()
         evidence = self.logger()
         shadow = EvidenceShadowSampler(ShadowSamplerSettings(enabled=True, session_id="session-a", process_id="process-a"))
         runtime = self.runtime(evidence=evidence, shadow_sampler=shadow)
         tick = self.tick("2026-07-10T14:20:00.100Z", 100, "t0")
         record_shadow_for_eligible_tick(runtime, tick)
-        renko_source_ticks(runtime, tick)
+        source_observations_for_runtime(runtime, tick, None)
 
         record_evidence_checkpoint(runtime, reason="test", checkpoint_timestamp="2026-07-10T14:20:00Z")
 
         checkpoint = [row for row in self.read_rows() if row["evidence_type"] == "state_checkpoint"][0]
         self.assertIn("production_sampler_state", checkpoint["payload"])
         self.assertIn("shadow_sampler_state", checkpoint["payload"])
-        self.assertIn("source_record_id", checkpoint["payload"]["production_sampler_state"]["unknown_fields"])
+        self.assertEqual(checkpoint["payload"]["production_sampler_state"]["unknown_fields"], [])
         self.assertEqual(checkpoint["payload"]["shadow_sampler_state"]["seen_source_id_capacity"], 100000)
         self.assertEqual(checkpoint["payload"]["shadow_sampler_state"]["seen_source_id_count"], 1)
 
     def test_production_pending_state_unknown_when_inaccessible(self) -> None:
         runtime = self.runtime(renko_source="ticks")
+        object.__setattr__(runtime, "market_adapter", None)
 
         state = production_sampler_checkpoint(runtime)
 

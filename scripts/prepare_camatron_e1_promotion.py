@@ -17,6 +17,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from shared.config.trader_config import audit_renko_brick_config, build_strategy_config, load_production_renko_config, production_metadata
+from silver.market import contract_snapshot
 
 
 POLICY = "RESET_RENKO_ON_BRICK_CHANGE_PRESERVE_POSITION_V1"
@@ -143,6 +144,11 @@ def apply_approved_targets(config_path: Path, current: dict[str, Any]) -> tuple[
                 "new_entry_bricks": new_config.entry_bricks,
                 "old_per_trader_hash": old_loaded.config_hash,
                 "new_per_trader_hash": proposed_per_trader_hash(config_path, trader),
+                "target_contract_fingerprints": contract_snapshot(
+                    symbol=target.symbol,
+                    strategy_config=new_config,
+                    session_timezone=new_config.timezone,
+                ),
                 "intended_first_reversal_quantity": target.expected_initial_quantity + target.quantity,
                 "intended_resulting_position": {"side": "short", "quantity": target.quantity},
             }

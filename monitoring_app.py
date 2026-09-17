@@ -14,6 +14,8 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from alpaca_trader import AlpacaTrader, load_alpaca_credentials
 from mission_control_telemetry import (
+    BrokerSnapshotBackgroundCollector,
+    BrokerSnapshotCache,
     MissionControlTelemetryCollector,
     TelemetryConfig,
     render_emergency_metrics,
@@ -54,8 +56,37 @@ def default_fleet_config_path() -> Path:
 
 
 @lru_cache(maxsize=1)
+def get_telemetry_config() -> TelemetryConfig:
+    return TelemetryConfig.from_environment()
+
+
+@lru_cache(maxsize=1)
 def get_telemetry_collector() -> MissionControlTelemetryCollector:
-    return MissionControlTelemetryCollector(TelemetryConfig.from_environment())
+    return MissionControlTelemetryCollector(get_telemetry_config())
+
+
+@lru_cache(maxsize=1)
+def get_broker_snapshot_cache() -> BrokerSnapshotCache:
+    return BrokerSnapshotCache()
+
+
+@lru_cache(maxsize=1)
+def get_broker_snapshot_refresher() -> BrokerSnapshotBackgroundCollector:
+    return BrokerSnapshotBackgroundCollector(
+        cache=get_broker_snapshot_cache(),
+        config=get_telemetry_config(),
+        broker_reader_for=get_trader,
+    )
+
+
+@app.on_event("startup")
+async def start_broker_snapshot_refresher() -> None:
+    get_broker_snapshot_refresher().start()
+
+
+@app.on_event("shutdown")
+async def stop_broker_snapshot_refresher() -> None:
+    get_broker_snapshot_refresher().stop()
 
 
 def load_fleet_config(path: Path | None = None) -> dict[str, Any]:
@@ -456,7 +487,15 @@ async def mission_control(
 @app.get("/metrics", response_class=PlainTextResponse)
 async def metrics() -> PlainTextResponse:
     try:
-        body = get_telemetry_collector().collect_prometheus(broker_reader_for=get_trader)
+        config = get_telemetry_config()
+        cache = get_broker_snapshot_cache()
+        body = get_telemetry_collector().collect_prometheus(
+            broker_snapshot_provider=lambda specs, now: cache.read_for_specs(
+                specs,
+                now,
+                stale_after_seconds=config.broker_cache_stale_seconds,
+            )
+        )
     except Exception:
         body = render_emergency_metrics(os.getenv("MISSION_CONTROL_ENVIRONMENT") or "production")
     return PlainTextResponse(

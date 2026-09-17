@@ -19,8 +19,9 @@ from fleet_runner import (
     load_config,
     normalize_renko_source,
 )
-from strategy_engine import RenkoStrategyEngine
-from trading_events import MarketTick, Signal, is_price_forming_trade
+from silver.market import CanonicalMarketObservationAdapter
+from strategy_engine import MeanReversionStrategyConfig, MeanReversionStrategyEngine, RenkoStrategyEngine
+from trading_events import MarketTick, Signal
 
 
 @dataclass(frozen=True)
@@ -143,77 +144,19 @@ def iter_source_ticks(
     dates: Iterable[str],
     renko_source: str,
 ) -> tuple[Iterable[MarketTick], dict[str, int]]:
-    if renko_source == "ticks":
-        stats = {"raw_tick_count": 0, "source_tick_count": 0}
-
-        def raw_ticks() -> Iterable[MarketTick]:
-            for tick in iter_archived_ticks(root, symbol, dates):
-                stats["raw_tick_count"] += 1
-                if is_price_forming_trade(tick):
-                    stats["source_tick_count"] += 1
-                    yield tick
-
-        return raw_ticks(), stats
-
     if renko_source != "1s_close":
         raise RuntimeError(f"Unsupported renko_source: {renko_source}")
 
     stats = {"raw_tick_count": 0, "source_tick_count": 0}
 
     def one_second_closes() -> Iterable[MarketTick]:
-        pending_bucket: str | None = None
-        pending_payload: dict[str, Any] | None = None
-        for archive_date in dates:
-            path = root / "ticks" / archive_date / f"{symbol.upper()}.jsonl"
-            if not path.exists():
-                continue
-            with path.open("r", encoding="utf-8") as handle:
-                for line in handle:
-                    if not line.strip():
-                        continue
-                    payload = json.loads(line)
-                    stats["raw_tick_count"] += 1
-                    tick = MarketTick(
-                        timestamp=utc_timestamp(payload["timestamp"]),
-                        symbol=str(payload["symbol"]).upper(),
-                        price=float(payload["price"]),
-                        size=float(payload.get("size", 0.0) or 0.0),
-                        exchange=str(payload.get("exchange", "")),
-                        trade_id=str(payload.get("trade_id", "")),
-                        tape=str(payload.get("tape", "")),
-                        conditions=tuple(str(item) for item in payload.get("conditions", []) if item is not None),
-                    )
-                    if not is_price_forming_trade(tick):
-                        continue
-                    raw_timestamp = str(payload["timestamp"])
-                    bucket = raw_timestamp[:19]
-                    if pending_bucket is None:
-                        pending_bucket = bucket
-                        pending_payload = payload
-                        continue
-                    if bucket == pending_bucket:
-                        pending_payload = payload
-                        continue
-                    if bucket < pending_bucket:
-                        continue
-                    if pending_payload is not None:
-                        tick = MarketTick(
-                            timestamp=pd.Timestamp(f"{pending_bucket}+00:00"),
-                            symbol=str(pending_payload["symbol"]).upper(),
-                            price=float(pending_payload["price"]),
-                            size=float(pending_payload.get("size", 0.0) or 0.0),
-                            exchange=str(pending_payload.get("exchange", "")),
-                            trade_id=str(pending_payload.get("trade_id", "")),
-                            tape=str(pending_payload.get("tape", "")),
-                            conditions=tuple(
-                                str(item) for item in pending_payload.get("conditions", []) if item is not None
-                            ),
-                        )
-                        if is_price_forming_trade(tick):
-                            stats["source_tick_count"] += 1
-                            yield tick
-                    pending_bucket = bucket
-                    pending_payload = payload
+        adapter = CanonicalMarketObservationAdapter(run_id=f"live_signal_parity:{symbol.upper()}")
+        for tick in iter_archived_ticks(root, symbol, dates):
+            stats["raw_tick_count"] += 1
+            result = adapter.process_tick(tick, trader_id=f"live_signal_parity_{symbol.lower()}")
+            for source_tick in adapter.observation_ticks(result):
+                stats["source_tick_count"] += 1
+                yield source_tick
 
     return one_second_closes(), stats
 
@@ -283,7 +226,11 @@ def replay_signals(
     symbol = str(trader["symbol"]).upper()
     data = trader.get("data") if isinstance(trader.get("data"), dict) else {}
     renko_source = normalize_renko_source(data.get("renko_source"))
-    engine = RenkoStrategyEngine(build_strategy_config(trader))
+    strategy_config = build_strategy_config(trader)
+    if isinstance(strategy_config, MeanReversionStrategyConfig):
+        engine = MeanReversionStrategyEngine(strategy_config)
+    else:
+        engine = RenkoStrategyEngine(strategy_config)
 
     dates = archive_dates(archive_root, symbol, start, end_exclusive)
     source_ticks, source_stats = iter_source_ticks(archive_root, symbol, dates, renko_source)

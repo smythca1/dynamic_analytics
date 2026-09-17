@@ -6,6 +6,8 @@ from decimal import Decimal
 from hashlib import sha256
 from typing import Any
 
+from silver.market import market_stream_contract, promotion_contract, renko_strategy_contract
+
 from .models import ReplayConfig
 
 
@@ -16,6 +18,11 @@ def stable_config_hash(config: ReplayConfig) -> str:
 
 
 def replay_fingerprint(*, configuration_hash: str, source_dataset_hash: str, config: ReplayConfig) -> str:
+    market = market_stream_contract(
+        symbol=config.symbol,
+        session_timezone=str(config.strategy_config.get("timezone") or "America/New_York"),
+    )
+    strategy = renko_strategy_contract(config.strategy_config)
     payload = {
         "configuration_hash": configuration_hash,
         "source_dataset_hash": source_dataset_hash,
@@ -24,12 +31,24 @@ def replay_fingerprint(*, configuration_hash: str, source_dataset_hash: str, con
         "renko_version": config.renko_version,
         "accounting_version": config.accounting_version,
         "metrics_version": config.metrics_version,
+        "market_stream_fingerprint": market.fingerprint,
+        "renko_strategy_fingerprint": strategy.fingerprint,
+        "promotion_fingerprint": promotion_contract(
+            market_stream_fingerprint=market.fingerprint,
+            renko_strategy_fingerprint=strategy.fingerprint,
+            source_dataset_hash=source_dataset_hash,
+        ).fingerprint,
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return sha256(raw.encode("utf-8")).hexdigest()
 
 
 def semantic_configuration_payload(config: ReplayConfig) -> dict[str, Any]:
+    market = market_stream_contract(
+        symbol=config.symbol,
+        session_timezone=str(config.strategy_config.get("timezone") or "America/New_York"),
+    )
+    strategy = renko_strategy_contract(config.strategy_config)
     return _jsonable(
         {
             "trader_id": config.trader_id,
@@ -69,6 +88,8 @@ def semantic_configuration_payload(config: ReplayConfig) -> dict[str, Any]:
             "accounting_version": config.accounting_version,
             "metrics_version": config.metrics_version,
             "production_config_hash": config.production_config.get("production_config_hash"),
+            "market_stream_contract": asdict(market),
+            "renko_strategy_contract": asdict(strategy),
         }
     )
 

@@ -1,0 +1,11 @@
+[Unit]
+Description=Timer for post-fix shared SIP active-session validation on 2026-08-27
+
+[Timer]
+OnCalendar=Thu 2026-08-27 13:20:00 UTC
+Unit=post-fix-shared-sip-validation-20260825.service
+Persistent=false
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

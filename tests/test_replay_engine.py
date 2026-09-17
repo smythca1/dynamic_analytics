@@ -9,6 +9,7 @@ from pathlib import Path
 import pandas as pd
 
 from replay.bronze import build_bronze_metadata, write_bronze_metadata
+from replay.artifact_serialization import artifact_json_dumps, artifact_payload_sha256
 from replay.config_hash import replay_fingerprint, stable_config_hash
 from replay.engine import run_replay
 from replay.execution import NextObservationExecution
@@ -16,7 +17,9 @@ from replay.historical_source import read_historical_source
 from replay.models import ReplayConfig
 from replay.parity import compare_logic_parity
 from replay.production_config import load_production_renko_config
+from replay.stop_election import evaluate_stop_election
 from replay.start_state import load_replay_start_state
+from exit_plan import build_renko_tp_sl_exit_plan
 from shared.config.trader_config import (
     TraderConfigError,
     audit_renko_brick_config,
@@ -26,7 +29,7 @@ from silver.accounting import PositionState
 from silver.market import CanonicalObservation
 from silver.market import CanonicalOneSecondSipSampler
 from strategy_engine import RenkoStrategyConfig, RenkoStrategyEngine
-from trading_events import OrderIntent, Signal
+from trading_events import MarketTick, OrderIntent, Signal
 
 
 def write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -152,6 +155,34 @@ class ReplayEngineTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
+
+    def test_artifact_serialization_preserves_decimal_precision_and_checksum(self) -> None:
+        payload = {
+            "price": Decimal("293.3400"),
+            "small": Decimal("0.0000100"),
+            "whole": Decimal("1000.000"),
+            "nested": {"negative_zero": Decimal("-0.000")},
+        }
+
+        first = artifact_json_dumps(payload, indent=None)
+        second = artifact_json_dumps(payload, indent=None)
+
+        self.assertEqual(first, second)
+        self.assertIn('"price":"293.34"', first)
+        self.assertIn('"small":"0.00001"', first)
+        self.assertIn('"whole":"1000"', first)
+        self.assertIn('"negative_zero":"0"', first)
+        self.assertEqual(
+            artifact_payload_sha256(payload),
+            artifact_payload_sha256(
+                {
+                    "nested": {"negative_zero": Decimal("0")},
+                    "price": Decimal("293.34"),
+                    "small": Decimal("0.000010"),
+                    "whole": Decimal("1E+3"),
+                }
+            ),
+        )
 
     def source(self, rows: list[dict]) -> Path:
         path = self.root / "source.jsonl"
@@ -657,6 +688,459 @@ class ReplayEngineTests(unittest.TestCase):
         position = PositionState(symbol="TSLA", side="long", qty=Decimal("3"), avg_entry_price=Decimal("100"))
         execution.queue(signal=sig, intent=intent, observation=obs, position=position)
         self.assertEqual(execution.fill_pending(observation=obs, position=position), tuple())
+
+    def test_bracket_exit_plan_replay_activates_protection_and_tp_child_fill(self) -> None:
+        execution = NextObservationExecution(run_id="bracket-tp", trader_id="replay_trader")
+        plan = build_renko_tp_sl_exit_plan(
+            trader_id="replay_trader",
+            strategy_id="tsla_tp_sl",
+            symbol="TSLA",
+            entry_side="buy",
+            quantity=4,
+            entry_reference_type="signal_price",
+            entry_reference_price="100",
+            brick_size="1",
+            take_profit_bricks=2,
+            stop_loss_bricks=1,
+            time_in_force="day",
+            order_class="bracket",
+            client_order_id="entry-bracket",
+            candidate_config_fingerprint="config-tsla",
+            market_contract_fingerprint="market-tsla",
+        ).to_dict()
+        signal = Signal(
+            signal_id="entry-signal",
+            signal_type="entry",
+            timestamp=pd.Timestamp("2026-07-20T13:31:00Z"),
+            symbol="TSLA",
+            side="long",
+            broker_side="buy",
+            price=100,
+            reason="renko_run_1_long",
+            strategy="tsla_tp_sl",
+            trader_id="replay_trader",
+        )
+        intent = OrderIntent(
+            client_order_id="entry-bracket",
+            timestamp=signal.timestamp,
+            symbol="TSLA",
+            side="buy",
+            signal_type="entry",
+            order_type="market",
+            strategy="tsla_tp_sl",
+            reason="renko_run_1_long",
+            qty=4,
+            exit_management="bracket",
+            take_profit_limit_price=102,
+            stop_loss_stop_price=99,
+            exit_plan=plan,
+            trader_id="replay_trader",
+        )
+        execution.queue(
+            signal=signal,
+            intent=intent,
+            observation=observation("2026-07-20T13:31:00Z", "100"),
+            position=PositionState.flat("TSLA"),
+        )
+
+        entry_bundles = execution.fill_pending(
+            observation=observation("2026-07-20T13:31:01Z", "100", 2),
+            position=PositionState.flat("TSLA"),
+        )
+
+        self.assertEqual(entry_bundles[0].fills[0].leg, "open")
+        self.assertEqual(execution.active_protections[0].take_profit_price, Decimal("102.00"))
+        self.assertEqual([event["state"] for event in execution.protection_events], ["BRACKET_SUBMITTED", "PROTECTED"])
+
+        open_position = PositionState(symbol="TSLA", side="long", qty=Decimal("4"), avg_entry_price=Decimal("100"))
+        exit_bundles = execution.fill_pending(
+            observation=observation("2026-07-20T13:31:02Z", "102", 3),
+            position=open_position,
+        )
+
+        fill = exit_bundles[0].fills[0]
+        self.assertEqual(fill.side, "sell")
+        self.assertEqual(fill.leg, "close")
+        self.assertEqual(fill.qty, Decimal("4"))
+        self.assertEqual(fill.reason, "take_profit_broker_native")
+        self.assertEqual(execution.active_protections, tuple())
+        self.assertEqual(execution.protection_events[-1]["sibling_cancelled"], True)
+
+    def test_reversal_catastrophic_stop_replay_activates_and_raw_trade_triggers(self) -> None:
+        execution = NextObservationExecution(run_id="reversal-cat-stop", trader_id="camatron_aapl")
+        signal = Signal(
+            signal_id="entry-signal",
+            signal_type="entry",
+            timestamp=pd.Timestamp("2026-08-24T13:31:00Z"),
+            symbol="AAPL",
+            side="long",
+            broker_side="buy",
+            price=300,
+            reason="long_entry_e1",
+            strategy="aapl_reversal",
+            trader_id="camatron_aapl",
+        )
+        intent = OrderIntent(
+            client_order_id="aapl-entry-1",
+            timestamp=signal.timestamp,
+            symbol="AAPL",
+            side="buy",
+            signal_type="entry",
+            order_type="market",
+            strategy="aapl_reversal",
+            reason="long_entry_e1",
+            qty=1,
+            exit_management="catastrophic_stop",
+            close_position=False,
+            trader_id="camatron_aapl",
+            brick_size=2.218981,
+            catastrophic_stop_bricks=3,
+            protection_type="reversal_catastrophic_stop",
+            candidate_config_fingerprint="config-aapl",
+            market_contract_fingerprint="market-aapl",
+        )
+        execution.queue(
+            signal=signal,
+            intent=intent,
+            observation=observation("2026-08-24T13:31:00Z", "300"),
+            position=PositionState.flat("AAPL"),
+        )
+        execution.fill_pending(
+            observation=observation("2026-08-24T13:31:01Z", "300", 2),
+            position=PositionState.flat("AAPL"),
+        )
+
+        protection = execution.active_protections[0]
+        self.assertEqual(protection.protection_type, "reversal_catastrophic_stop")
+        self.assertEqual(protection.stop_loss_price, Decimal("293.34"))
+
+        bundles = execution.fill_active_protections_on_raw_trade(
+            tick=MarketTick(
+                timestamp=pd.Timestamp("2026-08-24T13:31:01.250Z"),
+                symbol="AAPL",
+                price=293.33,
+                size=100,
+                exchange="V",
+                trade_id="raw-stop-1",
+                tape="C",
+                conditions=("@",),
+            ),
+            position=PositionState(symbol="AAPL", side="long", qty=Decimal("1"), avg_entry_price=Decimal("300")),
+        )
+
+        self.assertEqual(bundles[0].fills[0].reason, "reversal_catastrophic_stop_broker_native")
+        self.assertEqual(bundles[0].fills[0].side, "sell")
+        self.assertEqual(execution.active_protections, tuple())
+
+    def test_stop_election_excludes_odd_lot_condition(self) -> None:
+        decision = evaluate_stop_election(
+            symbol="AAPL",
+            timestamp="2026-08-14T18:30:45.001600515Z",
+            price=Decimal("296.1902"),
+            exchange="D",
+            tape="C",
+            trade_id="324308",
+            conditions=("@", "I"),
+            stop_price=Decimal("299.37"),
+            position_side="long",
+        )
+
+        self.assertEqual(decision.final_election_decision, "EXCLUDED_CONDITION")
+        self.assertIn("I:odd_lot_trade", decision.excluded_condition_reason or "")
+
+    def test_stop_election_excludes_sold_out_of_sequence_condition(self) -> None:
+        decision = evaluate_stop_election(
+            symbol="AAPL",
+            timestamp="2026-08-14T18:30:45.001600515Z",
+            price=Decimal("296.1902"),
+            exchange="D",
+            tape="C",
+            trade_id="324308",
+            conditions=("@", "Z"),
+            stop_price=Decimal("299.37"),
+            position_side="long",
+        )
+
+        self.assertEqual(decision.final_election_decision, "EXCLUDED_CONDITION")
+        self.assertIn("Z:sold_out_of_sequence", decision.excluded_condition_reason or "")
+
+    def test_stop_election_excludes_when_any_condition_is_excluded(self) -> None:
+        decision = evaluate_stop_election(
+            symbol="TSLA",
+            timestamp="2026-08-13T16:23:26.560857096Z",
+            price=Decimal("308.85"),
+            exchange="D",
+            tape="C",
+            trade_id="398319",
+            conditions=("@", "I", "Z"),
+            stop_price=Decimal("322.93"),
+            position_side="long",
+        )
+
+        self.assertEqual(decision.final_election_decision, "EXCLUDED_CONDITION")
+        self.assertIn("I:odd_lot_trade", decision.excluded_condition_reason or "")
+        self.assertIn("Z:sold_out_of_sequence", decision.excluded_condition_reason or "")
+
+    def test_stop_election_long_and_short_inside_nbbo_elect(self) -> None:
+        long_decision = evaluate_stop_election(
+            symbol="AAPL",
+            timestamp="2026-08-24T13:31:01Z",
+            price=Decimal("293.34"),
+            exchange="V",
+            tape="C",
+            trade_id="valid-long",
+            conditions=("@",),
+            stop_price=Decimal("293.34"),
+            position_side="long",
+            nbbo={"bid_price": Decimal("293.30"), "ask_price": Decimal("293.40"), "timestamp": "2026-08-24T13:31:01Z"},
+        )
+        short_decision = evaluate_stop_election(
+            symbol="TSLA",
+            timestamp="2026-08-24T13:31:01Z",
+            price=Decimal("353.13"),
+            exchange="V",
+            tape="C",
+            trade_id="valid-short",
+            conditions=("@",),
+            stop_price=Decimal("353.13"),
+            position_side="short",
+            nbbo={"bid_price": Decimal("353.10"), "ask_price": Decimal("353.20"), "timestamp": "2026-08-24T13:31:01Z"},
+        )
+
+        self.assertEqual(long_decision.final_election_decision, "ELECTED")
+        self.assertTrue(long_decision.inside_nbbo)
+        self.assertEqual(short_decision.final_election_decision, "ELECTED")
+        self.assertTrue(short_decision.inside_nbbo)
+
+    def test_stop_election_outside_nbbo_and_missing_nbbo_do_not_pass(self) -> None:
+        outside = evaluate_stop_election(
+            symbol="AAPL",
+            timestamp="2026-08-24T13:31:01Z",
+            price=Decimal("292.00"),
+            exchange="V",
+            tape="C",
+            trade_id="outside-nbbo",
+            conditions=("@",),
+            stop_price=Decimal("293.34"),
+            position_side="long",
+            nbbo={"bid_price": Decimal("293.30"), "ask_price": Decimal("293.40"), "timestamp": "2026-08-24T13:31:01Z"},
+        )
+        missing = evaluate_stop_election(
+            symbol="AAPL",
+            timestamp="2026-08-24T13:31:01Z",
+            price=Decimal("293.34"),
+            exchange="V",
+            tape="C",
+            trade_id="missing-nbbo",
+            conditions=("@",),
+            stop_price=Decimal("293.34"),
+            position_side="long",
+        )
+
+        self.assertEqual(outside.final_election_decision, "OUTSIDE_NBBO")
+        self.assertFalse(outside.inside_nbbo)
+        self.assertEqual(missing.final_election_decision, "MISSING_NBBO")
+        self.assertIsNone(missing.inside_nbbo)
+
+    def test_excluded_crossing_does_not_change_replay_outcome(self) -> None:
+        execution = NextObservationExecution(run_id="excluded-stop-crossing", trader_id="camatron_aapl")
+        signal = Signal(
+            signal_id="entry-signal",
+            signal_type="entry",
+            timestamp=pd.Timestamp("2026-08-24T13:31:00Z"),
+            symbol="AAPL",
+            side="long",
+            broker_side="buy",
+            price=300,
+            reason="long_entry_e1",
+            strategy="aapl_reversal",
+            trader_id="camatron_aapl",
+        )
+        intent = OrderIntent(
+            client_order_id="aapl-entry-1",
+            timestamp=signal.timestamp,
+            symbol="AAPL",
+            side="buy",
+            signal_type="entry",
+            order_type="market",
+            strategy="aapl_reversal",
+            reason="long_entry_e1",
+            qty=1,
+            exit_management="catastrophic_stop",
+            close_position=False,
+            trader_id="camatron_aapl",
+            brick_size=2.218981,
+            catastrophic_stop_bricks=3,
+            protection_type="reversal_catastrophic_stop",
+            candidate_config_fingerprint="config-aapl",
+            market_contract_fingerprint="market-aapl",
+        )
+        execution.queue(signal=signal, intent=intent, observation=observation("2026-08-24T13:31:00Z", "300"), position=PositionState.flat("AAPL"))
+        execution.fill_pending(observation=observation("2026-08-24T13:31:01Z", "300", 2), position=PositionState.flat("AAPL"))
+        decision = evaluate_stop_election(
+            symbol="AAPL",
+            timestamp="2026-08-24T13:31:01.250Z",
+            price=Decimal("293.33"),
+            exchange="V",
+            tape="C",
+            trade_id="odd-lot-cross",
+            conditions=("@", "I"),
+            stop_price=Decimal("293.34"),
+            position_side="long",
+        )
+
+        self.assertEqual(decision.final_election_decision, "EXCLUDED_CONDITION")
+        self.assertEqual(len(execution.active_protections), 1)
+
+    def test_eligible_crossing_can_complete_replay_exit(self) -> None:
+        execution = NextObservationExecution(run_id="eligible-stop-crossing", trader_id="camatron_aapl")
+        signal = Signal(
+            signal_id="entry-signal",
+            signal_type="entry",
+            timestamp=pd.Timestamp("2026-08-24T13:31:00Z"),
+            symbol="AAPL",
+            side="long",
+            broker_side="buy",
+            price=300,
+            reason="long_entry_e1",
+            strategy="aapl_reversal",
+            trader_id="camatron_aapl",
+        )
+        intent = OrderIntent(
+            client_order_id="aapl-entry-1",
+            timestamp=signal.timestamp,
+            symbol="AAPL",
+            side="buy",
+            signal_type="entry",
+            order_type="market",
+            strategy="aapl_reversal",
+            reason="long_entry_e1",
+            qty=1,
+            exit_management="catastrophic_stop",
+            close_position=False,
+            trader_id="camatron_aapl",
+            brick_size=2.218981,
+            catastrophic_stop_bricks=3,
+            protection_type="reversal_catastrophic_stop",
+            candidate_config_fingerprint="config-aapl",
+            market_contract_fingerprint="market-aapl",
+        )
+        execution.queue(signal=signal, intent=intent, observation=observation("2026-08-24T13:31:00Z", "300"), position=PositionState.flat("AAPL"))
+        execution.fill_pending(observation=observation("2026-08-24T13:31:01Z", "300", 2), position=PositionState.flat("AAPL"))
+        decision = evaluate_stop_election(
+            symbol="AAPL",
+            timestamp="2026-08-24T13:31:01.250Z",
+            price=Decimal("293.34"),
+            exchange="V",
+            tape="C",
+            trade_id="eligible-cross",
+            conditions=("@",),
+            stop_price=Decimal("293.34"),
+            position_side="long",
+            nbbo={"bid_price": Decimal("293.30"), "ask_price": Decimal("293.40"), "timestamp": "2026-08-24T13:31:01.250Z"},
+        )
+        bundles = execution.fill_active_protections_on_raw_trade(
+            tick=MarketTick(
+                timestamp=pd.Timestamp(decision.timestamp),
+                symbol="AAPL",
+                price=float(Decimal(decision.price)),
+                size=100,
+                exchange="V",
+                trade_id=decision.trade_id,
+                tape="C",
+                conditions=("@",),
+            ),
+            position=PositionState(symbol="AAPL", side="long", qty=Decimal("1"), avg_entry_price=Decimal("300")),
+        )
+
+        self.assertEqual(decision.final_election_decision, "ELECTED")
+        self.assertEqual(bundles[0].fills[0].reason, "reversal_catastrophic_stop_broker_native")
+        self.assertEqual(execution.active_protections, tuple())
+
+    def test_reversal_catastrophic_stop_replay_cancels_stop_for_normal_reversal_exit(self) -> None:
+        execution = NextObservationExecution(run_id="reversal-cat-stop-normal-exit", trader_id="camatron_tsla")
+        open_signal = Signal(
+            signal_id="entry-signal",
+            signal_type="entry",
+            timestamp=pd.Timestamp("2026-08-24T13:31:00Z"),
+            symbol="TSLA",
+            side="long",
+            broker_side="buy",
+            price=300,
+            reason="long_entry_e1",
+            strategy="tsla_reversal",
+            trader_id="camatron_tsla",
+        )
+        open_intent = OrderIntent(
+            client_order_id="tsla-entry-1",
+            timestamp=open_signal.timestamp,
+            symbol="TSLA",
+            side="buy",
+            signal_type="entry",
+            order_type="market",
+            strategy="tsla_reversal",
+            reason="long_entry_e1",
+            qty=1,
+            exit_management="catastrophic_stop",
+            close_position=False,
+            trader_id="camatron_tsla",
+            brick_size=2.218981,
+            catastrophic_stop_bricks=3,
+            protection_type="reversal_catastrophic_stop",
+            candidate_config_fingerprint="config-aapl",
+            market_contract_fingerprint="market-aapl",
+        )
+        execution.queue(
+            signal=open_signal,
+            intent=open_intent,
+            observation=observation("2026-08-24T13:31:00Z", "300"),
+            position=PositionState.flat("TSLA"),
+        )
+        execution.fill_pending(
+            observation=observation("2026-08-24T13:31:01Z", "300", 2),
+            position=PositionState.flat("TSLA"),
+        )
+        self.assertEqual(len(execution.active_protections), 1)
+
+        close_signal = Signal(
+            signal_id="reverse-signal",
+            signal_type="entry",
+            timestamp=pd.Timestamp("2026-08-24T13:32:00Z"),
+            symbol="TSLA",
+            side="short",
+            broker_side="sell",
+            price=305,
+            reason="short_entry_e1_reversal",
+            strategy="tsla_reversal",
+            trader_id="camatron_tsla",
+        )
+        close_intent = OrderIntent(
+            client_order_id="tsla-reverse-1",
+            timestamp=close_signal.timestamp,
+            symbol="TSLA",
+            side="sell",
+            signal_type="entry",
+            order_type="market",
+            strategy="tsla_reversal",
+            reason="short_entry_e1_reversal",
+            qty=2,
+            close_position=False,
+            trader_id="camatron_tsla",
+        )
+        execution.queue(
+            signal=close_signal,
+            intent=close_intent,
+            observation=observation("2026-08-24T13:32:00Z", "305", 3),
+            position=PositionState(symbol="TSLA", side="long", qty=Decimal("1"), avg_entry_price=Decimal("300")),
+        )
+        bundles = execution.fill_pending(
+            observation=observation("2026-08-24T13:32:01Z", "305", 4),
+            position=PositionState(symbol="TSLA", side="long", qty=Decimal("1"), avg_entry_price=Decimal("300")),
+        )
+
+        self.assertEqual([fill.leg for fill in bundles[0].fills], ["close", "open"])
+        self.assertEqual(execution.active_protections, tuple())
+        self.assertEqual(execution.protection_events[-1]["state"], "CANCELED_FOR_REVERSAL_EXIT")
 
     def test_fills_feed_canonical_accounting(self) -> None:
         result = self.run_signal_replay()

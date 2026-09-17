@@ -6,6 +6,7 @@ import time
 import requests
 from fastapi import HTTPException
 
+from reversal_protection import build_reversal_catastrophic_stop_plan, catastrophic_stop_order_payload
 from silver.execution import authoritative_position_from_alpaca, resolve_close_intent
 from trading_events import OrderIntent
 
@@ -253,21 +254,129 @@ class AlpacaTrader:
             raise HTTPException(status_code=response.status_code, detail=response.text)
         return response.json()
 
-    def get_orders(self, status: str = "open", limit: int = 100) -> list[dict]:
+    def get_orders(self, status: str = "open", limit: int = 100, *, nested: bool = False) -> list[dict]:
         response = self._request(
             "GET",
             "/v2/orders",
-            params={"status": status, "limit": int(limit), "direction": "desc", "nested": "false"},
+            params={"status": status, "limit": int(limit), "direction": "desc", "nested": "true" if nested else "false"},
         )
         if response.status_code >= 300:
             raise HTTPException(status_code=response.status_code, detail=response.text)
         return response.json()
+
+    def get_open_orders_nested(self, limit: int = 500) -> list[dict]:
+        return self.get_orders(status="open", limit=limit, nested=True)
+
+    def get_recent_fills(self, symbol: str | None = None, limit: int = 100) -> list[dict]:
+        response = self._request("GET", "/v2/account/activities/FILL", params={"page_size": int(limit), "direction": "desc"})
+        if response.status_code >= 300:
+            raise HTTPException(status_code=response.status_code, detail=response.text)
+        fills = response.json()
+        if symbol is None:
+            return fills
+        symbol_text = symbol.upper()
+        return [fill for fill in fills if str(fill.get("symbol") or "").upper() == symbol_text]
 
     def get_order(self, order_id: str) -> dict:
         response = self._request("GET", f"/v2/orders/{order_id}")
         if response.status_code >= 300:
             raise HTTPException(status_code=response.status_code, detail=response.text)
         return response.json()
+
+    def get_order_nested(self, order_id: str) -> dict:
+        response = self._request("GET", f"/v2/orders/{order_id}", params={"nested": "true"})
+        if response.status_code >= 300:
+            raise HTTPException(status_code=response.status_code, detail=response.text)
+        return response.json()
+
+    def cancel_order(self, order_id: str) -> dict:
+        response = self._request("DELETE", f"/v2/orders/{order_id}")
+        if response.status_code not in {200, 204, 404}:
+            raise HTTPException(status_code=response.status_code, detail=response.text)
+        return {"id": order_id, "status_code": response.status_code}
+
+    def replace_order(self, order_id: str, patch: dict) -> dict:
+        response = self._request("PATCH", f"/v2/orders/{order_id}", json=patch)
+        if response.status_code >= 300:
+            raise HTTPException(status_code=response.status_code, detail=response.text)
+        return response.json()
+
+    def submit_catastrophic_stop(self, order: dict) -> dict:
+        return self._submit_normalized_order(
+            dict(order),
+            action="catastrophic_stop",
+            reason="reversal_catastrophic_stop",
+            close_position=True,
+        )
+
+    def submit_recovery_oco(self, order: dict) -> dict:
+        return self._submit_normalized_order(
+            dict(order),
+            action="recovery_oco",
+            reason="broker_native_protection_recovery",
+            close_position=True,
+        )
+
+    def submit_emergency_flatten(self, order: dict) -> dict:
+        return self._submit_normalized_order(
+            dict(order),
+            action="emergency_flatten",
+            reason="broker_native_unprotected_position_containment",
+            close_position=True,
+        )
+
+    def submit_reversal_catastrophic_stop(
+        self,
+        *,
+        symbol: str,
+        entry_side: str,
+        brick_size: float,
+        catastrophic_stop_bricks: int,
+        client_order_id: str,
+        entry_order_id: str | None,
+        trader_id: str | None,
+        strategy_id: str,
+        candidate_config_fingerprint: str | None,
+        market_contract_fingerprint: str | None,
+    ) -> dict:
+        position = self._wait_until_entry_position(
+            symbol=symbol,
+            entry_side=entry_side,
+            order_id=entry_order_id,
+        )
+        position_side = str(position.get("side") or "").lower().strip()
+        if position_side not in {"long", "short"}:
+            raise HTTPException(status_code=409, detail=f"Broker position side for {symbol} is unavailable.")
+        qty = abs(self._as_float(position.get("qty") or position.get("qty_available"), "position qty", required=True) or 0.0)
+        avg_entry = self._as_float(position.get("avg_entry_price"), "avg_entry_price", required=True)
+        if qty <= 0 or avg_entry is None or avg_entry <= 0:
+            raise HTTPException(status_code=409, detail=f"Broker position for {symbol} is not ready for catastrophic stop.")
+        plan = build_reversal_catastrophic_stop_plan(
+            trader_id=trader_id or strategy_id,
+            strategy_id=strategy_id,
+            symbol=symbol,
+            entry_side="buy" if position_side == "long" else "sell",
+            quantity=self._format_qty(qty),
+            entry_reference_price=str(avg_entry),
+            brick_size=str(brick_size),
+            catastrophic_stop_bricks=int(catastrophic_stop_bricks),
+            client_order_id=client_order_id,
+            candidate_config_fingerprint=candidate_config_fingerprint,
+            market_contract_fingerprint=market_contract_fingerprint,
+        )
+        order = catastrophic_stop_order_payload(plan)
+        response = self.submit_catastrophic_stop(order)
+        return {
+            "status": "catastrophic stop sent",
+            "broker": "alpaca",
+            "mode": self.credentials.mode,
+            "symbol": symbol,
+            "position_side": position_side,
+            "broker_position": position,
+            "stop_plan": plan,
+            "order": order,
+            "response": response,
+        }
 
     def get_latest_trade(self, symbol: str, feed: str | None = None) -> dict:
         params = {"feed": feed} if feed else None
@@ -291,7 +400,13 @@ class AlpacaTrader:
             raise HTTPException(status_code=502, detail=f"Latest trade price for {symbol.upper()} is unavailable.")
         return price, str(trade.get("t")) if trade.get("t") is not None else None
 
-    def _cancel_open_orders(self, symbol: str, exclude_order_ids: set[str] | None = None) -> list[str]:
+    def _cancel_open_orders(
+        self,
+        symbol: str,
+        exclude_order_ids: set[str] | None = None,
+        *,
+        confirm_terminal: bool = False,
+    ) -> list[str]:
         excluded = exclude_order_ids or set()
         response = self._request(
             "GET",
@@ -316,9 +431,30 @@ class AlpacaTrader:
                 if cancel_response.status_code == 422 and "filled" in cancel_response.text.lower():
                     continue
                 raise HTTPException(status_code=cancel_response.status_code, detail=cancel_response.text)
+            if confirm_terminal and cancel_response.status_code != 404:
+                self._wait_until_order_terminal(str(order_id))
             cancelled_order_ids.append(order_id)
 
         return cancelled_order_ids
+
+    def _wait_until_order_terminal(self, order_id: str, *, timeout_seconds: float = 2.0) -> dict:
+        deadline = time.monotonic() + timeout_seconds
+        terminal = {"canceled", "cancelled", "expired", "filled", "rejected"}
+        last_order: dict | None = None
+        while time.monotonic() <= deadline:
+            order = self.get_order(order_id)
+            last_order = order
+            if str(order.get("status") or "").lower().strip() in terminal:
+                return order
+            time.sleep(0.1)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "order_cancel_not_terminal",
+                "order_id": order_id,
+                "last_status": (last_order or {}).get("status"),
+            },
+        )
 
     def _submit_normalized_order(self, order: dict, action: str, reason: object, close_position: bool) -> dict:
         response = self._request("POST", "/v2/orders", json=order)
@@ -487,6 +623,28 @@ class AlpacaTrader:
             "response": response,
         }
 
+    def _apply_bracket_exit_plan(self, order: dict, data: dict) -> dict:
+        exit_plan = data.get("exit_plan") if isinstance(data.get("exit_plan"), dict) else {}
+        take_profit_limit_price = data.get("take_profit_limit_price") or exit_plan.get("take_profit_limit_price")
+        stop_loss_stop_price = data.get("stop_loss_stop_price") or exit_plan.get("stop_loss_trigger_price")
+        stop_loss_limit_price = data.get("stop_loss_limit_price")
+        if take_profit_limit_price is None or stop_loss_stop_price is None:
+            raise HTTPException(status_code=400, detail="Bracket TP/SL orders require take_profit and stop_loss prices.")
+        if not order.get("qty"):
+            raise HTTPException(status_code=400, detail="Bracket TP/SL orders require explicit qty sizing.")
+        tp = self._as_float(take_profit_limit_price, "take_profit_limit_price", required=True)
+        sl = self._as_float(stop_loss_stop_price, "stop_loss_stop_price", required=True)
+        if tp is None or sl is None or tp <= 0 or sl <= 0:
+            raise HTTPException(status_code=400, detail="Bracket TP/SL prices must be positive.")
+        order["order_class"] = "bracket"
+        order["extended_hours"] = False
+        order["take_profit"] = {"limit_price": self._format_price(tp)}
+        order["stop_loss"] = {"stop_price": self._format_price(sl)}
+        if stop_loss_limit_price is not None:
+            sl_limit = self._as_float(stop_loss_limit_price, "stop_loss_limit_price", required=True)
+            order["stop_loss"]["limit_price"] = self._format_price(sl_limit)
+        return order
+
     def _split_reversal_order_if_needed(
         self,
         *,
@@ -500,6 +658,7 @@ class AlpacaTrader:
         reason: object,
         client_order_id: object,
         reversal_intent: bool,
+        require_protective_stop_terminal_cancel: bool = False,
     ) -> dict | None:
         if qty is None and target_qty is None:
             return None
@@ -515,14 +674,64 @@ class AlpacaTrader:
         if not opposite_position:
             return None
 
+        cancelled_order_ids: list[str] | None = None
         available_qty = abs(
             self._as_float(
-                position.get("qty_available") or position.get("qty"),
+                position.get("qty_available") if position.get("qty_available") is not None else position.get("qty"),
                 "position qty",
                 required=True,
             )
             or 0.0
         )
+        if available_qty <= 0 and require_protective_stop_terminal_cancel:
+            cancelled_order_ids = self._cancel_open_orders(
+                symbol,
+                confirm_terminal=True,
+            )
+            position = self._get_position(symbol)
+            if position is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "protected_reversal_position_changed_after_cancel",
+                        "symbol": symbol,
+                        "reason": str(reason or ""),
+                        "cancelled_order_ids": cancelled_order_ids,
+                    },
+                )
+            position_side = str(position.get("side", "")).lower().strip()
+            opposite_position = (side == "buy" and position_side == "short") or (
+                side == "sell" and position_side == "long"
+            )
+            if not opposite_position:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "protected_reversal_position_side_changed_after_cancel",
+                        "symbol": symbol,
+                        "entry_side": side,
+                        "broker_position": position,
+                        "cancelled_order_ids": cancelled_order_ids,
+                    },
+                )
+            available_qty = abs(
+                self._as_float(
+                    position.get("qty_available") if position.get("qty_available") is not None else position.get("qty"),
+                    "position qty",
+                    required=True,
+                )
+                or 0.0
+            )
+            if available_qty <= 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "protected_reversal_quantity_unavailable_after_cancel",
+                        "symbol": symbol,
+                        "broker_position": position,
+                        "cancelled_order_ids": cancelled_order_ids,
+                    },
+                )
         if available_qty <= 0:
             return None
 
@@ -538,7 +747,11 @@ class AlpacaTrader:
         if opening_qty <= 0:
             return None
 
-        cancelled_order_ids = self._cancel_open_orders(symbol)
+        if cancelled_order_ids is None:
+            cancelled_order_ids = self._cancel_open_orders(
+                symbol,
+                confirm_terminal=require_protective_stop_terminal_cancel,
+            )
         close_order = {
             "symbol": symbol,
             "side": side,
@@ -587,6 +800,7 @@ class AlpacaTrader:
             "broker_position_qty_closed": self._format_qty(available_qty),
             "target_opening_qty": self._format_qty(opening_qty),
             "cancelled_order_ids": cancelled_order_ids,
+            "protective_stop_cancel_confirmed": bool(require_protective_stop_terminal_cancel),
             "close_order": close_order,
             "open_order": open_order,
             "close_response": close_response,
@@ -738,6 +952,10 @@ class AlpacaTrader:
                 reason=reason,
                 client_order_id=client_order_id,
                 reversal_intent=reversal_intent,
+                require_protective_stop_terminal_cancel=(
+                    str(data.get("exit_management") or "").lower().strip() == "catastrophic_stop"
+                    and str(data.get("protection_type") or "").lower().strip() == "reversal_catastrophic_stop"
+                ),
             )
             if split_response is not None:
                 return split_response
@@ -765,6 +983,9 @@ class AlpacaTrader:
 
             if client_order_id:
                 order["client_order_id"] = str(client_order_id)
+
+            if str(data.get("exit_management") or "").lower().strip() == "bracket":
+                order = self._apply_bracket_exit_plan(order, data)
 
         order_response = self._submit_normalized_order(
             order,

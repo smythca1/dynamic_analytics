@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Monday 2026-08-31 Quantity-One Trading Canary Orchestration at 09:15 ET
+
+[Timer]
+OnCalendar=2026-08-31 13:15:00 UTC
+Persistent=false
+Unit=qty1-canary-20260831.service
+
+[Install]
+WantedBy=timers.target

@@ -11,9 +11,8 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from renko_builder import RenkoBuildState, update_renko_build_state
-
-
-PRICE_FORMING_CONDITION_SETS = {frozenset({"@"}), frozenset({"@", "F"})}
+from silver.market import CANONICAL_RENKO_SOURCE, CanonicalMarketObservationAdapter
+from trading_events import MarketTick
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,18 +24,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--brick-size", type=float, required=True)
     parser.add_argument("--anchor-mode", default="grid")
     parser.add_argument("--anchor-price", type=float, default=0.0)
-    parser.add_argument("--renko-source", choices=("ticks", "1s_close"), default="1s_close")
+    parser.add_argument("--renko-source", choices=(CANONICAL_RENKO_SOURCE,), default=CANONICAL_RENKO_SOURCE)
     return parser.parse_args()
 
 
-def is_price_forming(payload: dict[str, Any]) -> bool:
-    conditions = frozenset(str(item) for item in payload.get("conditions", []) if item is not None)
-    if not conditions:
-        return True
-    return conditions in PRICE_FORMING_CONDITION_SETS
-
-
-def iter_price_forming_ticks(root: Path, symbol: str, dates: Iterable[str]) -> Iterable[dict[str, Any]]:
+def iter_archived_ticks(root: Path, symbol: str, dates: Iterable[str]) -> Iterable[dict[str, Any]]:
     for archive_date in dates:
         path = root / "ticks" / archive_date / f"{symbol.upper()}.jsonl"
         if not path.exists():
@@ -46,34 +38,31 @@ def iter_price_forming_ticks(root: Path, symbol: str, dates: Iterable[str]) -> I
                 if not line.strip():
                     continue
                 payload = json.loads(line)
-                if is_price_forming(payload):
-                    yield payload
+                yield payload
 
 
 def iter_source_ticks(root: Path, symbol: str, dates: list[str], renko_source: str) -> Iterable[dict[str, Any]]:
-    if renko_source == "ticks":
-        yield from iter_price_forming_ticks(root, symbol, dates)
-        return
-
-    pending_bucket: str | None = None
-    pending_payload: dict[str, Any] | None = None
-    for payload in iter_price_forming_ticks(root, symbol, dates):
-        bucket = str(payload["timestamp"])[:19]
-        if pending_bucket is None:
-            pending_bucket = bucket
-            pending_payload = payload
-            continue
-        if bucket == pending_bucket:
-            pending_payload = payload
-            continue
-        if bucket < pending_bucket:
-            continue
-        if pending_payload is not None:
-            emitted = dict(pending_payload)
-            emitted["timestamp"] = f"{pending_bucket}+00:00"
+    if renko_source != CANONICAL_RENKO_SOURCE:
+        raise RuntimeError(f"Unsupported noncanonical renko_source: {renko_source}")
+    adapter = CanonicalMarketObservationAdapter(run_id=f"rebuild_renko:{symbol.upper()}")
+    for payload in iter_archived_ticks(root, symbol, dates):
+        tick = MarketTick(
+            timestamp=pd.Timestamp(payload["timestamp"]),
+            symbol=str(payload["symbol"]).upper(),
+            price=float(payload["price"]),
+            size=float(payload.get("size", 0.0) or 0.0),
+            exchange=str(payload.get("exchange", "")),
+            trade_id=str(payload.get("trade_id", "")),
+            tape=str(payload.get("tape", "")),
+            conditions=tuple(str(item) for item in payload.get("conditions", []) if item is not None),
+        )
+        result = adapter.process_tick(tick, trader_id=f"rebuild_renko_{symbol.lower()}")
+        for observation_tick in adapter.observation_ticks(result):
+            emitted = dict(payload)
+            emitted["timestamp"] = observation_tick.timestamp.isoformat()
+            emitted["price"] = observation_tick.price
+            emitted["trade_id"] = observation_tick.trade_id
             yield emitted
-        pending_bucket = bucket
-        pending_payload = payload
 
 
 def main() -> int:

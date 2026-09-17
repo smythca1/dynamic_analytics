@@ -9,7 +9,7 @@ import pandas as pd
 from silver.accounting import AccountingLedger, AccountingSnapshot
 from silver.accounting.models import EquityPoint
 from silver.events.models import CanonicalEvent
-from silver.market import CanonicalOneSecondSipSampler, CanonicalObservation
+from silver.market import CanonicalOneSecondSipSampler, CanonicalObservation, market_stream_contract, promotion_contract, renko_strategy_contract
 from strategy_engine import RenkoStrategyConfig, RenkoStrategyEngine
 from trading_events import MarketTick
 
@@ -251,6 +251,16 @@ def _manifest(config: ReplayConfig, context: ReplayContext, ledgers: ReplayLedge
     warnings = sum(1 for diagnostic in ledgers.diagnostics if diagnostic.severity == "warning")
     errors = sum(1 for diagnostic in ledgers.diagnostics if diagnostic.severity == "error")
     source_integrity = asdict(source.integrity)
+    market_contract = market_stream_contract(
+        symbol=config.symbol,
+        session_timezone=str(config.strategy_config.get("timezone") or "America/New_York"),
+    )
+    strategy_contract = renko_strategy_contract(config.strategy_config)
+    combined_contract = promotion_contract(
+        market_stream_fingerprint=market_contract.fingerprint,
+        renko_strategy_fingerprint=strategy_contract.fingerprint,
+        source_dataset_hash=source.source_hash,
+    )
     force_flat = config.strategy_config.get("force_flat")
     force_flat_status = "NOT_CONFIGURED" if not force_flat else "NOT_MODELED"
     result_quality = _result_quality_classification(config=config, ledgers=ledgers, source=source)
@@ -321,6 +331,11 @@ def _manifest(config: ReplayConfig, context: ReplayContext, ledgers: ReplayLedge
         "source_semantic_mode": config.source_semantic_mode,
         "configuration_hash": context.configuration_hash,
         "replay_fingerprint": context.replay_fingerprint,
+        "contract_fingerprints": {
+            "market_stream": asdict(market_contract),
+            "renko_strategy": asdict(strategy_contract),
+            "promotion": asdict(combined_contract),
+        },
         "git_commit": context.git_commit,
         "sampler_version": config.sampler_version,
         "renko_version": config.renko_version,

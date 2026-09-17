@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime
+from decimal import Decimal
 from hashlib import sha256
+from typing import Any
 
 from silver.events.models import CanonicalEvent
 
@@ -249,6 +252,70 @@ class CanonicalOneSecondSipSampler:
     def state(self, scope_key: tuple[str, str]) -> SamplerState | None:
         return self._states.get(scope_key)
 
+    def snapshot(self, *, scope_key: tuple[str, str]) -> dict[str, Any]:
+        state = self._states.get(scope_key)
+        seen = self._seen_source_ids.get(scope_key, OrderedDict())
+        payload: dict[str, Any] = {
+            "sampler_version": SAMPLER_VERSION,
+            "producer_version": self.producer_version,
+            "run_id": self.run_id,
+            "event_sequence": self._event_sequence,
+            "scope_key": list(scope_key),
+            "max_seen_source_ids": self.max_seen_source_ids,
+            "seen_source_ids": list(seen.keys()),
+            "state": None,
+        }
+        if state is not None:
+            pending_trade = state.pending_trade
+            payload["state"] = {
+                "scope_key": list(state.scope_key),
+                "pending_bucket": state.pending_bucket.isoformat() if state.pending_bucket else None,
+                "pending_trade": _jsonable(asdict(pending_trade)) if pending_trade is not None else None,
+                "last_ordering_key": _ordering_key_payload(state.last_ordering_key),
+                "emitted_sequence": state.emitted_sequence,
+                "seen_source_id_capacity": state.seen_source_id_capacity,
+                "seen_source_id_count": state.seen_source_id_count,
+                "seen_source_id_evictions": state.seen_source_id_evictions,
+            }
+        return payload
+
+    def restore_snapshot(self, payload: dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            raise ValueError("Sampler snapshot must be a mapping.")
+        if payload.get("sampler_version") != SAMPLER_VERSION:
+            raise ValueError("Sampler snapshot version does not match canonical sampler.")
+        scope_raw = payload.get("scope_key")
+        if not isinstance(scope_raw, list) or len(scope_raw) != 2:
+            raise ValueError("Sampler snapshot missing scope_key.")
+        scope_key = (str(scope_raw[0]), str(scope_raw[1]).upper())
+        seen_values = payload.get("seen_source_ids") or []
+        if not isinstance(seen_values, list):
+            raise ValueError("Sampler snapshot seen_source_ids must be a list.")
+        self._seen_source_ids[scope_key] = OrderedDict((str(item), None) for item in seen_values)
+        self._event_sequence = max(self._event_sequence, int(payload.get("event_sequence") or 0))
+
+        raw_state = payload.get("state")
+        if raw_state is None:
+            self._states[scope_key] = SamplerState(
+                scope_key=scope_key,
+                seen_source_id_capacity=int(payload.get("max_seen_source_ids") or self.max_seen_source_ids),
+                seen_source_id_count=len(self._seen_source_ids[scope_key]),
+            )
+            return
+        if not isinstance(raw_state, dict):
+            raise ValueError("Sampler snapshot state must be a mapping.")
+        pending_trade = _restore_pending_trade(raw_state.get("pending_trade"))
+        self._states[scope_key] = SamplerState(
+            scope_key=scope_key,
+            pending_bucket=_datetime_or_none(raw_state.get("pending_bucket")),
+            pending_trade=pending_trade,
+            last_ordering_key=_restore_ordering_key(raw_state.get("last_ordering_key")),
+            emitted_sequence=int(raw_state.get("emitted_sequence") or 0),
+            seen_source_id_capacity=int(raw_state.get("seen_source_id_capacity") or self.max_seen_source_ids),
+            seen_source_id_count=int(raw_state.get("seen_source_id_count") or len(self._seen_source_ids[scope_key])),
+            seen_source_id_evictions=int(raw_state.get("seen_source_id_evictions") or 0),
+        )
+
     def _state_for(self, raw_trade: RawSipTrade) -> SamplerState:
         return self._states.setdefault(
             raw_trade.scope_key,
@@ -413,3 +480,55 @@ class CanonicalOneSecondSipSampler:
                 "replay_finalized": observation.replay_finalized,
             },
         )
+
+
+def _restore_pending_trade(payload: Any) -> EligibleTrade | None:
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        raise ValueError("pending_trade snapshot must be a mapping.")
+    raw_payload = payload.get("raw_trade")
+    if not isinstance(raw_payload, dict):
+        raise ValueError("pending_trade snapshot missing raw_trade.")
+    raw_payload = dict(raw_payload)
+    if isinstance(raw_payload.get("conditions"), list):
+        raw_payload["conditions"] = tuple(raw_payload["conditions"])
+    raw_trade = RawSipTrade(**raw_payload)
+    return EligibleTrade(
+        raw_trade=raw_trade,
+        eligible_trade_id=str(payload["eligible_trade_id"]),
+        eligibility_event_id=payload.get("eligibility_event_id"),
+        root_event_id=payload.get("root_event_id"),
+    )
+
+
+def _ordering_key_payload(value: tuple[datetime, int, int] | None) -> list[Any] | None:
+    if value is None:
+        return None
+    return [value[0].isoformat(), value[1], value[2]]
+
+
+def _restore_ordering_key(value: Any) -> tuple[datetime, int, int] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or len(value) != 3:
+        raise ValueError("last_ordering_key must be a three-item list.")
+    return (datetime.fromisoformat(str(value[0]).replace("Z", "+00:00")), int(value[1]), int(value[2]))
+
+
+def _datetime_or_none(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _jsonable(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, Decimal):
+        return str(value)
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return value

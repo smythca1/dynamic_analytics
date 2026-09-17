@@ -115,6 +115,18 @@ class AlpacaExecutionEngine:
             payload["take_profit_offset"] = intent.take_profit_offset
         if intent.stop_loss_offset is not None:
             payload["stop_loss_offset"] = intent.stop_loss_offset
+        if intent.exit_plan is not None:
+            payload["exit_plan"] = intent.exit_plan
+        if intent.brick_size is not None:
+            payload["brick_size"] = intent.brick_size
+        if intent.catastrophic_stop_bricks is not None:
+            payload["catastrophic_stop_bricks"] = intent.catastrophic_stop_bricks
+        if intent.protection_type:
+            payload["protection_type"] = intent.protection_type
+        if intent.candidate_config_fingerprint:
+            payload["candidate_config_fingerprint"] = intent.candidate_config_fingerprint
+        if intent.market_contract_fingerprint:
+            payload["market_contract_fingerprint"] = intent.market_contract_fingerprint
 
         response = self.trader.submit_order(payload, action=action, side=intent.side)
         if (
@@ -140,6 +152,31 @@ class AlpacaExecutionEngine:
                 else None,
                 client_order_id=child_client_order_id(intent.client_order_id, "oco"),
                 entry_order_id=str(response.get("response", {}).get("id") or "") or None,
+            )
+        if (
+            intent.signal_type == "entry"
+            and intent.exit_management == "catastrophic_stop"
+            and intent.catastrophic_stop_bricks is not None
+        ):
+            response = dict(response)
+            if intent.brick_size is None:
+                raise RuntimeError("catastrophic_stop entry requires intent.brick_size")
+            entry_order_id = (
+                str(response.get("response", {}).get("id") or "")
+                or str(response.get("open_response", {}).get("id") or "")
+                or None
+            )
+            response["catastrophic_stop_response"] = self.trader.submit_reversal_catastrophic_stop(
+                symbol=intent.symbol,
+                entry_side=intent.side,
+                brick_size=float(intent.brick_size),
+                catastrophic_stop_bricks=int(intent.catastrophic_stop_bricks),
+                client_order_id=intent.client_order_id,
+                entry_order_id=entry_order_id,
+                trader_id=intent.trader_id,
+                strategy_id=intent.strategy,
+                candidate_config_fingerprint=intent.candidate_config_fingerprint,
+                market_contract_fingerprint=intent.market_contract_fingerprint,
             )
         event = ExecutionEvent(
             timestamp=pd.Timestamp.now(tz="UTC"),

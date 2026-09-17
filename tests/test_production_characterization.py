@@ -2,8 +2,9 @@ import unittest
 
 import pandas as pd
 
-from fleet_runner import _PENDING_1S_CLOSE_TICKS, TraderRuntime, renko_source_ticks, tick_second_bucket
+from fleet_runner import tick_second_bucket
 from renko_builder import RenkoBuildState, update_renko_build_state
+from silver.market import CanonicalMarketObservationAdapter
 from strategy_engine import RenkoStrategyConfig, RenkoStrategyEngine
 from trading_events import MarketTick, is_price_forming_trade
 
@@ -21,22 +22,12 @@ def tick(timestamp: str, symbol: str = "TSLA", price: float = 100.0, conditions=
     )
 
 
-def runtime(trader_id: str, symbol: str = "TSLA") -> TraderRuntime:
-    return TraderRuntime(
-        trader_id=trader_id,
-        symbol=symbol,
-        mode="live",
-        credential_profile=None,
-        feed="sip",
-        enabled=True,
-        execution_enabled=False,
-        max_position_notional=1000.0,
-        max_daily_loss=0.0,
-        engine=object(),
-        execution=object(),
-        log=object(),
-        renko_source="1s_close",
-    )
+def adapter_ticks(adapter: CanonicalMarketObservationAdapter, trader_id: str, *ticks: MarketTick):
+    emitted = []
+    for item in ticks:
+        result = adapter.process_tick(item, trader_id=trader_id)
+        emitted.extend(adapter.observation_ticks(result))
+    return emitted
 
 
 def logical_bricks(state: RenkoBuildState):
@@ -52,9 +43,6 @@ def logical_bricks(state: RenkoBuildState):
 
 
 class ProductionMarketDataCharacterizationTests(unittest.TestCase):
-    def setUp(self):
-        _PENDING_1S_CLOSE_TICKS.clear()
-
     def test_price_forming_trade_eligibility_current_contract(self):
         self.assertTrue(is_price_forming_trade(tick("2026-07-20T14:00:00Z", conditions=())))
         self.assertTrue(is_price_forming_trade(tick("2026-07-20T14:00:00Z", conditions=("@",))))
@@ -68,46 +56,54 @@ class ProductionMarketDataCharacterizationTests(unittest.TestCase):
         self.assertEqual(bucket, pd.Timestamp("2026-07-20T13:30:00Z"))
 
     def test_last_eligible_trade_per_occupied_second_and_delayed_emission(self):
-        rt = runtime("sampler_tsla")
-
-        self.assertEqual(renko_source_ticks(rt, tick("2026-07-20T13:30:00.100Z", price=100.0)), [])
-        self.assertEqual(renko_source_ticks(rt, tick("2026-07-20T13:30:00.900Z", price=101.0)), [])
-        emitted = renko_source_ticks(rt, tick("2026-07-20T13:30:01.001Z", price=102.0))
+        adapter = CanonicalMarketObservationAdapter(run_id="sampler_tsla")
+        emitted = adapter_ticks(
+            adapter,
+            "sampler_tsla",
+            tick("2026-07-20T13:30:00.100Z", price=100.0),
+            tick("2026-07-20T13:30:00.900Z", price=101.0),
+            tick("2026-07-20T13:30:01.001Z", price=102.0),
+        )
 
         self.assertEqual(len(emitted), 1)
         self.assertEqual(emitted[0].timestamp, pd.Timestamp("2026-07-20T13:30:00Z"))
         self.assertEqual(emitted[0].price, 101.0)
 
     def test_no_synthetic_empty_seconds(self):
-        rt = runtime("sampler_gap_tsla")
-
-        self.assertEqual(renko_source_ticks(rt, tick("2026-07-20T13:30:00.100Z", price=100.0)), [])
-        emitted = renko_source_ticks(rt, tick("2026-07-20T13:30:05.001Z", price=105.0))
+        adapter = CanonicalMarketObservationAdapter(run_id="sampler_gap_tsla")
+        emitted = adapter_ticks(
+            adapter,
+            "sampler_gap_tsla",
+            tick("2026-07-20T13:30:00.100Z", price=100.0),
+            tick("2026-07-20T13:30:05.001Z", price=105.0),
+        )
 
         self.assertEqual(len(emitted), 1)
         self.assertEqual(emitted[0].timestamp, pd.Timestamp("2026-07-20T13:30:00Z"))
         self.assertEqual(emitted[0].price, 100.0)
 
     def test_out_of_order_tick_behavior(self):
-        rt = runtime("sampler_ooo_tsla")
-
-        self.assertEqual(renko_source_ticks(rt, tick("2026-07-20T13:30:02.100Z", price=102.0)), [])
-        self.assertEqual(renko_source_ticks(rt, tick("2026-07-20T13:30:01.900Z", price=101.0)), [])
-        emitted = renko_source_ticks(rt, tick("2026-07-20T13:30:03.001Z", price=103.0))
+        adapter = CanonicalMarketObservationAdapter(run_id="sampler_ooo_tsla")
+        emitted = adapter_ticks(
+            adapter,
+            "sampler_ooo_tsla",
+            tick("2026-07-20T13:30:02.100Z", price=102.0),
+            tick("2026-07-20T13:30:01.900Z", price=101.0),
+            tick("2026-07-20T13:30:03.001Z", price=103.0),
+        )
 
         self.assertEqual(len(emitted), 1)
         self.assertEqual(emitted[0].timestamp, pd.Timestamp("2026-07-20T13:30:02Z"))
         self.assertEqual(emitted[0].price, 102.0)
 
     def test_sampler_state_is_isolated_across_traders(self):
-        first = runtime("sampler_aapl", symbol="AAPL")
-        second = runtime("sampler_nvda", symbol="NVDA")
+        adapter = CanonicalMarketObservationAdapter(run_id="multi")
 
-        self.assertEqual(renko_source_ticks(first, tick("2026-07-20T13:30:00.100Z", "AAPL", 200.0)), [])
-        self.assertEqual(renko_source_ticks(second, tick("2026-07-20T13:30:00.100Z", "NVDA", 300.0)), [])
+        adapter_ticks(adapter, "sampler_aapl", tick("2026-07-20T13:30:00.100Z", "AAPL", 200.0))
+        adapter_ticks(adapter, "sampler_nvda", tick("2026-07-20T13:30:00.100Z", "NVDA", 300.0))
 
-        first_emitted = renko_source_ticks(first, tick("2026-07-20T13:30:01.100Z", "AAPL", 201.0))
-        second_emitted = renko_source_ticks(second, tick("2026-07-20T13:30:01.100Z", "NVDA", 301.0))
+        first_emitted = adapter_ticks(adapter, "sampler_aapl", tick("2026-07-20T13:30:01.100Z", "AAPL", 201.0))
+        second_emitted = adapter_ticks(adapter, "sampler_nvda", tick("2026-07-20T13:30:01.100Z", "NVDA", 301.0))
 
         self.assertEqual([(row.symbol, row.price) for row in first_emitted], [("AAPL", 200.0)])
         self.assertEqual([(row.symbol, row.price) for row in second_emitted], [("NVDA", 300.0)])

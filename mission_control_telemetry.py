@@ -4,12 +4,14 @@ import json
 import math
 import os
 import re
+import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, time as local_time, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Sequence
 from zoneinfo import ZoneInfo
 
 
@@ -66,6 +68,7 @@ NY_TIMEZONE = "America/New_York"
 
 
 BrokerReaderFactory = Callable[[str | None, str | None], Any]
+BrokerSnapshotProvider = Callable[[list["FleetSpec"], datetime], "BrokerCacheReadResult"]
 
 
 @dataclass(frozen=True)
@@ -81,6 +84,9 @@ class TelemetryConfig:
     json_max_bytes: int = 5_242_880
     regular_session_stale_seconds: float = 15.0
     trader_heartbeat_stale_seconds: float = 60.0
+    broker_cache_refresh_seconds: float = 3.0
+    broker_cache_stale_seconds: float = 15.0
+    broker_cache_read_timeout_seconds: float = 2.0
 
     @classmethod
     def from_environment(cls) -> "TelemetryConfig":
@@ -107,6 +113,14 @@ class TelemetryConfig:
             json_max_bytes=_env_int("MISSION_CONTROL_JSON_MAX_BYTES", 5_242_880),
             regular_session_stale_seconds=_env_float("MISSION_CONTROL_REGULAR_SESSION_STALE_SECONDS", 15.0),
             trader_heartbeat_stale_seconds=_env_float("MISSION_CONTROL_TRADER_HEARTBEAT_STALE_SECONDS", 60.0),
+            broker_cache_refresh_seconds=_env_float_clamped(
+                "MISSION_CONTROL_BROKER_CACHE_REFRESH_SECONDS",
+                default=3.0,
+                minimum=2.0,
+                maximum=5.0,
+            ),
+            broker_cache_stale_seconds=_env_float("MISSION_CONTROL_BROKER_CACHE_STALE_SECONDS", 15.0),
+            broker_cache_read_timeout_seconds=_env_float("MISSION_CONTROL_BROKER_CACHE_READ_TIMEOUT_SECONDS", 2.0),
         )
 
 
@@ -147,12 +161,285 @@ class FleetSpec:
     session: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class FleetSpecsReadResult:
+    specs: tuple[FleetSpec, ...]
+    any_error: bool = False
+    last_success_timestamp_seconds: float | None = None
+
+
 @dataclass
 class BrokerFleetSnapshot:
     connected: bool = False
-    accounts: list[dict[str, Any]] = field(default_factory=list)
-    positions: list[dict[str, Any]] = field(default_factory=list)
-    orders: list[dict[str, Any]] = field(default_factory=list)
+    accounts: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+    positions: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+    orders: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class BrokerCacheFleetStatus:
+    cache_up: bool
+    has_snapshot: bool
+    stale: bool
+    last_success_timestamp_seconds: float | None
+    cache_age_seconds: float | None
+    last_refresh_duration_seconds: float | None
+    refresh_failures_total: int
+    last_error: str | None = None
+
+
+@dataclass(frozen=True)
+class BrokerCacheReadResult:
+    snapshots: dict[str, BrokerFleetSnapshot]
+    statuses: dict[str, BrokerCacheFleetStatus]
+
+
+@dataclass(frozen=True)
+class BrokerCacheEntry:
+    snapshot: BrokerFleetSnapshot | None = None
+    last_success_timestamp_seconds: float | None = None
+    last_attempt_timestamp_seconds: float | None = None
+    last_refresh_duration_seconds: float | None = None
+    refresh_failures_total: int = 0
+    last_error: str | None = None
+
+
+@dataclass(frozen=True)
+class BrokerFleetRefreshResult:
+    snapshot: BrokerFleetSnapshot | None
+    duration_seconds: float
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class BrokerRefreshResult:
+    expected_fleets: tuple[str, ...]
+    fleet_results: dict[str, BrokerFleetRefreshResult]
+
+
+class BrokerSnapshotCache:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: dict[str, BrokerCacheEntry] = {}
+
+    def read_for_specs(
+        self,
+        specs: list[FleetSpec],
+        now: datetime,
+        *,
+        stale_after_seconds: float,
+    ) -> BrokerCacheReadResult:
+        now_seconds = _coerce_utc_datetime(now).timestamp()
+        expected_fleets = sorted({spec.fleet for spec in specs if spec.enabled})
+        with self._lock:
+            entries = dict(self._entries)
+
+        snapshots: dict[str, BrokerFleetSnapshot] = {}
+        statuses: dict[str, BrokerCacheFleetStatus] = {}
+        for fleet in expected_fleets:
+            entry = entries.get(fleet)
+            snapshot = entry.snapshot if entry and entry.snapshot is not None else None
+            age: float | None = None
+            if entry and entry.last_success_timestamp_seconds is not None:
+                age = max(0.0, now_seconds - entry.last_success_timestamp_seconds)
+            stale = snapshot is None or age is None or age > stale_after_seconds
+            last_error = entry.last_error if entry else "broker_cache_empty"
+            cache_up = bool(snapshot is not None and not stale and last_error is None)
+            snapshots[fleet] = snapshot if snapshot is not None else BrokerFleetSnapshot()
+            statuses[fleet] = BrokerCacheFleetStatus(
+                cache_up=cache_up,
+                has_snapshot=snapshot is not None,
+                stale=stale,
+                last_success_timestamp_seconds=entry.last_success_timestamp_seconds if entry else None,
+                cache_age_seconds=age,
+                last_refresh_duration_seconds=entry.last_refresh_duration_seconds if entry else None,
+                refresh_failures_total=entry.refresh_failures_total if entry else 0,
+                last_error=last_error,
+            )
+        return BrokerCacheReadResult(snapshots=snapshots, statuses=statuses)
+
+    def apply_refresh_result(self, result: BrokerRefreshResult, now: datetime | None = None) -> None:
+        completed_at = _coerce_utc_datetime(now).timestamp()
+        with self._lock:
+            entries = dict(self._entries)
+            for fleet in result.expected_fleets:
+                current = entries.get(fleet, BrokerCacheEntry())
+                fleet_result = result.fleet_results.get(
+                    fleet,
+                    BrokerFleetRefreshResult(
+                        snapshot=None,
+                        duration_seconds=0.0,
+                        error="broker_refresh_missing_result",
+                    ),
+                )
+                if fleet_result.error is None and fleet_result.snapshot is not None:
+                    entries[fleet] = BrokerCacheEntry(
+                        snapshot=fleet_result.snapshot,
+                        last_success_timestamp_seconds=completed_at,
+                        last_attempt_timestamp_seconds=completed_at,
+                        last_refresh_duration_seconds=fleet_result.duration_seconds,
+                        refresh_failures_total=current.refresh_failures_total,
+                        last_error=None,
+                    )
+                else:
+                    entries[fleet] = BrokerCacheEntry(
+                        snapshot=current.snapshot,
+                        last_success_timestamp_seconds=current.last_success_timestamp_seconds,
+                        last_attempt_timestamp_seconds=completed_at,
+                        last_refresh_duration_seconds=fleet_result.duration_seconds,
+                        refresh_failures_total=current.refresh_failures_total + 1,
+                        last_error=_bounded_label_value(fleet_result.error or "broker_refresh_failed"),
+                    )
+            self._entries = entries
+
+    def mark_refresh_timeout(self, specs: list[FleetSpec], duration_seconds: float, now: datetime | None = None) -> None:
+        expected_fleets = tuple(sorted({spec.fleet for spec in specs if spec.enabled}))
+        self.apply_refresh_result(
+            BrokerRefreshResult(
+                expected_fleets=expected_fleets,
+                fleet_results={
+                    fleet: BrokerFleetRefreshResult(
+                        snapshot=None,
+                        duration_seconds=duration_seconds,
+                        error="broker_refresh_timeout",
+                    )
+                    for fleet in expected_fleets
+                },
+            ),
+            now=now,
+        )
+
+
+class BrokerSnapshotBackgroundCollector:
+    def __init__(
+        self,
+        *,
+        cache: BrokerSnapshotCache,
+        config: TelemetryConfig,
+        broker_reader_for: BrokerReaderFactory,
+        refresh_interval_seconds: float | None = None,
+        read_timeout_seconds: float | None = None,
+    ) -> None:
+        self.cache = cache
+        self.config = config
+        self.broker_reader_for = broker_reader_for
+        self.refresh_interval_seconds = float(
+            config.broker_cache_refresh_seconds if refresh_interval_seconds is None else refresh_interval_seconds
+        )
+        self.read_timeout_seconds = float(
+            config.broker_cache_read_timeout_seconds if read_timeout_seconds is None else read_timeout_seconds
+        )
+        self._stop = threading.Event()
+        self._thread_lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._executor: ThreadPoolExecutor | None = None
+        self._active_future: Future[BrokerRefreshResult] | None = None
+        self._timed_out_future: Future[BrokerRefreshResult] | None = None
+
+    def start(self) -> None:
+        with self._thread_lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="broker-cache-refresh")
+            self._thread = threading.Thread(
+                target=self._run,
+                name="broker-cache-supervisor",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=timeout)
+        executor = self._executor
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def refresh_once(self, now: datetime | None = None) -> BrokerRefreshResult:
+        specs = read_fleet_specs(self.config).specs
+        result = self._build_refresh_result(list(specs))
+        self.cache.apply_refresh_result(result, now=now)
+        return result
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            cycle_started = time.perf_counter()
+            self._run_cycle()
+            elapsed = time.perf_counter() - cycle_started
+            sleep_seconds = max(0.0, self.refresh_interval_seconds - elapsed)
+            self._stop.wait(sleep_seconds)
+
+    def _run_cycle(self) -> None:
+        executor = self._executor
+        if executor is None:
+            return
+        if self._active_future is not None:
+            if not self._active_future.done():
+                return
+            if self._active_future is self._timed_out_future:
+                self._active_future = None
+                self._timed_out_future = None
+                return
+            try:
+                self.cache.apply_refresh_result(self._active_future.result())
+            except Exception:
+                pass
+            self._active_future = None
+
+        specs = list(read_fleet_specs(self.config).specs)
+        self._active_future = executor.submit(self._build_refresh_result, specs)
+        started = time.perf_counter()
+        try:
+            result = self._active_future.result(timeout=max(0.001, self.read_timeout_seconds))
+        except TimeoutError:
+            self._timed_out_future = self._active_future
+            self.cache.mark_refresh_timeout(specs, time.perf_counter() - started)
+        except Exception:
+            self.cache.mark_refresh_timeout(specs, time.perf_counter() - started)
+            self._active_future = None
+        else:
+            self.cache.apply_refresh_result(result)
+            self._active_future = None
+
+    def _build_refresh_result(self, specs: list[FleetSpec]) -> BrokerRefreshResult:
+        grouped = _broker_account_keys_by_fleet(specs)
+        fleet_results: dict[str, BrokerFleetRefreshResult] = {}
+        for fleet, account_keys in sorted(grouped.items()):
+            started = time.perf_counter()
+            accounts: list[dict[str, Any]] = []
+            positions: list[dict[str, Any]] = []
+            orders: list[dict[str, Any]] = []
+            error: str | None = None
+            try:
+                for mode, profile in sorted(account_keys, key=lambda item: (item[0], item[1] or "")):
+                    reader = self.broker_reader_for(mode, profile)
+                    accounts.append(_mapping_from_object(reader.get_account()))
+                    positions.extend(_mapping_from_object(position) for position in reader.get_positions())
+                    orders.extend(_mapping_from_object(order) for order in reader.get_orders(status="open", limit=100))
+            except Exception as exc:
+                error = f"{type(exc).__name__}"
+            duration_seconds = time.perf_counter() - started
+            if error is None:
+                fleet_results[fleet] = BrokerFleetRefreshResult(
+                    snapshot=BrokerFleetSnapshot(
+                        connected=True,
+                        accounts=tuple(accounts),
+                        positions=tuple(positions),
+                        orders=tuple(orders),
+                    ),
+                    duration_seconds=duration_seconds,
+                    error=None,
+                )
+            else:
+                fleet_results[fleet] = BrokerFleetRefreshResult(
+                    snapshot=None,
+                    duration_seconds=duration_seconds,
+                    error=error,
+                )
+        return BrokerRefreshResult(expected_fleets=tuple(sorted(grouped)), fleet_results=fleet_results)
 
 
 @dataclass(frozen=True)
@@ -346,6 +633,7 @@ class MissionControlTelemetryCollector:
         self,
         *,
         broker_reader_for: BrokerReaderFactory | None = None,
+        broker_snapshot_provider: BrokerSnapshotProvider | None = None,
         now: datetime | None = None,
     ) -> str:
         started = time.perf_counter()
@@ -353,7 +641,13 @@ class MissionControlTelemetryCollector:
         renderer = PrometheusRenderer()
         source_errors: Counter[tuple[tuple[str, str], ...]] = Counter()
         try:
-            self._collect(renderer, source_errors, broker_reader_for=broker_reader_for, now=now_utc)
+            self._collect(
+                renderer,
+                source_errors,
+                broker_reader_for=broker_reader_for,
+                broker_snapshot_provider=broker_snapshot_provider,
+                now=now_utc,
+            )
             renderer.sample(
                 "renko_telemetry_collector_up",
                 1,
@@ -390,6 +684,7 @@ class MissionControlTelemetryCollector:
         source_errors: Counter[tuple[tuple[str, str], ...]],
         *,
         broker_reader_for: BrokerReaderFactory | None,
+        broker_snapshot_provider: BrokerSnapshotProvider | None,
         now: datetime,
     ) -> None:
         market_open = is_regular_market_session_open(now)
@@ -410,11 +705,12 @@ class MissionControlTelemetryCollector:
         event_paths = sorted({spec.event_log_path for spec in specs})
         self._update_event_counters(renderer, source_errors, event_paths, specs_by_trader)
 
-        broker_snapshots = self._collect_broker_snapshots(
+        broker_snapshots, broker_cache_statuses = self._collect_broker_snapshots(
             renderer,
             source_errors,
             specs,
             broker_reader_for=broker_reader_for,
+            broker_snapshot_provider=broker_snapshot_provider,
             now=now,
         )
         self._emit_market_data_metrics(renderer, health, metric_specs, market_open=market_open, now=now)
@@ -423,15 +719,17 @@ class MissionControlTelemetryCollector:
             source_errors,
             metric_specs,
             broker_snapshots,
+            broker_cache_statuses,
             market_open=market_open,
             now=now,
         )
-        self._emit_broker_and_portfolio_metrics(renderer, broker_snapshots, metric_specs)
+        self._emit_broker_and_portfolio_metrics(renderer, broker_snapshots, broker_cache_statuses, metric_specs)
         self._emit_activity_metrics(renderer)
         self._emit_readiness(
             renderer,
             metric_specs,
             broker_snapshots,
+            broker_cache_statuses,
             readiness_inputs,
             market_open=market_open,
             health=health,
@@ -553,26 +851,16 @@ class MissionControlTelemetryCollector:
         renderer: PrometheusRenderer,
         source_errors: Counter[tuple[tuple[str, str], ...]],
     ) -> list[FleetSpec]:
-        specs: list[FleetSpec] = []
         labels = {"environment": self.config.environment, "service": "fleet_config"}
-        any_error = False
-        last_success: float | None = None
-        for path in self.config.fleet_config_paths:
-            result = _read_json_document(path, max_bytes=self.config.json_max_bytes)
-            any_error = any_error or not result.ok
-            if not result.ok or not isinstance(result.payload, dict):
-                continue
-            if result.mtime_seconds is not None:
-                last_success = max(last_success or 0.0, result.mtime_seconds)
-            specs.extend(self._fleet_specs_from_config(result.payload))
-        source_errors[_label_tuple(labels)] = 1 if any_error else 0
+        result = read_fleet_specs(self.config)
+        source_errors[_label_tuple(labels)] = 1 if result.any_error else 0
         renderer.sample(
             "renko_telemetry_source_last_success_timestamp_seconds",
-            last_success if last_success is not None else math.nan,
+            result.last_success_timestamp_seconds if result.last_success_timestamp_seconds is not None else math.nan,
             labels,
             help_text="Unix timestamp for the last successful bounded telemetry source read.",
         )
-        return specs
+        return list(result.specs)
 
     def _deduplicate_metric_specs(
         self,
@@ -609,43 +897,7 @@ class MissionControlTelemetryCollector:
         return (int(spec.enabled), int(spec.execution_enabled), state_mtime, spec.trader_id)
 
     def _fleet_specs_from_config(self, config: dict[str, Any]) -> list[FleetSpec]:
-        fleet = _bounded_label_value(config.get("fleet_id") or config.get("experiment_id") or "unknown")
-        runtime_roots = config.get("runtime_roots") if isinstance(config.get("runtime_roots"), dict) else {}
-        state_root = Path(str(runtime_roots.get("state"))) if runtime_roots.get("state") else self.config.archive_root / "state"
-        specs: list[FleetSpec] = []
-        for trader in config.get("traders", []):
-            if not isinstance(trader, dict):
-                continue
-            trader_id = str(trader.get("id") or "unknown")
-            symbol = str(trader.get("symbol") or "").upper()
-            strategy = _bounded_label_value(trader.get("strategy_name") or trader_id)
-            strategy_config = trader.get("strategy") if isinstance(trader.get("strategy"), dict) else {}
-            credential_profile = trader.get("credential_profile")
-            account_namespace = (
-                trader.get("account_namespace")
-                or trader.get("account_alias")
-                or credential_profile
-                or config.get("account_namespace")
-                or "default"
-            )
-            specs.append(
-                FleetSpec(
-                    fleet=fleet,
-                    trader_id=trader_id,
-                    symbol=symbol,
-                    strategy=strategy,
-                    strategy_type=str(strategy_config.get("type") or "unknown"),
-                    enabled=bool(trader.get("enabled", True)),
-                    execution_enabled=bool(trader.get("execution_enabled", True)),
-                    mode=str(trader.get("mode") or os.getenv("ALPACA_TRADING_MODE") or "paper").lower(),
-                    credential_profile=str(credential_profile) if credential_profile not in {None, ""} else None,
-                    account_namespace=_bounded_label_value(account_namespace),
-                    event_log_path=Path(str(trader.get("event_log") or os.getenv("LIVE_EVENT_LOG") or "artifacts/live/live_events.jsonl")),
-                    state_path=state_root / f"{_slug(trader_id)}.json",
-                    session=trader.get("session") if isinstance(trader.get("session"), dict) else {},
-                )
-            )
-        return specs
+        return list(_fleet_specs_from_config_payload(config, archive_root=self.config.archive_root))
 
     def _update_event_counters(
         self,
@@ -780,29 +1032,75 @@ class MissionControlTelemetryCollector:
         specs: list[FleetSpec],
         *,
         broker_reader_for: BrokerReaderFactory | None,
+        broker_snapshot_provider: BrokerSnapshotProvider | None,
         now: datetime,
-    ) -> dict[str, BrokerFleetSnapshot]:
-        grouped: dict[str, set[tuple[str, str | None]]] = defaultdict(set)
-        for spec in specs:
-            if spec.enabled:
-                grouped[spec.fleet].add((spec.mode, spec.credential_profile))
+    ) -> tuple[dict[str, BrokerFleetSnapshot], dict[str, BrokerCacheFleetStatus]]:
+        grouped = _broker_account_keys_by_fleet(specs)
+        if broker_snapshot_provider is not None:
+            read_result = broker_snapshot_provider(specs, now)
+            for fleet, status in sorted(read_result.statuses.items()):
+                labels = {"environment": self.config.environment, "fleet": fleet, "service": "broker"}
+                source_errors[_label_tuple(labels)] = 0 if status.cache_up else 1
+                renderer.sample(
+                    "renko_telemetry_source_last_success_timestamp_seconds",
+                    status.last_success_timestamp_seconds if status.last_success_timestamp_seconds is not None else math.nan,
+                    labels,
+                    help_text="Unix timestamp for the last successful bounded telemetry source read.",
+                )
+            self._emit_broker_cache_metrics(renderer, read_result.statuses)
+            return read_result.snapshots, read_result.statuses
+
         snapshots: dict[str, BrokerFleetSnapshot] = {fleet: BrokerFleetSnapshot() for fleet in grouped}
+        statuses: dict[str, BrokerCacheFleetStatus] = {}
         for fleet, account_keys in sorted(grouped.items()):
-            snapshot = snapshots[fleet]
             labels = {"environment": self.config.environment, "fleet": fleet, "service": "broker"}
             if broker_reader_for is None:
                 source_errors[_label_tuple(labels)] = 1
+                statuses[fleet] = BrokerCacheFleetStatus(
+                    cache_up=False,
+                    has_snapshot=False,
+                    stale=True,
+                    last_success_timestamp_seconds=None,
+                    cache_age_seconds=None,
+                    last_refresh_duration_seconds=None,
+                    refresh_failures_total=0,
+                    last_error="broker_reader_missing",
+                )
                 continue
             connected = True
+            started = time.perf_counter()
+            accounts: list[dict[str, Any]] = []
+            positions: list[dict[str, Any]] = []
+            orders: list[dict[str, Any]] = []
             for mode, profile in sorted(account_keys, key=lambda item: (item[0], item[1] or "")):
                 try:
                     reader = broker_reader_for(mode, profile)
-                    snapshot.accounts.append(reader.get_account())
-                    snapshot.positions.extend(reader.get_positions())
-                    snapshot.orders.extend(reader.get_orders(status="open", limit=100))
+                    accounts.append(_mapping_from_object(reader.get_account()))
+                    positions.extend(_mapping_from_object(position) for position in reader.get_positions())
+                    orders.extend(_mapping_from_object(order) for order in reader.get_orders(status="open", limit=100))
                 except Exception:
                     connected = False
-            snapshot.connected = connected
+            duration = time.perf_counter() - started
+            if not connected:
+                accounts = []
+                positions = []
+                orders = []
+            snapshots[fleet] = BrokerFleetSnapshot(
+                connected=connected,
+                accounts=tuple(accounts),
+                positions=tuple(positions),
+                orders=tuple(orders),
+            )
+            statuses[fleet] = BrokerCacheFleetStatus(
+                cache_up=connected,
+                has_snapshot=connected,
+                stale=not connected,
+                last_success_timestamp_seconds=now.timestamp() if connected else None,
+                cache_age_seconds=0.0 if connected else None,
+                last_refresh_duration_seconds=duration,
+                refresh_failures_total=0 if connected else 1,
+                last_error=None if connected else "broker_direct_read_failed",
+            )
             source_errors[_label_tuple(labels)] = 0 if connected else 1
             renderer.sample(
                 "renko_telemetry_source_last_success_timestamp_seconds",
@@ -810,7 +1108,47 @@ class MissionControlTelemetryCollector:
                 labels,
                 help_text="Unix timestamp for the last successful bounded telemetry source read.",
             )
-        return snapshots
+        self._emit_broker_cache_metrics(renderer, statuses)
+        return snapshots, statuses
+
+    def _emit_broker_cache_metrics(
+        self,
+        renderer: PrometheusRenderer,
+        statuses: dict[str, BrokerCacheFleetStatus],
+    ) -> None:
+        for fleet, status in sorted(statuses.items()):
+            labels = {"environment": self.config.environment, "fleet": fleet, "service": "broker_cache"}
+            renderer.sample(
+                "renko_broker_cache_last_success_timestamp_seconds",
+                status.last_success_timestamp_seconds if status.last_success_timestamp_seconds is not None else math.nan,
+                labels,
+                help_text="Unix timestamp for the last successful background broker cache refresh.",
+            )
+            renderer.sample(
+                "renko_broker_cache_age_seconds",
+                status.cache_age_seconds if status.cache_age_seconds is not None else math.nan,
+                labels,
+                help_text="Age of the cached broker snapshot; can also be derived from the last-success timestamp.",
+            )
+            renderer.sample(
+                "renko_broker_cache_refresh_duration_seconds",
+                status.last_refresh_duration_seconds if status.last_refresh_duration_seconds is not None else math.nan,
+                labels,
+                help_text="Duration of the most recent background broker cache refresh attempt.",
+            )
+            renderer.sample(
+                "renko_broker_cache_refresh_failures_total",
+                status.refresh_failures_total,
+                labels,
+                help_text="Total failed background broker cache refresh attempts.",
+                metric_type="counter",
+            )
+            renderer.sample(
+                "renko_broker_cache_up",
+                int(status.cache_up),
+                labels,
+                help_text="Whether the broker cache has a fresh last-known-good snapshot and the latest refresh state is healthy.",
+            )
 
     def _emit_market_data_metrics(
         self,
@@ -915,6 +1253,7 @@ class MissionControlTelemetryCollector:
         source_errors: Counter[tuple[tuple[str, str], ...]],
         specs: list[FleetSpec],
         broker_snapshots: dict[str, BrokerFleetSnapshot],
+        broker_cache_statuses: dict[str, BrokerCacheFleetStatus],
         *,
         market_open: bool,
         now: datetime,
@@ -996,14 +1335,17 @@ class MissionControlTelemetryCollector:
         self,
         renderer: PrometheusRenderer,
         broker_snapshots: dict[str, BrokerFleetSnapshot],
+        broker_cache_statuses: dict[str, BrokerCacheFleetStatus],
         specs: list[FleetSpec],
     ) -> None:
         fleets = sorted({spec.fleet for spec in specs} | set(broker_snapshots))
         for fleet in fleets:
             labels = {"environment": self.config.environment, "fleet": fleet, "service": "broker"}
             snapshot = broker_snapshots.get(fleet, BrokerFleetSnapshot())
+            cache_status = broker_cache_statuses.get(fleet)
             account = _aggregate_accounts(snapshot.accounts)
-            renderer.sample("renko_broker_connected", int(snapshot.connected), labels, help_text="Whether all read-only broker GET calls for the fleet succeeded.")
+            broker_current = cache_status.cache_up if cache_status is not None else snapshot.connected
+            renderer.sample("renko_broker_connected", int(broker_current), labels, help_text="Whether broker telemetry is backed by a fresh successful cache refresh.")
             renderer.sample("renko_broker_account_equity", account.get("equity", math.nan), labels, help_text="Broker account equity, aggregated by fleet.")
             renderer.sample("renko_broker_buying_power", account.get("buying_power", math.nan), labels, help_text="Broker account buying power, aggregated by fleet.")
             renderer.sample("renko_broker_cash", account.get("cash", math.nan), labels, help_text="Broker account cash, aggregated by fleet.")
@@ -1081,6 +1423,7 @@ class MissionControlTelemetryCollector:
         renderer: PrometheusRenderer,
         specs: list[FleetSpec],
         broker_snapshots: dict[str, BrokerFleetSnapshot],
+        broker_cache_statuses: dict[str, BrokerCacheFleetStatus],
         readiness_inputs: dict[str, dict[str, bool]],
         *,
         market_open: bool,
@@ -1090,7 +1433,8 @@ class MissionControlTelemetryCollector:
         health_payload = health or {}
         for fleet in sorted({spec.fleet for spec in specs}):
             enabled_specs = [spec for spec in specs if spec.fleet == fleet and spec.enabled]
-            broker_ok = broker_snapshots.get(fleet, BrokerFleetSnapshot()).connected
+            cache_status = broker_cache_statuses.get(fleet)
+            broker_ok = cache_status.cache_up if cache_status is not None else broker_snapshots.get(fleet, BrokerFleetSnapshot()).connected
             trader_ok = all(
                 readiness_inputs.get(spec.trader_id, {}).get("state_valid", False)
                 and readiness_inputs.get(spec.trader_id, {}).get("heartbeat_ok", False)
@@ -1170,6 +1514,73 @@ def is_trader_entry_session_active(spec: FleetSpec, now: datetime | None = None)
     return entry_start <= local_now.time() <= entry_end
 
 
+def read_fleet_specs(config: TelemetryConfig) -> FleetSpecsReadResult:
+    specs: list[FleetSpec] = []
+    any_error = False
+    last_success: float | None = None
+    for path in config.fleet_config_paths:
+        result = _read_json_document(path, max_bytes=config.json_max_bytes)
+        any_error = any_error or not result.ok
+        if not result.ok or not isinstance(result.payload, dict):
+            continue
+        if result.mtime_seconds is not None:
+            last_success = max(last_success or 0.0, result.mtime_seconds)
+        specs.extend(_fleet_specs_from_config_payload(result.payload, archive_root=config.archive_root))
+    return FleetSpecsReadResult(
+        specs=tuple(specs),
+        any_error=any_error,
+        last_success_timestamp_seconds=last_success,
+    )
+
+
+def _fleet_specs_from_config_payload(config: dict[str, Any], *, archive_root: Path) -> tuple[FleetSpec, ...]:
+    fleet = _bounded_label_value(config.get("fleet_id") or config.get("experiment_id") or "unknown")
+    runtime_roots = config.get("runtime_roots") if isinstance(config.get("runtime_roots"), dict) else {}
+    state_root = Path(str(runtime_roots.get("state"))) if runtime_roots.get("state") else archive_root / "state"
+    specs: list[FleetSpec] = []
+    for trader in config.get("traders", []):
+        if not isinstance(trader, dict):
+            continue
+        trader_id = str(trader.get("id") or "unknown")
+        symbol = str(trader.get("symbol") or "").upper()
+        strategy = _bounded_label_value(trader.get("strategy_name") or trader_id)
+        strategy_config = trader.get("strategy") if isinstance(trader.get("strategy"), dict) else {}
+        credential_profile = trader.get("credential_profile")
+        account_namespace = (
+            trader.get("account_namespace")
+            or trader.get("account_alias")
+            or credential_profile
+            or config.get("account_namespace")
+            or "default"
+        )
+        specs.append(
+            FleetSpec(
+                fleet=fleet,
+                trader_id=trader_id,
+                symbol=symbol,
+                strategy=strategy,
+                strategy_type=str(strategy_config.get("type") or "unknown"),
+                enabled=bool(trader.get("enabled", True)),
+                execution_enabled=bool(trader.get("execution_enabled", True)),
+                mode=str(trader.get("mode") or os.getenv("ALPACA_TRADING_MODE") or "paper").lower(),
+                credential_profile=str(credential_profile) if credential_profile not in {None, ""} else None,
+                account_namespace=_bounded_label_value(account_namespace),
+                event_log_path=Path(str(trader.get("event_log") or os.getenv("LIVE_EVENT_LOG") or "artifacts/live/live_events.jsonl")),
+                state_path=state_root / f"{_slug(trader_id)}.json",
+                session=trader.get("session") if isinstance(trader.get("session"), dict) else {},
+            )
+        )
+    return tuple(specs)
+
+
+def _broker_account_keys_by_fleet(specs: Sequence[FleetSpec]) -> dict[str, set[tuple[str, str | None]]]:
+    grouped: dict[str, set[tuple[str, str | None]]] = defaultdict(set)
+    for spec in specs:
+        if spec.enabled:
+            grouped[spec.fleet].add((spec.mode, spec.credential_profile))
+    return grouped
+
+
 def _fleet_config_paths_from_environment() -> tuple[Path, ...]:
     explicit = os.getenv("MISSION_CONTROL_CONFIG_PATHS")
     if explicit:
@@ -1215,6 +1626,10 @@ def _env_float(name: str, default: float) -> float:
         return float(os.getenv(name, str(default)))
     except ValueError:
         return default
+
+
+def _env_float_clamped(name: str, *, default: float, minimum: float, maximum: float) -> float:
+    return min(max(_env_float(name, default), minimum), maximum)
 
 
 def _read_json_document(path: Path, *, max_bytes: int) -> JsonReadResult:
@@ -1362,6 +1777,28 @@ def _dict_keys(value: Any) -> tuple[str, ...]:
 
 def _label_tuple(labels: dict[str, object]) -> tuple[tuple[str, str], ...]:
     return tuple(sorted((key, _bounded_label_value(value)) for key, value in labels.items()))
+
+
+def _mapping_from_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if hasattr(value, "model_dump"):
+        try:
+            payload = value.model_dump()
+            if isinstance(payload, dict):
+                return dict(payload)
+        except Exception:
+            pass
+    if hasattr(value, "dict"):
+        try:
+            payload = value.dict()
+            if isinstance(payload, dict):
+                return dict(payload)
+        except Exception:
+            pass
+    if hasattr(value, "__dict__"):
+        return {str(key): item for key, item in vars(value).items() if not str(key).startswith("_")}
+    return {}
 
 
 def _safe_float(value: object, default: float = 0.0) -> float:
