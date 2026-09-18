@@ -250,6 +250,87 @@ def test_bracket_order(symbol="AAPL"):
     }
 
 
+def owned_tp_sl_exit_plan(*, symbol="TSLA", entry_side="sell", quantity=1):
+    return build_renko_tp_sl_exit_plan(
+        trader_id=f"camatron_{symbol.lower()}",
+        strategy_id=f"{symbol.lower()}_tp_sl",
+        symbol=symbol,
+        entry_side=entry_side,
+        quantity=quantity,
+        entry_reference_type="signal_price",
+        entry_reference_price="365.883",
+        brick_size="1.3755",
+        take_profit_bricks=1,
+        stop_loss_bricks=3,
+        time_in_force="day",
+        order_class="bracket",
+        client_order_id=f"{symbol.lower()}-entry",
+        candidate_config_fingerprint=f"config-{symbol.lower()}",
+        market_contract_fingerprint=f"market-{symbol.lower()}",
+    ).to_dict()
+
+
+def owned_tp_sl_bracket_order(
+    *,
+    symbol="TSLA",
+    entry_side="sell",
+    tp_status="accepted",
+    sl_status="accepted",
+    parent_id="parent-owned",
+    tp_id="tp-owned",
+    sl_id="sl-owned",
+):
+    plan = owned_tp_sl_exit_plan(symbol=symbol, entry_side=entry_side)
+    closing_side = "sell" if entry_side == "buy" else "buy"
+    return {
+        "id": parent_id,
+        "symbol": symbol,
+        "side": entry_side,
+        "qty": "1",
+        "filled_qty": "1",
+        "status": "filled",
+        "order_class": "bracket",
+        "client_order_id": plan["client_order_id"],
+        "legs": [
+            {
+                "id": tp_id,
+                "parent_order_id": parent_id,
+                "client_order_id": plan["take_profit_client_order_id"],
+                "symbol": symbol,
+                "side": closing_side,
+                "qty": "1",
+                "filled_qty": "1" if tp_status == "filled" else "0",
+                "status": tp_status,
+                "limit_price": plan["take_profit_limit_price"],
+            },
+            {
+                "id": sl_id,
+                "parent_order_id": parent_id,
+                "client_order_id": plan["stop_loss_client_order_id"],
+                "symbol": symbol,
+                "side": closing_side,
+                "qty": "1",
+                "filled_qty": "1" if sl_status == "filled" else "0",
+                "status": sl_status,
+                "stop_price": plan["stop_loss_trigger_price"],
+            },
+        ],
+    }
+
+
+def owned_tp_sl_fill(*, order_id="tp-owned", symbol="TSLA", side="buy", qty="1"):
+    return {
+        "id": f"fill-{order_id}",
+        "order_id": order_id,
+        "symbol": symbol,
+        "side": side,
+        "qty": qty,
+        "price": "363.13" if side == "buy" else "367.26",
+        "transaction_time": "2026-09-18T15:21:03.142Z",
+        "order_status": "filled",
+    }
+
+
 def test_oco_order_from_payload(order):
     return {
         "id": "recovery-oco-1",
@@ -4941,6 +5022,179 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
         self.assertEqual(engine.last_closed_exit["reason"], "stop_loss_1_bricks")
         self.assertEqual(log.events[0][0], "state_reconciled")
         self.assertEqual(log.events[0][1]["reason"], "broker_flat_tp_sl_close_confirmed")
+
+    def _owned_tp_sl_runtime(
+        self,
+        *,
+        position_side="short",
+        orders=None,
+        fills=None,
+        tp_id="tp-owned",
+        sl_id="sl-owned",
+        parent_id="parent-owned",
+    ):
+        entry_side = "sell" if position_side == "short" else "buy"
+        exit_plan = owned_tp_sl_exit_plan(symbol="TSLA", entry_side=entry_side)
+        engine = RenkoStrategyEngine(
+            RenkoStrategyConfig(
+                trader_id="camatron_tsla",
+                symbol="TSLA",
+                brick_size=1.3755,
+                entry_bricks=2,
+                take_profit_bricks=1,
+                stop_loss_bricks=3,
+                qty=1,
+                strategy_name="tsla_tp_sl",
+                exit_management="bracket",
+                candidate_config_fingerprint="config-tsla",
+                market_contract_fingerprint="market-tsla",
+            )
+        )
+        engine.position = PositionState(
+            symbol="TSLA",
+            side=position_side,
+            entry_time=pd.Timestamp("2026-09-18T15:17:57.440204Z"),
+            entry_price=364.4863,
+            qty=1,
+        )
+        engine.protection_state = {
+            "state": TP_SL_LIFECYCLE_PROTECTED,
+            "protection_type": "broker_native_tp_sl",
+            "order_class": "bracket",
+            "lifecycle_id": exit_plan["lifecycle_id"],
+            "parent_order_id": parent_id,
+            "take_profit_order_id": tp_id,
+            "stop_loss_order_id": sl_id,
+            "take_profit_limit_price": exit_plan["take_profit_limit_price"],
+            "stop_loss_stop_price": exit_plan["stop_loss_trigger_price"],
+            "exit_plan": exit_plan,
+        }
+        engine.tp_sl_lifecycle_state = TP_SL_LIFECYCLE_PROTECTED
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader = FakeProtectionTrader(position=None, orders=orders or [], fills=fills or [])
+        execution.log = None
+        log = MemoryLog()
+        runtime = TraderRuntime(
+            trader_id="camatron_tsla",
+            symbol="TSLA",
+            mode="live",
+            credential_profile=None,
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=2500,
+            max_daily_loss=0,
+            engine=engine,
+            execution=execution,
+            log=log,
+        )
+        return engine, runtime, log
+
+    def test_reconcile_recognizes_owned_tp_fill_during_bracket_cleanup_race(self):
+        order = owned_tp_sl_bracket_order(entry_side="sell", tp_status="filled", sl_status="accepted")
+        engine, runtime, log = self._owned_tp_sl_runtime(
+            position_side="short",
+            orders=[order],
+            fills=[owned_tp_sl_fill(order_id="tp-owned", side="buy")],
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertTrue(runtime.enabled)
+        self.assertIsNone(engine.position)
+        self.assertIsNone(engine.protection_state)
+        self.assertFalse(engine.reconciliation_unsafe)
+        self.assertEqual(engine.tp_sl_lifecycle_state, TP_SL_LIFECYCLE_FLAT)
+        self.assertEqual(engine.last_closed_exit["reason"], "take_profit_1_bricks")
+        self.assertEqual(engine.last_closed_exit["order_id"], "tp-owned")
+        self.assertEqual(engine.last_closed_exit["source"], "alpaca_reconciliation_broker_native_tp_sl_fill")
+        self.assertNotIn("critical_runtime_halt", [event_type for event_type, _payload in log.events])
+        self.assertNotIn("critical_protection_invariant_violation", [event_type for event_type, _payload in log.events])
+        self.assertEqual(log.events[0][0], "state_reconciled")
+        self.assertEqual(log.events[0][1]["reason"], "broker_flat_broker_native_tp_sl_close_reconciled")
+
+    def test_reconcile_recognizes_owned_sl_fill_during_bracket_cleanup_race(self):
+        order = owned_tp_sl_bracket_order(entry_side="buy", tp_status="accepted", sl_status="filled")
+        engine, runtime, log = self._owned_tp_sl_runtime(
+            position_side="long",
+            orders=[order],
+            fills=[owned_tp_sl_fill(order_id="sl-owned", side="sell")],
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertTrue(runtime.enabled)
+        self.assertIsNone(engine.position)
+        self.assertIsNone(engine.protection_state)
+        self.assertFalse(engine.reconciliation_unsafe)
+        self.assertEqual(engine.last_closed_exit["reason"], "stop_loss_3_bricks")
+        self.assertEqual(engine.last_closed_exit["order_id"], "sl-owned")
+        self.assertEqual(engine.last_closed_exit["source"], "alpaca_reconciliation_broker_native_tp_sl_fill")
+        self.assertNotIn("critical_runtime_halt", [event_type for event_type, _payload in log.events])
+        self.assertNotIn("critical_protection_invariant_violation", [event_type for event_type, _payload in log.events])
+
+    def test_reconcile_classifies_owned_tp_sl_fill_after_oco_cleanup_completed(self):
+        engine, runtime, log = self._owned_tp_sl_runtime(
+            position_side="short",
+            orders=[],
+            fills=[owned_tp_sl_fill(order_id="tp-owned", side="buy")],
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertIsNone(engine.position)
+        self.assertIsNone(engine.protection_state)
+        self.assertEqual(engine.last_closed_exit["reason"], "take_profit_1_bricks")
+        self.assertEqual(engine.last_closed_exit["source"], "alpaca_reconciliation_broker_native_tp_sl_fill")
+        self.assertEqual(log.events[0][1]["reason"], "broker_flat_broker_native_tp_sl_close_reconciled")
+        self.assertNotEqual(log.events[0][1]["reason"], "broker_flat_manual_external_close_reconciled")
+
+    def test_reconcile_keeps_manual_external_close_for_non_owned_fill_without_visible_protection(self):
+        engine, runtime, log = self._owned_tp_sl_runtime(
+            position_side="short",
+            orders=[],
+            fills=[owned_tp_sl_fill(order_id="manual-close-order", side="buy")],
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reconcile_engine_with_broker(Path(temp_dir), runtime)
+
+        self.assertIsNone(engine.position)
+        self.assertEqual(engine.last_closed_exit["reason"], "manual_external_close")
+        self.assertEqual(log.events[0][1]["reason"], "broker_flat_manual_external_close_reconciled")
+
+    def test_reconcile_fails_closed_for_unproven_tp_sl_cleanup(self):
+        current_order = owned_tp_sl_bracket_order(entry_side="sell", tp_status="filled", sl_status="accepted")
+        unrelated_order = owned_tp_sl_bracket_order(
+            entry_side="sell",
+            parent_id="other-parent",
+            tp_id="other-tp",
+            sl_id="other-sl",
+        )
+        cases = [
+            ("wrong_child_id", [current_order], [owned_tp_sl_fill(order_id="other-tp", side="buy")]),
+            ("wrong_symbol", [current_order], [owned_tp_sl_fill(order_id="tp-owned", symbol="AAPL", side="buy")]),
+            ("wrong_side", [current_order], [owned_tp_sl_fill(order_id="tp-owned", side="sell")]),
+            ("wrong_quantity", [current_order], [owned_tp_sl_fill(order_id="tp-owned", side="buy", qty="0.5")]),
+            ("no_fill_evidence", [current_order], []),
+            ("unrelated_tsla_order", [unrelated_order], [owned_tp_sl_fill(order_id="tp-owned", side="buy")]),
+            ("ambiguous_ownership", [current_order, unrelated_order], [owned_tp_sl_fill(order_id="tp-owned", side="buy")]),
+            ("stale_previous_lifecycle", [unrelated_order], [owned_tp_sl_fill(order_id="other-tp", side="buy")]),
+        ]
+        for name, orders, fills in cases:
+            with self.subTest(name=name):
+                engine, runtime, log = self._owned_tp_sl_runtime(position_side="short", orders=orders, fills=fills)
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    with self.assertRaises(BrokerEngineStateMismatch):
+                        reconcile_engine_with_broker(Path(temp_dir), runtime)
+                self.assertIn(
+                    "critical_protection_invariant_violation",
+                    [event_type for event_type, _payload in log.events],
+                )
+                self.assertIsNotNone(engine.position)
 
     def test_renko_tp_sl_quantity_reconciliation_violation_halts_entries(self):
         engine = RenkoStrategyEngine(

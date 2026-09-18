@@ -1402,6 +1402,158 @@ def matching_external_close_fill(runtime: TraderRuntime, engine_position: dict[s
     return None
 
 
+def _tp_sl_protection_state(runtime: TraderRuntime) -> dict[str, Any] | None:
+    protection_state = getattr(runtime.engine, "protection_state", None)
+    if isinstance(protection_state, dict):
+        return protection_state
+    trade = runtime.engine.trade_state_snapshot()
+    protection_state = trade.get("protection_state") if isinstance(trade.get("protection_state"), dict) else None
+    return protection_state if isinstance(protection_state, dict) else None
+
+
+def _known_tp_sl_child_close_reason(runtime: TraderRuntime, order_id: str) -> str | None:
+    protection_state = _tp_sl_protection_state(runtime) or {}
+    if order_id and order_id == str(protection_state.get("take_profit_order_id") or ""):
+        return f"take_profit_{getattr(runtime.engine.config, 'take_profit_bricks', '')}_bricks"
+    if order_id and order_id == str(protection_state.get("stop_loss_order_id") or ""):
+        return f"stop_loss_{getattr(runtime.engine.config, 'stop_loss_bricks', '')}_bricks"
+    return None
+
+
+def matching_broker_native_tp_sl_close_fill(runtime: TraderRuntime, engine_position: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(runtime.execution, AlpacaExecutionEngine):
+        return None
+    protection_state = _tp_sl_protection_state(runtime)
+    if not isinstance(protection_state, dict):
+        return None
+    known_child_ids = {
+        str(protection_state.get("take_profit_order_id") or "").strip(),
+        str(protection_state.get("stop_loss_order_id") or "").strip(),
+    }
+    known_child_ids.discard("")
+    if not known_child_ids:
+        return None
+    trader = runtime.execution.trader
+    if not hasattr(trader, "get_recent_fills"):
+        return None
+
+    symbol = runtime.symbol.upper()
+    position_side = str(engine_position.get("side") or "").lower().strip()
+    expected_side = "sell" if position_side == "long" else "buy"
+    expected_qty = Decimal(str(abs(float(engine_position.get("qty") or 0))))
+    if expected_qty <= 0:
+        return None
+
+    for fill in trader.get_recent_fills(runtime.symbol):
+        order_id = str(fill.get("order_id") or "").strip()
+        if order_id not in known_child_ids:
+            continue
+        if str(fill.get("symbol") or "").upper().strip() != symbol:
+            continue
+        if str(fill.get("side") or "").lower().strip() != expected_side:
+            continue
+        qty = Decimal(str(fill.get("qty") or fill.get("filled_qty") or 0))
+        if not _decimal_equal(qty, expected_qty):
+            continue
+        reason = _known_tp_sl_child_close_reason(runtime, order_id)
+        if reason is None:
+            continue
+        result = dict(fill)
+        result["broker_native_tp_sl_reason"] = reason
+        return result
+    return None
+
+
+def broker_flat_orders_are_known_tp_sl_cleanup(runtime: TraderRuntime, orders: list[dict[str, Any]]) -> bool:
+    protection_state = _tp_sl_protection_state(runtime)
+    if not isinstance(protection_state, dict):
+        return False
+    known_ids = {
+        str(protection_state.get("parent_order_id") or "").strip(),
+        str(protection_state.get("take_profit_order_id") or "").strip(),
+        str(protection_state.get("stop_loss_order_id") or "").strip(),
+    }
+    known_ids.discard("")
+    parent_id = str(protection_state.get("parent_order_id") or "").strip()
+    if not known_ids:
+        return False
+
+    symbol = runtime.symbol.upper()
+    relevant_orders = []
+    for order in orders:
+        if not isinstance(order, dict):
+            continue
+        order_symbols = {str(order.get("symbol") or "").upper().strip()}
+        for leg in order.get("legs") or []:
+            if isinstance(leg, dict):
+                order_symbols.add(str(leg.get("symbol") or "").upper().strip())
+        if symbol in order_symbols:
+            relevant_orders.append(order)
+    if not relevant_orders:
+        return True
+
+    for order in relevant_orders:
+        ids = _order_ids(order)
+        if not ids or not ids <= known_ids:
+            return False
+        order_parent = str(order.get("parent_order_id") or order.get("parent_id") or "").strip()
+        if order_parent and parent_id and order_parent != parent_id:
+            return False
+        for leg in order.get("legs") or []:
+            if not isinstance(leg, dict):
+                continue
+            leg_parent = str(leg.get("parent_order_id") or leg.get("parent_id") or "").strip()
+            if leg_parent and parent_id and leg_parent != parent_id:
+                return False
+    return True
+
+
+def reconcile_broker_native_tp_sl_close_fill(
+    root: Path,
+    runtime: TraderRuntime,
+    engine_trade: dict[str, Any],
+    engine_position: dict[str, Any],
+    fill: dict[str, Any],
+) -> None:
+    entry_price = Decimal(str(engine_position.get("entry_price") or 0))
+    fill_price = Decimal(str(fill.get("price") or fill.get("filled_avg_price") or 0))
+    qty = Decimal(str(fill.get("qty") or fill.get("filled_qty") or 0))
+    side_mult = Decimal("1") if engine_position.get("side") == "long" else Decimal("-1")
+    realized_pnl = (fill_price - entry_price) * qty * side_mult
+    runtime.engine.mark_external_close_filled(
+        timestamp=fill.get("transaction_time") or fill.get("filled_at"),
+        reason=str(fill["broker_native_tp_sl_reason"]),
+        order_id=str(fill.get("order_id") or fill.get("id") or ""),
+        source="alpaca_reconciliation_broker_native_tp_sl_fill",
+        fill_price=str(fill_price),
+        filled_qty=str(qty),
+        realized_pnl=str(realized_pnl),
+    )
+    runtime.log.write(
+        "state_reconciled",
+        {
+            "trader_id": runtime.trader_id,
+            "symbol": runtime.symbol,
+            "reason": "broker_flat_broker_native_tp_sl_close_reconciled",
+            "fill": fill,
+            "previous_trade_state": engine_trade,
+        },
+    )
+    mark_reconciliation_safe(
+        root,
+        runtime,
+        reason="broker_native_tp_sl_close_reconciled",
+        evidence=reconciliation_evidence(
+            runtime,
+            broker_position=None,
+            engine_position=None,
+            open_orders=[],
+            verification=None,
+        ),
+    )
+    archive_engine_state(root, runtime, reason="broker_flat_broker_native_tp_sl_close_reconciled")
+
+
 def matching_reversal_catastrophic_stop_fill(runtime: TraderRuntime, engine_position: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(runtime.execution, AlpacaExecutionEngine):
         return None
@@ -1572,11 +1724,23 @@ def reconcile_engine_with_broker(root: Path, runtime: TraderRuntime) -> None:
     if broker_position is None and (broker_native_runtime or reversal_stop_runtime):
         if reversal_stop_runtime and engine_position is None and last_closed_reversal_stop_is_terminal(runtime):
             return
+        nested_orders = broker_nested_open_orders(runtime)
+        if broker_native_runtime and isinstance(engine_position, dict):
+            broker_native_fill = matching_broker_native_tp_sl_close_fill(runtime, engine_position)
+            if broker_native_fill is not None and broker_flat_orders_are_known_tp_sl_cleanup(runtime, nested_orders):
+                reconcile_broker_native_tp_sl_close_fill(
+                    root,
+                    runtime,
+                    engine_trade,
+                    engine_position,
+                    broker_native_fill,
+                )
+                return
         if reversal_stop_runtime:
             orphan_verification = verify_reversal_catastrophic_stop(
                 symbol=runtime.symbol,
                 broker_position=None,
-                open_orders=broker_nested_open_orders(runtime),
+                open_orders=nested_orders,
                 stop_plan=current_reversal_stop_plan(runtime),
                 expected_config_fingerprint=getattr(runtime.engine.config, "candidate_config_fingerprint", None),
                 expected_market_contract_fingerprint=runtime_expected_market_contract_fingerprint(runtime),
@@ -1585,7 +1749,7 @@ def reconcile_engine_with_broker(root: Path, runtime: TraderRuntime) -> None:
             orphan_verification = verify_broker_native_protection(
                 symbol=runtime.symbol,
                 broker_position=None,
-                nested_orders=broker_nested_open_orders(runtime),
+                nested_orders=nested_orders,
                 exit_plan=current_exit_plan(runtime),
                 protection_state=getattr(runtime.engine, "protection_state", None)
                 if isinstance(getattr(runtime.engine, "protection_state", None), dict)
