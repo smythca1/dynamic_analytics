@@ -23,11 +23,10 @@ TP_SL_SESSION_CONTRACT = {
     "allow_overnight": False,
 }
 
-SINGLE_STRATEGY_KERNEL_TRADER_ID = "camatron_tsla_1s_renko_0p58_e1_tp2_sl2_qty1_20260928_live"
-SINGLE_STRATEGY_KERNEL_BRICK_PCT = Decimal("0.58")
+SINGLE_STRATEGY_KERNEL_TRADER_ID = "camatron_tsla_1s_renko_reversal_0p32_e1_qty5_20261005_live"
+SINGLE_STRATEGY_KERNEL_BRICK_PCT = Decimal("0.32")
 SINGLE_STRATEGY_KERNEL_ENTRY_BRICKS = 1
-SINGLE_STRATEGY_KERNEL_TAKE_PROFIT_BRICKS = 2
-SINGLE_STRATEGY_KERNEL_STOP_LOSS_BRICKS = 2
+SINGLE_STRATEGY_KERNEL_QTY = 5
 
 
 @dataclass(frozen=True)
@@ -381,13 +380,13 @@ def validate_single_strategy_kernel_config(data: dict[str, Any], *, config_path:
         "broker": str(trader.get("broker") or "").lower() == "alpaca",
         "account_namespace": account_namespace == "camatron",
         "mode": str(trader.get("mode") or "").lower() == "live",
-        "strategy_type": str(strategy.get("type") or "").lower() == "renko_tp_sl",
+        "strategy_type": str(strategy.get("type") or "").lower() == "renko_reversal",
         "brick_pct": brick_pct == SINGLE_STRATEGY_KERNEL_BRICK_PCT,
         "entry_bricks": int(strategy.get("entry_bricks") or 0) == SINGLE_STRATEGY_KERNEL_ENTRY_BRICKS,
-        "take_profit_bricks": int(strategy.get("take_profit_bricks") or 0) == SINGLE_STRATEGY_KERNEL_TAKE_PROFIT_BRICKS,
-        "stop_loss_bricks": int(strategy.get("stop_loss_bricks") or 0) == SINGLE_STRATEGY_KERNEL_STOP_LOSS_BRICKS,
-        "exit_management": str(strategy.get("exit_management") or "").lower() == "bracket",
-        "qty": abs(qty - 1.0) <= 1e-9,
+        "take_profit_bricks": strategy.get("take_profit_bricks") is None,
+        "stop_loss_bricks": strategy.get("stop_loss_bricks") is None,
+        "exit_management": str(strategy.get("exit_management") or "").lower() == "strategy",
+        "qty": abs(qty - SINGLE_STRATEGY_KERNEL_QTY) <= 1e-9,
         "market_data_source": str(data_block.get("market_data_source") or "").lower() == "shared_canonical_stream",
         "feed": str(data_block.get("feed") or "").lower() == "sip",
         "renko_source": str(data_block.get("renko_source") or "").lower() == CANONICAL_RENKO_SOURCE,

@@ -891,8 +891,8 @@
     },
     {
       "id": "camatron_tsla_1s_renko_0p58_e1_tp2_sl2_qty1_20260928_live",
-      "enabled": true,
-      "execution_enabled": true,
+      "enabled": false,
+      "execution_enabled": false,
       "symbol": "TSLA",
       "broker": "alpaca",
       "account_alias": "camatron",
@@ -909,7 +909,9 @@
         "brick_sizing_mode": "BRICK_PERCENT",
         "ltp_reference": 327.5,
         "live_qty_contract": 1,
-        "canary_topology": "camatron_tp_sl_only"
+        "canary_topology": "camatron_tp_sl_only",
+        "disabled_by": "camatron_tsla_reversal_0p32_e1_qty5_20261005_live",
+        "disabled_reason": "Replaced by approved static-brick TSLA E1 reversal promotion."
       },
       "data": {
         "market_data_source": "shared_canonical_stream",
@@ -951,6 +953,66 @@
       "sizing": {
         "type": "qty",
         "qty": 1
+      },
+      "risk": {
+        "max_daily_loss": 250,
+        "max_position_notional": 2500
+      },
+      "warm_start": {
+        "enabled": false,
+        "days": 0
+      }
+    },
+    {
+      "id": "camatron_tsla_1s_renko_reversal_0p32_e1_qty5_20261005_live",
+      "enabled": true,
+      "execution_enabled": true,
+      "symbol": "TSLA",
+      "broker": "alpaca",
+      "account_alias": "camatron",
+      "account_namespace": "camatron",
+      "mode": "live",
+      "event_log": "artifacts/live/fleet_live_events.jsonl",
+      "strategy_name": "tsla_1s_renko_reversal_0p32_e1_qty5_20261005_live",
+      "profile": {
+        "source": "tsla_reversal_persistent_regimes_v2_20261005",
+        "trust_status": "operator_approved_static_brick_promotion",
+        "strategy_logic": "pure_e1_reversal_hold_overnight",
+        "renko_logic": "1s_close_tradingview_style_reversal",
+        "renko_brick_pct": 0.32,
+        "brick_sizing_mode": "FIXED_DOLLARS",
+        "ltp_reference": 362.0348,
+        "live_qty_contract": 5,
+        "canonical_reference_identity": "69720bd9117f39c02db1c13bac27692a09cbc43402887c80a79072e6ad0b0859"
+      },
+      "data": {
+        "market_data_source": "shared_canonical_stream",
+        "market_data_profile": null,
+        "feed": "sip",
+        "renko_source": "1s_close"
+      },
+      "strategy": {
+        "type": "renko_reversal",
+        "brick_size": 1.15851136,
+        "renko_anchor_mode": "grid",
+        "renko_anchor_price": 0.0,
+        "entry_bricks": 1,
+        "allow_short": true,
+        "order_type": "market",
+        "exit_management": "strategy"
+      },
+      "session": {
+        "timezone": "America/New_York",
+        "entry_start": "09:31:00",
+        "entry_end": "15:59:59",
+        "force_flat": null,
+        "active_start_date": "2026-10-05",
+        "active_end_date": null,
+        "allow_overnight": true
+      },
+      "sizing": {
+        "type": "qty",
+        "qty": 5
       },
       "risk": {
         "max_daily_loss": 250,

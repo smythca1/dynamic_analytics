@@ -716,7 +716,7 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
         enabled_megatron = {trader["id"]: trader for trader in megatron["traders"] if trader.get("enabled")}
 
         expected_camatron = {
-            "camatron_tsla_1s_renko_0p58_e1_tp2_sl2_qty1_20260928_live": ("TSLA", "renko_tp_sl", 1.8995, 1, 2, 2),
+            "camatron_tsla_1s_renko_reversal_0p32_e1_qty5_20261005_live": ("TSLA", "renko_reversal", 1.15851136, 1, None, None),
         }
         self.assertEqual(set(enabled_camatron), set(expected_camatron))
         self.assertEqual(enabled_megatron, {})
@@ -728,14 +728,14 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
             self.assertEqual(trader["account_namespace"], "camatron")
             self.assertEqual(trader["data"]["market_data_source"], "shared_canonical_stream")
             self.assertEqual(trader["data"]["renko_source"], "1s_close")
-            self.assertEqual(trader["sizing"]["qty"], 1)
+            self.assertEqual(trader["sizing"]["qty"], 5)
             self.assertEqual(config.symbol, symbol)
             self.assertEqual(config.strategy_type, strategy_type)
             self.assertAlmostEqual(config.brick_size, brick_size)
             self.assertEqual(config.entry_bricks, entry)
             self.assertEqual(config.take_profit_bricks, tp)
             self.assertEqual(config.stop_loss_bricks, sl)
-            self.assertEqual(config.qty, 1)
+            self.assertEqual(config.qty, 5)
             if strategy_type == "renko_tp_sl":
                 self.assertEqual(config.entry_start, "09:30:15")
                 self.assertEqual(config.entry_end, "15:50:15")
@@ -4130,17 +4130,17 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
         self.assertEqual(len(active), 1)
         trader = active[0]
         strategy = build_strategy_config(trader)
-        self.assertEqual(trader["id"], "camatron_tsla_1s_renko_0p58_e1_tp2_sl2_qty1_20260928_live")
+        self.assertEqual(trader["id"], "camatron_tsla_1s_renko_reversal_0p32_e1_qty5_20261005_live")
         self.assertEqual(trader["symbol"], "TSLA")
         self.assertEqual(trader["account_namespace"], "camatron")
         self.assertEqual(trader["data"]["market_data_source"], "shared_canonical_stream")
         self.assertEqual(trader["data"]["feed"], "sip")
         self.assertEqual(trader["data"]["renko_source"], "1s_close")
-        self.assertEqual(strategy.strategy_type, "renko_tp_sl")
-        self.assertEqual(strategy.qty, 1)
-        self.assertEqual(strategy.exit_management, "bracket")
-        self.assertEqual(strategy.take_profit_bricks, 2)
-        self.assertEqual(strategy.stop_loss_bricks, 2)
+        self.assertEqual(strategy.strategy_type, "renko_reversal")
+        self.assertEqual(strategy.qty, 5)
+        self.assertEqual(strategy.exit_management, "strategy")
+        self.assertIsNone(strategy.take_profit_bricks)
+        self.assertIsNone(strategy.stop_loss_bricks)
 
     def test_single_strategy_kernel_validator_rejects_extra_active_renko_trader(self):
         config = json.loads(Path("configs/traders.live.example.json").read_text(encoding="utf-8"))
