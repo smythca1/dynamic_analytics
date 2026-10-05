@@ -803,7 +803,9 @@ class SharedCanonicalMarketDataServer:
         self.recovery = recovered
         self.journal_corruption = recovered.corruption
         self.events_by_symbol: dict[str, list[dict[str, Any]]] = {symbol: [] for symbol in config.symbols}
-        self.sequences: dict[str, int] = {symbol: 0 for symbol in config.symbols}
+        self.sequences: dict[str, int] = {
+            symbol: int(recovered.latest_sequences.get(symbol, 0)) for symbol in config.symbols
+        }
         for event in recovered.events:
             symbol = str(event.get("symbol") or "").upper()
             if symbol in self.events_by_symbol:
@@ -1291,11 +1293,17 @@ class SharedCanonicalMarketDataServer:
             raise RuntimeError("canonical journal must remain enabled for shared production market data")
         journal_path = Path(self.config.journal_path)
         if journal_path.exists() and journal_path.stat().st_size >= self.config.journal_max_bytes:
-            self._critical_event(
-                "journal_size_limit",
-                {"journal_path": str(journal_path), "journal_size_bytes": journal_path.stat().st_size},
+            archive_path = self.journal.rotate(latest_sequences=dict(self.sequences))
+            self._audit_event(
+                "journal_rotated",
+                {
+                    "journal_path": str(journal_path),
+                    "archive_path": str(archive_path) if archive_path else None,
+                    "journal_size_bytes": journal_path.stat().st_size if journal_path.exists() else 0,
+                    "latest_sequences": dict(self.sequences),
+                },
             )
-            raise RuntimeError("canonical journal size limit reached; shutting down ingestion")
+            self.metrics.increment("canonical_journal_rotations")
         symbol = str(event["symbol"]).upper()
         journal_started = time.perf_counter()
         self.journal.append(event)

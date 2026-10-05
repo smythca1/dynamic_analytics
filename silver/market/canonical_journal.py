@@ -43,6 +43,10 @@ class CanonicalJournal:
             raise ValueError("max_replay_records must be positive.")
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
+    @property
+    def checkpoint_path(self) -> Path:
+        return self.path.with_suffix(self.path.suffix + ".checkpoint.json")
+
     def append(self, event: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         raw = self.encode_record(event) + b"\n"
@@ -52,6 +56,51 @@ class CanonicalJournal:
             os.fsync(fd)
         finally:
             os.close(fd)
+
+    def rotate(
+        self,
+        *,
+        timestamp: object | None = None,
+        latest_sequences: dict[str, int] | None = None,
+    ) -> Path | None:
+        """Atomically archive the active journal and create a fresh append target."""
+        if not self.path.exists() or self.path.stat().st_size == 0:
+            return None
+        stamp = pd.Timestamp(timestamp or pd.Timestamp.now(tz="UTC"))
+        if stamp.tzinfo is None:
+            stamp = stamp.tz_localize("UTC")
+        stamp = stamp.tz_convert("UTC")
+        max_sequence = max((int(value) for value in (latest_sequences or {}).values()), default=0)
+        suffix = f"_{max_sequence:09d}" if max_sequence else ""
+        archive = self.path.with_name(f"{self.path.stem}_{stamp.strftime('%Y%m%dT%H%M%SZ')}{suffix}{self.path.suffix}")
+        counter = 1
+        while archive.exists():
+            archive = self.path.with_name(
+                f"{self.path.stem}_{stamp.strftime('%Y%m%dT%H%M%SZ')}{suffix}_{counter}{self.path.suffix}"
+            )
+            counter += 1
+        directory_fd = os.open(self.path.parent, os.O_RDONLY)
+        try:
+            os.replace(self.path, archive)
+            checkpoint = {
+                "version": 1,
+                "archived_journal": str(archive),
+                "latest_sequences": {str(key): int(value) for key, value in (latest_sequences or {}).items()},
+            }
+            checkpoint_tmp = self.checkpoint_path.with_name(self.checkpoint_path.name + ".tmp")
+            checkpoint_tmp.write_text(json.dumps(checkpoint, sort_keys=True) + "\n", encoding="utf-8")
+            with checkpoint_tmp.open("rb") as handle:
+                os.fsync(handle.fileno())
+            os.replace(checkpoint_tmp, self.checkpoint_path)
+            fd = os.open(self.path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o640)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return archive
 
     @staticmethod
     def payload_checksum(event: dict[str, Any]) -> str:
@@ -119,9 +168,10 @@ class CanonicalJournal:
 
     def recover(self) -> JournalRecovery:
         if not self.path.exists():
-            return JournalRecovery(events=tuple(), corrupted_records=0)
+            checkpoint_sequences = self._load_checkpoint_sequences()
+            return JournalRecovery(events=tuple(), corrupted_records=0, latest_sequences=checkpoint_sequences)
         self._events: list[dict[str, Any]] = []
-        self._latest_sequences: dict[str, int] = {}
+        self._latest_sequences: dict[str, int] = self._load_checkpoint_sequences()
         with self.path.open("r", encoding="utf-8") as handle:
             physical_line_number = 0
             while True:
@@ -207,6 +257,17 @@ class CanonicalJournal:
             corrupted_records=0,
             latest_sequences=dict(self._latest_sequences),
         )
+
+    def _load_checkpoint_sequences(self) -> dict[str, int]:
+        if not self.checkpoint_path.exists():
+            return {}
+        try:
+            payload = json.loads(self.checkpoint_path.read_text(encoding="utf-8"))
+            if payload.get("version") != 1 or not isinstance(payload.get("latest_sequences"), dict):
+                raise ValueError("invalid journal checkpoint")
+            return {str(key).upper(): int(value) for key, value in payload["latest_sequences"].items()}
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"invalid canonical journal checkpoint: {self.checkpoint_path}") from exc
 
     def replay_after(self, *, symbol: str, last_sequence: int, through_sequence: int | None = None) -> tuple[dict[str, Any], ...]:
         recovered = self.recover()
