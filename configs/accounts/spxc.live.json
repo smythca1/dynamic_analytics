@@ -1,0 +1,103 @@
+{
+  "fleet_id": "production-camatron-spxc-reversal-2p02-e1-qty5-20261007",
+  "experiment_id": "production-camatron-spxc-reversal-2p02-e1-qty5-20261007",
+  "account_namespace": "camatron",
+  "production_validation_profile": "isolated_spxc_v1",
+  "runtime_roots": {
+    "state": "artifacts/live/spxc/state/",
+    "events": "artifacts/live/spxc/events/",
+    "orders": "artifacts/live/spxc/orders/",
+    "evidence": "artifacts/live/spxc/evidence/",
+    "renko": "artifacts/live/spxc/renko/"
+  },
+  "traders": [
+    {
+      "id": "camatron_spxc_1s_renko_reversal_2p02_e1_qty5_20261007_live",
+      "enabled": true,
+      "execution_enabled": true,
+      "symbol": "SPXC",
+      "broker": "alpaca",
+      "account_alias": "camatron",
+      "account_namespace": "camatron",
+      "mode": "live",
+      "event_log": "/root/trading-server/artifacts/live/spxc/events/fleet_events.jsonl",
+      "strategy_name": "spxc_1s_renko_reversal_2p02_e1_qty5_20261007_live",
+      "profile": {
+        "source": "spxc_reversal_extension_20261007",
+        "trust_status": "operator_approved_live_deployment",
+        "strategy_logic": "pure_e1_reversal_hold_overnight",
+        "renko_logic": "1s_close_tradingview_style_reversal",
+        "research_selection_pct": "2.02",
+        "brick_sizing_mode": "FIXED_DOLLARS",
+        "reference_window_sessions": [
+          "2026-09-09",
+          "2026-09-10",
+          "2026-09-11",
+          "2026-09-14",
+          "2026-09-15",
+          "2026-09-16",
+          "2026-09-17",
+          "2026-09-18",
+          "2026-09-21",
+          "2026-09-22",
+          "2026-09-23",
+          "2026-09-24",
+          "2026-09-25",
+          "2026-09-28",
+          "2026-09-29",
+          "2026-09-30",
+          "2026-10-01",
+          "2026-10-02",
+          "2026-10-05",
+          "2026-10-06"
+        ],
+        "reference_session": "2026-09-09",
+        "reference_timestamp": "2026-09-09T13:30:02+00:00",
+        "reference_price": "195",
+        "fixed_dollar_brick": "3.9390",
+        "brick_percentage": "0.0202",
+        "automatic_recalibration": "disabled",
+        "entry_bricks": 1,
+        "live_qty_contract": 5
+      },
+      "data": {
+        "market_data_source": "shared_canonical_stream",
+        "market_data_profile": null,
+        "feed": "sip",
+        "renko_source": "1s_close"
+      },
+      "strategy": {
+        "type": "renko_reversal",
+        "brick_size": 3.9390,
+        "brick_sizing_mode": "FIXED_DOLLARS",
+        "renko_anchor_mode": "grid",
+        "renko_anchor_price": 0.0,
+        "entry_bricks": 1,
+        "allow_short": true,
+        "order_type": "market",
+        "exit_management": "strategy"
+      },
+      "session": {
+        "timezone": "America/New_York",
+        "entry_start": "09:31:00",
+        "entry_end": "15:59:59",
+        "force_flat": null,
+        "active_start_date": "2026-10-07",
+        "active_end_date": null,
+        "allow_overnight": true
+      },
+      "sizing": {
+        "type": "qty",
+        "qty": 5
+      },
+      "risk": {
+        "max_daily_loss": 250,
+        "max_position_notional": 2500
+      },
+      "warm_start": {
+        "enabled": false,
+        "days": 0
+      }
+    }
+  ]
+}

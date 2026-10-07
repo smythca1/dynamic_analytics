@@ -4,7 +4,8 @@
   "symbols": [
     "AAPL",
     "NVDA",
-    "TSLA"
+    "TSLA",
+    "SPXC"
   ],
   "socket_path": "/run/trading/market-data/live.sock",
   "journal_path": "/root/trading-server/artifacts/live/market-data/canonical_journal.jsonl",
@@ -27,6 +28,7 @@
   "contract_fingerprints": {
     "AAPL": "0761d66b121034dea1c4ab89569a5578084f60e072f7281d38d7a7ea7cdd580a",
     "NVDA": "83f01df8ed0b3ba105c94d1e042e5d63cf1f888b94d9e70d4ab45236605625d3",
-    "TSLA": "6ff4bc9a603abbde9999a767009a94304646032f458978c6d71cfc31e01b656d"
+    "TSLA": "6ff4bc9a603abbde9999a767009a94304646032f458978c6d71cfc31e01b656d",
+    "SPXC": "edd7a47a656bfb17ab8fe1b1135b7ad96103d93d149d439a5b5005b2dcad9bda"
   }
 }

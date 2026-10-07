@@ -27,6 +27,8 @@ SINGLE_STRATEGY_KERNEL_TRADER_ID = "camatron_tsla_1s_renko_reversal_0p32_e1_qty5
 SINGLE_STRATEGY_KERNEL_BRICK_PCT = Decimal("0.32")
 SINGLE_STRATEGY_KERNEL_ENTRY_BRICKS = 1
 SINGLE_STRATEGY_KERNEL_QTY = 5
+ISOLATED_SPXC_TRADER_ID = "camatron_spxc_1s_renko_reversal_2p02_e1_qty5_20261007_live"
+ISOLATED_SPXC_BRICK_SIZE = Decimal("3.9390")
 
 
 @dataclass(frozen=True)
@@ -374,6 +376,37 @@ def validate_single_strategy_kernel_config(data: dict[str, Any], *, config_path:
     )
     qty = as_float(sizing.get("qty"), default=0.0)
     brick_pct = _decimal_or_none(strategy.get("brick_pct") or profile.get("renko_brick_pct"))
+    validation_profile = str(data.get("production_validation_profile") or "").strip().lower()
+    if validation_profile == "isolated_spxc_v1":
+        session = trader.get("session") if isinstance(trader.get("session"), dict) else {}
+        checks = {
+            "trader_id": trader_id == ISOLATED_SPXC_TRADER_ID,
+            "symbol": str(trader.get("symbol") or "").upper() == "SPXC",
+            "broker": str(trader.get("broker") or "").lower() == "alpaca",
+            "account_namespace": account_namespace == "camatron",
+            "mode": str(trader.get("mode") or "").lower() == "live",
+            "strategy_type": str(strategy.get("type") or "").lower() == "renko_reversal",
+            "brick_sizing_mode": str(strategy.get("brick_sizing_mode") or "").upper() == "FIXED_DOLLARS",
+            "brick_size": _decimal_or_none(strategy.get("brick_size")) == ISOLATED_SPXC_BRICK_SIZE,
+            "entry_bricks": int(strategy.get("entry_bricks") or 0) == 1,
+            "take_profit_bricks": strategy.get("take_profit_bricks") is None,
+            "stop_loss_bricks": strategy.get("stop_loss_bricks") is None,
+            "exit_management": str(strategy.get("exit_management") or "").lower() == "strategy",
+            "qty": abs(qty - 5) <= 1e-9,
+            "market_data_source": str(data_block.get("market_data_source") or "").lower() == "shared_canonical_stream",
+            "feed": str(data_block.get("feed") or "").lower() == "sip",
+            "renko_source": str(data_block.get("renko_source") or "").lower() == CANONICAL_RENKO_SOURCE,
+            "allow_short": bool(strategy.get("allow_short", False)),
+            "allow_overnight": bool(session.get("allow_overnight", False)),
+            "force_flat": session.get("force_flat") is None,
+        }
+        failed = [name for name, ok in checks.items() if not ok]
+        if failed:
+            raise TraderConfigError(
+                f"{source}{trader_id}: isolated SPXC production contract violation: {', '.join(failed)}"
+            )
+        return
+
     checks = {
         "trader_id": trader_id == SINGLE_STRATEGY_KERNEL_TRADER_ID,
         "symbol": str(trader.get("symbol") or "").upper() == "TSLA",

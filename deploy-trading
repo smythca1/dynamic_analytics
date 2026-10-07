@@ -34,6 +34,9 @@ SERVICE_FILES=(
   "trading-fleet-live.service"
 )
 CONFIG_FILE="configs/traders.live.example.json"
+SPXC_CONFIG_FILE="configs/accounts/spxc.live.json"
+SPXC_SERVICE_FILE="trading-fleet-spxc-live.service"
+EXTRA_CONFIG_FILE=""
 
 EXCLUDED_PATHS=(
   ".git/"
@@ -60,11 +63,13 @@ DEPLOY_CONFIG=0
 RESTART_FLEET=0
 RESTART_MISSION=0
 DEPLOY_SERVICES=0
+DEPLOY_SPXC=0
 
 usage() {
   cat <<'EOF'
 Usage:
   ./deploy-trading --commit <sha> --dry-run [--deploy-config]
+  ./deploy-trading --commit <sha> --dry-run --deploy-spxc
   ./deploy-trading --commit <sha> --no-restart [--deploy-config]
   ./deploy-trading --restart-fleet
   ./deploy-trading --rollback <deployment-id> [--restart-fleet]
@@ -75,6 +80,7 @@ Options:
   --no-restart               Deploy code without restarting services.
   --deploy-config            Replace remote production config from the requested commit.
   --deploy-services          Replace remote systemd service unit files.
+  --deploy-spxc              Deploy the isolated SPXC config and service.
   --restart-fleet            Restart only trading-fleet-live.service.
   --restart-mission-control  Restart only mission-control.service.
   --rollback <deployment-id> Restore files from /root/deploy-backups/<deployment-id>.
@@ -119,6 +125,16 @@ parse_args() {
         shift
         ;;
       --deploy-services)
+        DEPLOY_SERVICES=1
+        shift
+        ;;
+      --deploy-spxc)
+        DEPLOY_SPXC=1
+        CONFIG_FILE="$SPXC_CONFIG_FILE"
+        SERVICE_FILES=("$SPXC_SERVICE_FILE")
+        FLEET_SERVICE="$SPXC_SERVICE_FILE"
+        EXTRA_CONFIG_FILE="configs/market-data.live.example.json"
+        DEPLOY_CONFIG=1
         DEPLOY_SERVICES=1
         shift
         ;;
@@ -237,6 +253,9 @@ require_payload_exists() {
   if [[ "$DEPLOY_CONFIG" == "1" ]]; then
     [[ -f "${source_dir}/${CONFIG_FILE}" ]] || die "requested config is missing from commit source: ${CONFIG_FILE}"
   fi
+  if [[ -n "$EXTRA_CONFIG_FILE" ]]; then
+    [[ -f "${source_dir}/${EXTRA_CONFIG_FILE}" ]] || die "required supporting config missing from commit source: ${EXTRA_CONFIG_FILE}"
+  fi
 }
 
 print_payload() {
@@ -254,6 +273,9 @@ print_payload() {
   fi
   if [[ "$DEPLOY_CONFIG" == "1" ]]; then
     echo "  ${CONFIG_FILE}"
+  fi
+  if [[ -n "$EXTRA_CONFIG_FILE" ]]; then
+    echo "  ${EXTRA_CONFIG_FILE}"
   fi
   echo
   echo "Payload excludes:"
@@ -286,6 +308,9 @@ print_payload_hashes() {
   done
   if [[ "$DEPLOY_CONFIG" == "1" ]]; then
     echo "  ${CONFIG_FILE} $(sha256_file "${source_dir}/${CONFIG_FILE}")"
+  fi
+  if [[ -n "$EXTRA_CONFIG_FILE" ]]; then
+    echo "  ${EXTRA_CONFIG_FILE} $(sha256_file "${source_dir}/${EXTRA_CONFIG_FILE}")"
   fi
   echo
 }
@@ -334,7 +359,7 @@ Remote staging directory: ${REMOTE_DIR}/.deploy-staging/${deployment_id}
 Remote backup directory: /root/deploy-backups/${deployment_id}
 Config policy: ${config_policy}
 Service file policy: $(if [[ "$DEPLOY_SERVICES" == "1" ]]; then echo "replace_from_commit"; else echo "preserve_remote"; fi)
-Config path used by service: ${REMOTE_DIR}/configs/traders.live.example.json
+Config path used by service: ${REMOTE_DIR}/${CONFIG_FILE}
 Services restarted by this command: none
 
 EOF
@@ -385,8 +410,12 @@ make_local_release() {
     done
   fi
   if [[ "$DEPLOY_CONFIG" == "1" ]]; then
-    mkdir -p "${release_dir}/configs"
+    mkdir -p "${release_dir}/$(dirname "$CONFIG_FILE")"
     install -m 0644 "${source_dir}/${CONFIG_FILE}" "${release_dir}/${CONFIG_FILE}"
+  fi
+  if [[ -n "$EXTRA_CONFIG_FILE" ]]; then
+    mkdir -p "${release_dir}/$(dirname "$EXTRA_CONFIG_FILE")"
+    install -m 0644 "${source_dir}/${EXTRA_CONFIG_FILE}" "${release_dir}/${EXTRA_CONFIG_FILE}"
   fi
 }
 
@@ -439,9 +468,9 @@ deploy_commit() {
   [[ "$DEPLOY_CONFIG" == "1" ]] && config_policy="replace_from_commit"
   requirements_hash="$(sha256_file "${CLEAN_SOURCE}/requirements.txt")"
   config_hash=""
-  if [[ "$DEPLOY_CONFIG" == "1" ]]; then
-    config_hash="$(sha256_file "${CLEAN_SOURCE}/${CONFIG_FILE}")"
-  fi
+if [[ "$DEPLOY_CONFIG" == "1" ]]; then
+  config_hash="$(sha256_file "${CLEAN_SOURCE}/${CONFIG_FILE}")"
+fi
 
   make_local_release "$CLEAN_SOURCE" "$LOCAL_RELEASE_DIR"
 
@@ -500,7 +529,7 @@ PY
   scp_base -r "${LOCAL_RELEASE_DIR}/." "${target}:${staging_dir}/"
 
   local validation_config="${REMOTE_DIR}/configs/traders.live.example.json"
-  if [[ "$DEPLOY_CONFIG" == "1" ]]; then
+if [[ "$DEPLOY_CONFIG" == "1" ]]; then
     validation_config="${staging_dir}/${CONFIG_FILE}"
   fi
 
@@ -708,9 +737,17 @@ for f in "\${service_files[@]}"; do
 done
 config_included=false
 if [[ "$DEPLOY_CONFIG" == "1" && -f "$CONFIG_FILE" ]]; then
-  cp -a "$CONFIG_FILE" $(quote "$backup_dir")/configs/
+  mkdir -p $(quote "$backup_dir")/$(quote "$(dirname "$CONFIG_FILE")")
+  cp -a "$CONFIG_FILE" $(quote "$backup_dir")/"$CONFIG_FILE"
   backed_up+=("$CONFIG_FILE")
   config_included=true
+fi
+if [[ "$DEPLOY_SPXC" == "1" ]]; then
+if [[ -f $(quote "$EXTRA_CONFIG_FILE") ]]; then
+  mkdir -p $(quote "$backup_dir")/$(quote "$(dirname "$EXTRA_CONFIG_FILE")")
+  cp -a $(quote "$EXTRA_CONFIG_FILE") $(quote "$backup_dir")/$(quote "$EXTRA_CONFIG_FILE")
+  backed_up+=("$(quote "$EXTRA_CONFIG_FILE")")
+fi
 fi
 prior_commit=null
 if [[ -f DEPLOYED_VERSION.json ]]; then
@@ -762,8 +799,9 @@ remote_service_promotion_script() {
 for f in ${SERVICE_FILES[*]@Q}; do
   activate_file "\$f"
 done
-install -m 0644 mission-control.service /etc/systemd/system/mission-control.service
-install -m 0644 trading-fleet-live.service /etc/systemd/system/trading-fleet-live.service
+for f in ${SERVICE_FILES[*]@Q}; do
+    install -m 0644 "\$f" /etc/systemd/system/"\$(basename "\$f")"
+  done
 systemctl daemon-reload
 EOF
 }
@@ -930,6 +968,9 @@ done
 if [[ "$DEPLOY_CONFIG" == "1" ]]; then
   activate_file "$CONFIG_FILE"
 fi
+if [[ "$DEPLOY_SPXC" == "1" ]]; then
+  activate_file "$(quote "$EXTRA_CONFIG_FILE")"
+fi
 $(remote_service_promotion_script)
 trap - ERR
 echo $(quote "$deployment_id") > .last_attempted_deployment_id
@@ -950,6 +991,9 @@ for f in ${RUNTIME_FILES[*]@Q}; do
 done
 if [[ "$DEPLOY_CONFIG" == "1" ]]; then
   rm -f "$CONFIG_FILE.__old__.$deployment_id"
+fi
+if [[ "$DEPLOY_SPXC" == "1" ]]; then
+  rm -f "$(quote "$EXTRA_CONFIG_FILE.__old__.$deployment_id")"
 fi
 if [[ "$DEPLOY_SERVICES" == "1" ]]; then
   for f in ${SERVICE_FILES[*]@Q}; do
@@ -991,7 +1035,7 @@ DRY RUN ONLY - no remote changes will be made.
 Rollback deployment ID: ${deployment_id}
 Backup path: ${backup_dir}
 Would restore backed-up runtime files, shared/, silver/, service files, requirements.txt.
-Would restore config only if ${backup_dir}/configs/${CONFIG_FILE##*/} exists.
+Would restore config only if ${backup_dir}/${CONFIG_FILE} exists.
 Would preserve artifacts, venv, evidence, logs, and state.
 Would run non-trading validation after restoration.
 Fleet restart requested: ${RESTART_FLEET}
@@ -1179,9 +1223,15 @@ done
 for f in ${RUNTIME_FILES[*]@Q}; do
   activate_backup_file "\$f"
 done
-if [[ -f $(quote "$backup_dir")/configs/${CONFIG_FILE##*/} ]]; then
-  mkdir -p configs
+if [[ -f $(quote "$backup_dir")/"$CONFIG_FILE" ]]; then
+  mkdir -p "$(dirname "$CONFIG_FILE")"
   activate_backup_file "$CONFIG_FILE"
+fi
+if [[ "$DEPLOY_SPXC" == "1" ]]; then
+if [[ -f $(quote "$backup_dir")/$(quote "$EXTRA_CONFIG_FILE") ]]; then
+  mkdir -p $(quote "$(dirname "$EXTRA_CONFIG_FILE")")
+  activate_backup_file $(quote "$EXTRA_CONFIG_FILE")
+fi
 fi
 service_files_restored=false
 for f in ${SERVICE_FILES[*]@Q}; do
@@ -1221,8 +1271,11 @@ done
 for f in ${RUNTIME_FILES[*]@Q}; do
   rm -f "\${f}.__rollback_old__.$deployment_id"
 done
-if [[ -f configs/${CONFIG_FILE##*/} ]]; then
+if [[ -f "$CONFIG_FILE" ]]; then
   rm -f "$CONFIG_FILE.__rollback_old__.$deployment_id"
+fi
+if [[ "$DEPLOY_SPXC" == "1" ]]; then
+  rm -f "$(quote "$EXTRA_CONFIG_FILE.__rollback_old__.$deployment_id")"
 fi
 for f in ${SERVICE_FILES[*]@Q}; do
   rm -f "\${f}.__rollback_old__.$deployment_id"
