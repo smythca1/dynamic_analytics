@@ -16,6 +16,11 @@ ExecutionMode = Literal["shadow", "real"]
 
 PRICE_FORMING_TRADE_CONDITIONS = {frozenset({"@"}), frozenset({"@", "F"})}
 
+
+def normalize_trade_conditions(conditions: tuple[str, ...]) -> tuple[str, ...]:
+    """Normalize source condition tokens before canonical eligibility evaluation."""
+    return tuple("@" if condition == " " else condition for condition in conditions)
+
 _ISO_TIMESTAMP_RE = re.compile(
     r"^(?P<date>\d{4}-\d{2}-\d{2})[T ]"
     r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})"
@@ -134,6 +139,9 @@ class MarketTick:
     trade_id: str = ""
     tape: str = ""
     conditions: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "conditions", normalize_trade_conditions(self.conditions))
 
     @classmethod
     def from_alpaca_trade(cls, message: dict[str, Any]) -> "MarketTick":

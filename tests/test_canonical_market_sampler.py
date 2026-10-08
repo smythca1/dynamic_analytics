@@ -5,8 +5,11 @@ import time
 import unittest
 from decimal import Decimal
 
+import pandas as pd
+
 from silver.market import CanonicalOneSecondSipSampler, RawSipTrade, evaluate_trade_eligibility
 from silver.market.shadow_parity import compare_with_production_sampler
+from trading_events import MarketTick
 
 
 D = Decimal
@@ -71,6 +74,30 @@ def run_bounded_sampler(trades: list[RawSipTrade], *, capacity: int):
 
 
 class CanonicalMarketSamplerTests(unittest.TestCase):
+    def test_alpaca_condition_normalization_preserves_canonical_eligibility_contract(self) -> None:
+        cases = (
+            ((" ",), ("@",), True),
+            ((" ", "F"), ("@", "F"), True),
+            ((" ", "I"), ("@", "I"), False),
+            ((" ", "F", "I"), ("@", "F", "I"), False),
+            ((" ", "4", "I"), ("@", "4", "I"), False),
+            ((" ", "O"), ("@", "O"), False),
+            (("@",), ("@",), True),
+            (("@", "F"), ("@", "F"), True),
+            (("X", "4"), ("X", "4"), False),
+        )
+        for original, expected, eligible in cases:
+            with self.subTest(original=original):
+                tick = MarketTick(
+                    timestamp=pd.Timestamp("2026-07-20T13:30:00Z"),
+                    symbol="INTC",
+                    price=100.0,
+                    size=1.0,
+                    conditions=original,
+                )
+                self.assertEqual(tick.conditions, expected)
+                self.assertEqual(evaluate_trade_eligibility(raw("2026-07-20T13:30:00Z", conditions=tick.conditions)).is_eligible, eligible)
+
     def test_eligible_price_forming_trade(self) -> None:
         decision = evaluate_trade_eligibility(raw("2026-07-20T13:30:00Z", conditions=("@", "F")))
         self.assertTrue(decision.is_eligible)

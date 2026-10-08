@@ -165,6 +165,52 @@ class SharedMarketDataServiceTests(unittest.IsolatedAsyncioTestCase):
             state_path=Path(self.temp.name) / f"{identity}.json",
         )
 
+    async def test_alpaca_blank_regular_sale_is_normalized_before_shared_filter(self):
+        adapter = CanonicalMarketObservationAdapter(run_id="condition-normalization")
+        first = live_market_event_from_archive_payload(
+            {
+                "timestamp": "2026-08-21T14:00:00.100Z",
+                "symbol": "AAPL",
+                "price": 100.0,
+                "size": 100,
+                "trade_id": "blank-sale",
+                "conditions": [" "],
+            },
+            source_sequence=1,
+        )
+        self.assertEqual(first.tick.conditions, ("@",))
+        self.assertTrue(first.eligible)
+        await self.server.ingest_raw_trade(first, adapter)
+
+        rejected = live_market_event_from_archive_payload(
+            {
+                "timestamp": "2026-08-21T14:00:00.200Z",
+                "symbol": "AAPL",
+                "price": 100.1,
+                "size": 100,
+                "trade_id": "odd-lot-sale",
+                "conditions": [" ", "I"],
+            },
+            source_sequence=2,
+        )
+        self.assertEqual(rejected.tick.conditions, ("@", "I"))
+        self.assertFalse(rejected.eligible)
+
+        second = live_market_event_from_archive_payload(
+            {
+                "timestamp": "2026-08-21T14:00:01.100Z",
+                "symbol": "AAPL",
+                "price": 100.2,
+                "size": 100,
+                "trade_id": "regular-sale",
+                "conditions": [" ", "F"],
+            },
+            source_sequence=3,
+        )
+        emitted = await self.server.ingest_raw_trade(second, adapter)
+        self.assertEqual(len(emitted), 1)
+        self.assertEqual(emitted[0]["source_trade_id"], "blank-sale")
+
     async def test_two_consumers_receive_identical_canonical_observation_and_ack(self):
         camatron = await self._consumer("camatron")
         megatron = await self._consumer("megatron")
