@@ -847,6 +847,7 @@ class SharedCanonicalMarketDataServer:
             "pending_canonical_bucket_by_symbol": {},
             "canonical_flush_expected_by_symbol": {},
             "canonical_flush_expected_at_by_symbol": {},
+            "symbol_delivery_failure_by_symbol": {},
             "consumers": {},
         }
         self._last_health_write_monotonic = 0.0
@@ -1105,6 +1106,16 @@ class SharedCanonicalMarketDataServer:
                 for symbol in subscribed_symbols
                 if symbol in last_sequences
             }
+            if identity in self.consumers:
+                await write_message(
+                    writer,
+                    {
+                        "type": "consumer_identity_conflict",
+                        "identity": identity,
+                        "reason": "consumer identity is already connected",
+                    },
+                )
+                return
             replay_head = dict(self.sequences)
             consumer = ConsumerState(
                 identity=identity,
@@ -1356,6 +1367,7 @@ class SharedCanonicalMarketDataServer:
             "canonical_flush_expected_at": self.health.get(
                 "canonical_flush_expected_at_by_symbol", {}
             ).get(symbol),
+            "symbol_delivery_failure": self.health.get("symbol_delivery_failure_by_symbol", {}).get(symbol),
             "last_canonical_observation": self.health.get("last_canonical_observation_by_symbol", {}).get(symbol),
         }
         for consumer in tuple(self.consumers.values()):
@@ -1649,7 +1661,22 @@ class AlpacaSipUpstream:
             self._status({"authenticated": True})
             await websocket.send(json.dumps({"action": "subscribe", "trades": list(self.config.symbols)}))
             subscription = await self._wait_for_control_ack(websocket, phase="subscription")
-            self._status({"subscription_acknowledged": True, "subscription": subscription})
+            acknowledged_symbols = {
+                str(symbol).upper()
+                for message in subscription
+                if message.get("T") == "subscription"
+                for symbol in list(message.get("trades") or [])
+            }
+            missing_symbols = sorted(set(self.config.symbols) - acknowledged_symbols)
+            self._status(
+                {
+                    "subscription_acknowledged": True,
+                    "subscription": subscription,
+                    "symbol_delivery_failure_by_symbol": {
+                        symbol: "subscription_not_acknowledged" for symbol in missing_symbols
+                    },
+                }
+            )
             async for raw in websocket:
                 frame_started = time.perf_counter()
                 messages = json.loads(raw)

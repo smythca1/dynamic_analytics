@@ -244,6 +244,29 @@ class SharedMarketDataServiceTests(unittest.IsolatedAsyncioTestCase):
             await cam_iter.aclose()
             await meg_iter.aclose()
 
+    async def test_duplicate_consumer_identity_fails_closed(self):
+        first = await self._consumer("camatron:tsla")
+        first_iter = first.connect().__aiter__()
+        first_task = asyncio.create_task(first_iter.__anext__())
+        try:
+            for _ in range(20):
+                if "camatron:tsla" in self.server.consumers:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIn("camatron:tsla", self.server.consumers)
+
+            duplicate = await self._consumer("camatron:tsla")
+            duplicate_iter = duplicate.connect().__aiter__()
+            try:
+                with self.assertRaisesRegex(RuntimeError, "identity conflict"):
+                    await asyncio.wait_for(duplicate_iter.__anext__(), timeout=2)
+            finally:
+                await duplicate_iter.aclose()
+        finally:
+            first_task.cancel()
+            await asyncio.gather(first_task, return_exceptions=True)
+            await first_iter.aclose()
+
     async def test_reconnect_replays_missed_observation_in_order(self):
         adapter = CanonicalMarketObservationAdapter(run_id="test-replay")
         await self.server.ingest_raw_trade(trade("AAPL", "2026-08-21T14:00:00.100Z", 100.0, 1), adapter)

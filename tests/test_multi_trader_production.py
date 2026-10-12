@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from shared.config.trader_config import TraderConfigError, validate_production_fleet_config
+from shared.config.trader_config import TraderConfigError, production_consumer_identity, validate_production_fleet_config
 from silver.market.ipc_consumer import SharedCanonicalStreamConsumer
 
 
@@ -29,6 +29,19 @@ class MultiTraderProductionTests(unittest.TestCase):
         config = self._three_trader_config()
         config["traders"][2]["symbol"] = "TSLA"
         with self.assertRaisesRegex(TraderConfigError, "symbols must be unique"):
+            validate_production_fleet_config(config)
+
+    def test_consumer_identity_is_deterministic_and_trader_scoped(self):
+        config = self._three_trader_config()
+        identities = [production_consumer_identity(trader) for trader in config["traders"]]
+        self.assertEqual(identities[0], "camatron:" + config["traders"][0]["id"])
+        self.assertEqual(len(identities), len(set(identities)))
+
+    def test_duplicate_consumer_identity_fails_closed(self):
+        config = self._three_trader_config()
+        config["traders"][2]["id"] = config["traders"][0]["id"]
+        config["traders"][2]["symbol"] = "NVDA"
+        with self.assertRaisesRegex(TraderConfigError, "trader ids must be unique"):
             validate_production_fleet_config(config)
 
     def test_symbol_local_gap_does_not_block_other_symbol(self):
@@ -99,7 +112,7 @@ class MultiTraderProductionTests(unittest.TestCase):
             "shared_market_data_canonical_emission_failed",
         )
 
-    def test_symbol_raw_stale_does_not_block_other_symbol(self):
+    def test_symbol_raw_quiet_does_not_block_other_symbol(self):
         consumer = self._ready_consumer()
         old = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(seconds=10)).isoformat()
         consumer.symbol_health["SPXC"] = {
@@ -116,7 +129,28 @@ class MultiTraderProductionTests(unittest.TestCase):
             "last_raw_trade": pd.Timestamp.now(tz="UTC").isoformat(),
             "canonical_flush_expected": False,
         }
-        self.assertTrue(consumer.signal_block_reason("SPXC").startswith("shared_market_data_raw_stale_"))
+        self.assertIsNone(consumer.signal_block_reason("SPXC"))
+        self.assertIsNone(consumer.signal_block_reason("TSLA"))
+
+    def test_explicit_symbol_delivery_failure_blocks_only_symbol(self):
+        consumer = self._ready_consumer()
+        consumer.symbol_health["SPXC"] = {
+            "symbol": "SPXC",
+            "journal_healthy": True,
+            "gap_count": 0,
+            "symbol_delivery_failure": "subscription_rejected",
+            "canonical_flush_expected": False,
+        }
+        consumer.symbol_health["TSLA"] = {
+            "symbol": "TSLA",
+            "journal_healthy": True,
+            "gap_count": 0,
+            "canonical_flush_expected": False,
+        }
+        self.assertEqual(
+            consumer.signal_block_reason("SPXC"),
+            "shared_market_data_symbol_delivery_failed_subscription_rejected",
+        )
         self.assertIsNone(consumer.signal_block_reason("TSLA"))
 
     def test_startup_requires_two_live_observations(self):

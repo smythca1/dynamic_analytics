@@ -32,6 +32,7 @@ from shared.config.trader_config import (
     canonical_observation_source_for_non_renko,
     load_production_renko_config,
     normalize_renko_source,
+    production_consumer_identity,
     validate_renko_trader_source,
     validate_production_fleet_config,
 )
@@ -171,6 +172,17 @@ def slug(value: str) -> str:
 def normalize_optional_namespace(value: object) -> str | None:
     raw = str(value or "").strip().lower()
     return raw or None
+
+
+def shared_consumer_identity(runtime: TraderRuntime) -> str:
+    """Return the stable IPC identity for one trader runtime."""
+    return production_consumer_identity(
+        {
+            "id": runtime.trader_id,
+            "account_namespace": runtime.account_namespace,
+            "credential_profile": runtime.credential_profile,
+        }
+    )
 
 
 def normalize_market_data_source(value: object) -> str:
@@ -3056,20 +3068,15 @@ async def run_market_stream(
         by_symbol.setdefault(runtime.symbol, []).append(runtime)
 
     if market_data_source == "shared_canonical_stream":
-        identity = normalize_optional_namespace(runtimes[0].account_namespace or runtimes[0].credential_profile) or "camatron"
-        expected_fingerprints: dict[str, str] = {}
-        for runtime in runtimes:
-            market = (runtime.contract_fingerprints or {}).get("market_stream") if isinstance(runtime.contract_fingerprints, dict) else None
-            fingerprint = market.get("fingerprint") if isinstance(market, dict) else None
-            if fingerprint:
-                expected_fingerprints[runtime.symbol] = str(fingerprint)
+        identities = [shared_consumer_identity(runtime) for runtime in runtimes]
+        if len(identities) != len(set(identities)):
+            raise RuntimeError(f"duplicate shared canonical consumer identity: {identities}")
         socket_path = getattr(args, "shared_market_socket", None)
         if not socket_path and getattr(args, "shared_market_data_config", None):
             with Path(str(args.shared_market_data_config)).open("r", encoding="utf-8") as handle:
                 socket_path = json.load(handle)["socket_path"]
         if not socket_path:
             raise RuntimeError("shared_canonical_stream requires --shared-market-socket or --shared-market-data-config.")
-        consumer_state_path = root / "market_consumers" / f"{slug(identity)}.json"
         for runtime in runtimes:
             runtime.log.write(
                 "runner_started",
@@ -3089,21 +3096,31 @@ async def run_market_stream(
             )
             archive_engine_state(root, runtime, reason="runner_started")
         while True:
-            consumer = SharedCanonicalStreamConsumer(
-                socket_path=str(socket_path),
-                identity=identity,
-                expected_contract_fingerprints=expected_fingerprints,
-                state_path=consumer_state_path,
-                symbols=tuple(symbols),
-                freshness_threshold_seconds=float(getattr(args, "shared_market_freshness_seconds", 5.0)),
-            )
-            stream = consumer.connect().__aiter__()
-            next_event_task = asyncio.create_task(stream.__anext__())
+            consumers: dict[str, SharedCanonicalStreamConsumer] = {}
+            streams: dict[str, Any] = {}
+            pending_reads: dict[asyncio.Task[Any], str] = {}
+            for runtime in runtimes:
+                identity = shared_consumer_identity(runtime)
+                market = (runtime.contract_fingerprints or {}).get("market_stream") if isinstance(runtime.contract_fingerprints, dict) else None
+                fingerprint = market.get("fingerprint") if isinstance(market, dict) else None
+                consumer = SharedCanonicalStreamConsumer(
+                    socket_path=str(socket_path),
+                    identity=identity,
+                    expected_contract_fingerprints={runtime.symbol: str(fingerprint)} if fingerprint else {},
+                    state_path=root / "market_consumers" / f"{slug(identity)}.json",
+                    symbols=(runtime.symbol,),
+                    freshness_threshold_seconds=float(getattr(args, "shared_market_freshness_seconds", 5.0)),
+                )
+                consumers[runtime.trader_id] = consumer
+                stream = consumer.connect().__aiter__()
+                streams[runtime.trader_id] = stream
+                pending_reads[asyncio.create_task(stream.__anext__())] = runtime.trader_id
             try:
                 while True:
-                    done, _pending = await asyncio.wait({next_event_task}, timeout=1.0)
+                    done, _pending = await asyncio.wait(set(pending_reads), timeout=1.0)
                     if not done:
                         for runtime in runtimes:
+                            consumer = consumers[runtime.trader_id]
                             block_reason = consumer.signal_block_reason(runtime.symbol)
                             previous_block_reason = runtime.market_data_signal_block_reason
                             object.__setattr__(runtime, "market_data_signal_block_reason", block_reason)
@@ -3118,10 +3135,14 @@ async def run_market_stream(
                                 )
                             reconcile_broker_state_if_due_or_halt(root, runtime)
                         continue
-                    canonical_event = next_event_task.result()
-                    next_event_task = asyncio.create_task(stream.__anext__())
-                    tick = canonical_event.to_market_tick()
-                    for runtime in by_symbol.get(tick.symbol, []):
+                    for completed in done:
+                        trader_id = pending_reads.pop(completed)
+                        canonical_event = completed.result()
+                        consumer = consumers[trader_id]
+                        stream = streams[trader_id]
+                        pending_reads[asyncio.create_task(stream.__anext__())] = trader_id
+                        runtime = next(item for item in runtimes if item.trader_id == trader_id)
+                        tick = canonical_event.to_market_tick()
                         block_reason = consumer.signal_block_reason(runtime.symbol)
                         previous_block_reason = runtime.market_data_signal_block_reason
                         if block_reason is not None:
@@ -3138,13 +3159,15 @@ async def run_market_stream(
                             )
                         process_market_tick_for_runtime(root=root, args=args, runtime=runtime, tick=tick, source_event=None)
                         object.__setattr__(runtime, "market_data_signal_block_reason", previous_block_reason)
-                    await consumer.ack(canonical_event)
+                        await consumer.ack(canonical_event)
             except asyncio.CancelledError:
-                await close_stream_after_pending_read(stream, next_event_task)
+                for task, trader_id in list(pending_reads.items()):
+                    await close_stream_after_pending_read(streams[trader_id], task)
                 flush_evidence(runtimes)
                 raise
             except Exception as exc:
-                await close_stream_after_pending_read(stream, next_event_task)
+                for task, trader_id in list(pending_reads.items()):
+                    await close_stream_after_pending_read(streams[trader_id], task)
                 for runtime in runtimes:
                     runtime.log.write(
                         "stream_error",

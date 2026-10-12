@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import struct
 from hashlib import sha256
 from typing import Any
@@ -9,7 +10,7 @@ from typing import Any
 
 PROTOCOL_VERSION = "canonical_market_ipc.v1"
 MAX_FRAME_BYTES = 4 * 1024 * 1024
-VALID_CONSUMER_IDENTITIES = {"camatron", "megatron"}
+CONSUMER_IDENTITY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,127}$")
 
 
 class ProtocolError(ValueError):
@@ -73,6 +74,6 @@ def validate_message(message: dict[str, Any]) -> None:
 
 def validate_consumer_identity(identity: str) -> str:
     normalized = str(identity or "").strip().lower()
-    if normalized not in VALID_CONSUMER_IDENTITIES:
+    if not CONSUMER_IDENTITY_PATTERN.fullmatch(normalized):
         raise ProtocolError(f"Invalid consumer identity: {identity!r}.")
     return normalized

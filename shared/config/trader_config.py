@@ -450,6 +450,9 @@ def validate_production_fleet_config(data: dict[str, Any], *, config_path: str |
         raise TraderConfigError(f"{source}active execution trader ids must be unique: {ids}")
     if len(symbols) != len(set(symbols)):
         raise TraderConfigError(f"{source}active execution symbols must be unique: {symbols}")
+    consumer_ids = [production_consumer_identity(trader) for trader in active]
+    if len(consumer_ids) != len(set(consumer_ids)):
+        raise TraderConfigError(f"{source}active execution consumer identities must be unique: {consumer_ids}")
     namespaces = {
         normalized_account_namespace(
             trader.get("account_namespace") or trader.get("account_alias") or trader.get("credential_profile")
@@ -507,6 +510,17 @@ def canonical_observation_source_for_non_renko() -> str:
 def normalized_account_namespace(value: Any) -> str | None:
     raw = str(value or "").strip().lower()
     return raw or None
+
+
+def production_consumer_identity(trader: dict[str, Any]) -> str:
+    """Return the deterministic shared-market identity for one configured trader."""
+    trader_id = str(trader.get("id") or "").strip().lower()
+    if not trader_id:
+        raise TraderConfigError("active execution traders require non-empty ids")
+    namespace = normalized_account_namespace(
+        trader.get("account_namespace") or trader.get("account_alias") or trader.get("credential_profile")
+    ) or "default"
+    return f"{namespace}:{trader_id}"
 
 
 def as_float(value: Any, default: float = 0.0) -> float:

@@ -130,6 +130,9 @@ class SharedCanonicalStreamConsumer:
                 if message_type == "contract_mismatch":
                     self.gapped = True
                     raise RuntimeError(f"shared canonical stream contract mismatch: {message}")
+                if message_type == "consumer_identity_conflict":
+                    self.gapped = True
+                    raise RuntimeError(f"shared canonical stream consumer identity conflict: {message}")
                 if message_type != "observation":
                     if message_type == "symbol_health":
                         symbol = str(message.get("symbol") or "").upper().strip()
@@ -185,16 +188,14 @@ class SharedCanonicalStreamConsumer:
             health = self.symbol_health.get(normalized_symbol, {})
             if not bool(health.get("journal_healthy", True)) or int(health.get("gap_count", 0)) > 0:
                 return "shared_market_data_gap"
+            delivery_failure = health.get("symbol_delivery_failure")
+            if delivery_failure:
+                return f"shared_market_data_symbol_delivery_failed_{delivery_failure}"
             if normalized_symbol not in self.startup_ready_symbols:
                 return "shared_market_data_not_ready"
             last_raw = health.get("last_raw_trade")
             last_eligible = health.get("last_eligible_trade")
-            if last_raw is None:
-                return "shared_market_data_raw_not_seen"
             now = pd.Timestamp.now(tz="UTC")
-            raw_age = (now - pd.Timestamp(last_raw)).total_seconds()
-            if raw_age > self.freshness_threshold_seconds:
-                return f"shared_market_data_raw_stale_{raw_age:.3f}s"
             flush_expected = bool(health.get("canonical_flush_expected", False))
             if flush_expected:
                 expected_at = health.get("canonical_flush_expected_at")
