@@ -65,6 +65,9 @@ class SharedCanonicalStreamConsumer:
         self.catchup_complete = False
         self.last_observation_at: pd.Timestamp | None = None
         self.last_observation_at_by_symbol: dict[str, pd.Timestamp] = {}
+        self.symbol_health: dict[str, dict[str, Any]] = {}
+        self.live_observation_count_by_symbol: dict[str, int] = {}
+        self.startup_ready_symbols: set[str] = set()
         self._writer: asyncio.StreamWriter | None = None
 
     @staticmethod
@@ -114,6 +117,8 @@ class SharedCanonicalStreamConsumer:
                     continue
                 if message_type == "catchup_complete":
                     self.catchup_complete = True
+                    self.live_observation_count_by_symbol.clear()
+                    self.startup_ready_symbols.clear()
                     continue
                 if message_type == "gap":
                     symbol = str(message.get("symbol") or "").upper().strip()
@@ -126,6 +131,10 @@ class SharedCanonicalStreamConsumer:
                     self.gapped = True
                     raise RuntimeError(f"shared canonical stream contract mismatch: {message}")
                 if message_type != "observation":
+                    if message_type == "symbol_health":
+                        symbol = str(message.get("symbol") or "").upper().strip()
+                        if symbol:
+                            self.symbol_health[symbol] = dict(message)
                     continue
                 event = CanonicalStreamEvent(message)
                 key = (event.symbol, event.sequence, event.event_id)
@@ -143,6 +152,11 @@ class SharedCanonicalStreamConsumer:
                 observation_at = pd.Timestamp(event.payload["observation_timestamp"])
                 self.last_observation_at = observation_at
                 self.last_observation_at_by_symbol[event.symbol] = observation_at
+                if self.catchup_complete:
+                    count = self.live_observation_count_by_symbol.get(event.symbol, 0) + 1
+                    self.live_observation_count_by_symbol[event.symbol] = count
+                    if count >= 2:
+                        self.startup_ready_symbols.add(event.symbol)
                 yield event
         finally:
             if self._writer is writer:
@@ -167,6 +181,32 @@ class SharedCanonicalStreamConsumer:
             return "shared_market_data_gap"
         if not self.catchup_complete:
             return "shared_market_data_not_caught_up"
+        if normalized_symbol:
+            health = self.symbol_health.get(normalized_symbol, {})
+            if not bool(health.get("journal_healthy", True)) or int(health.get("gap_count", 0)) > 0:
+                return "shared_market_data_gap"
+            if normalized_symbol not in self.startup_ready_symbols:
+                return "shared_market_data_not_ready"
+            last_raw = health.get("last_raw_trade")
+            last_eligible = health.get("last_eligible_trade")
+            if last_raw is None:
+                return "shared_market_data_raw_not_seen"
+            now = pd.Timestamp.now(tz="UTC")
+            raw_age = (now - pd.Timestamp(last_raw)).total_seconds()
+            if raw_age > self.freshness_threshold_seconds:
+                return f"shared_market_data_raw_stale_{raw_age:.3f}s"
+            flush_expected = bool(health.get("canonical_flush_expected", False))
+            if flush_expected:
+                expected_at = health.get("canonical_flush_expected_at")
+                if expected_at:
+                    expected_age = (now - pd.Timestamp(expected_at)).total_seconds()
+                    if expected_age > self.freshness_threshold_seconds:
+                        return "shared_market_data_canonical_emission_failed"
+                return None
+            # An active raw feed with no recent eligible trade is quiet and healthy.
+            if last_eligible is None:
+                return None
+            return None
         last_observation_at = self.last_observation_at_by_symbol.get(normalized_symbol) if normalized_symbol else self.last_observation_at
         if last_observation_at is None:
             return "shared_market_data_no_observation"

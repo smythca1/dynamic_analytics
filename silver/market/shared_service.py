@@ -820,6 +820,7 @@ class SharedCanonicalMarketDataServer:
         self._canonical_heartbeat_monotonic_by_symbol: dict[str, float] = {}
         self._canonical_publication_monotonic_by_symbol: dict[str, float] = {}
         self._canonical_source_high_water_by_symbol: dict[str, pd.Timestamp] = {}
+        self._last_symbol_health_publish_monotonic: dict[str, float] = {}
         self.health: dict[str, Any] = {
             "sip_connected": False,
             "subscription_acknowledged": False,
@@ -834,6 +835,7 @@ class SharedCanonicalMarketDataServer:
             "critical_events": [],
             "audit_events": [],
             "last_raw_trade_by_symbol": {},
+            "last_eligible_trade_by_symbol": {},
             "raw_trade_count_by_symbol": {},
             "eligible_raw_trade_count_by_symbol": {},
             "excluded_raw_trade_count_by_symbol": {},
@@ -842,6 +844,9 @@ class SharedCanonicalMarketDataServer:
             "last_canonical_publication_by_symbol": {},
             "last_canonical_sampler_admission_by_symbol": {},
             "last_canonical_source_timestamp_by_symbol": {},
+            "pending_canonical_bucket_by_symbol": {},
+            "canonical_flush_expected_by_symbol": {},
+            "canonical_flush_expected_at_by_symbol": {},
             "consumers": {},
         }
         self._last_health_write_monotonic = 0.0
@@ -1331,6 +1336,44 @@ class SharedCanonicalMarketDataServer:
                     consumer.writer.close()
         self._refresh_health()
 
+    async def publish_symbol_health(self, symbol: str, *, force: bool = False) -> None:
+        symbol = symbol.upper()
+        now_monotonic = time.monotonic()
+        if not force and now_monotonic - self._last_symbol_health_publish_monotonic.get(symbol, 0.0) < 1.0:
+            return
+        self._last_symbol_health_publish_monotonic[symbol] = now_monotonic
+        payload = {
+            "type": "symbol_health",
+            "symbol": symbol,
+            "journal_healthy": bool(self.health.get("journal_healthy", False)),
+            "gap_count": int(self.health.get("gap_count", 0)),
+            "last_raw_trade": self.health.get("last_raw_trade_by_symbol", {}).get(symbol),
+            "last_eligible_trade": self.health.get("last_eligible_trade_by_symbol", {}).get(symbol),
+            "pending_canonical_bucket": self.health.get("pending_canonical_bucket_by_symbol", {}).get(symbol),
+            "canonical_flush_expected": bool(
+                self.health.get("canonical_flush_expected_by_symbol", {}).get(symbol, False)
+            ),
+            "canonical_flush_expected_at": self.health.get(
+                "canonical_flush_expected_at_by_symbol", {}
+            ).get(symbol),
+            "last_canonical_observation": self.health.get("last_canonical_observation_by_symbol", {}).get(symbol),
+        }
+        for consumer in tuple(self.consumers.values()):
+            if consumer.subscribed_symbols and symbol not in consumer.subscribed_symbols:
+                continue
+            try:
+                consumer.queue.put_nowait(payload)
+            except asyncio.QueueFull:
+                consumer.stale = True
+                consumer.dropped_message_count += 1
+                self.health["dropped_message_count"] += 1
+                gap = {"type": "gap", "symbol": symbol, "reason": "consumer_queue_overflow"}
+                if consumer.replaying:
+                    consumer.pending_control_messages.append(gap)
+                else:
+                    await write_message(consumer.writer, gap)
+                    consumer.writer.close()
+
     def _mark_canonical_sampler_admission(self, symbol: str, source_timestamp: pd.Timestamp) -> None:
         symbol = symbol.upper()
         now_wall = pd.Timestamp.now(tz="UTC")
@@ -1396,9 +1439,12 @@ class SharedCanonicalMarketDataServer:
             excluded_counts[symbol] = int(excluded_counts.get(symbol, 0)) + 1
             self.metrics.increment("raw_trades_rejected")
             self.metrics.observe("ingest_raw_trade_seconds", time.perf_counter() - ingest_started)
+            self._refresh_health()
+            await self.publish_symbol_health(symbol)
             return tuple()
         eligible_counts = self.health.setdefault("eligible_raw_trade_count_by_symbol", {})
         eligible_counts[symbol] = int(eligible_counts.get(symbol, 0)) + 1
+        self.health["last_eligible_trade_by_symbol"][symbol] = event.tick.timestamp.isoformat()
         sampler_started = time.perf_counter()
         result = adapter.process_tick(event.tick, trader_id="shared_market_data_service", source_event=event)
         sampler_done = time.perf_counter()
@@ -1408,6 +1454,12 @@ class SharedCanonicalMarketDataServer:
         if result.eligibility is not None and result.eligibility.is_eligible:
             self._mark_canonical_sampler_admission(symbol, event.tick.timestamp)
             self._refresh_health()
+        if result.observations:
+            self.health["canonical_flush_expected_by_symbol"][symbol] = True
+            self.health.setdefault("canonical_flush_expected_at_by_symbol", {})[symbol] = pd.Timestamp.now(tz="UTC").isoformat()
+        self._refresh_sampler_activity(symbol, adapter)
+        if result.observations:
+            await self.publish_symbol_health(symbol, force=True)
         emitted: list[dict[str, Any]] = []
         for observation in result.observations:
             finalize_started = time.perf_counter()
@@ -1451,8 +1503,22 @@ class SharedCanonicalMarketDataServer:
             await self.publish_event(payload)
             emitted.append(payload)
             self.metrics.increment("canonical_closes_finalized")
+        self.health["canonical_flush_expected_by_symbol"][symbol] = False
+        self.health.setdefault("canonical_flush_expected_at_by_symbol", {}).pop(symbol, None)
+        self._refresh_sampler_activity(symbol, adapter)
+        await self.publish_symbol_health(symbol, force=True)
         self.metrics.observe("ingest_raw_trade_seconds", time.perf_counter() - ingest_started)
         return tuple(emitted)
+
+    def _refresh_sampler_activity(self, symbol: str, adapter: CanonicalMarketObservationAdapter) -> None:
+        symbol = symbol.upper()
+        snapshot = adapter.snapshot(trader_id="shared_market_data_service", symbol=symbol)
+        state = snapshot.get("state") if isinstance(snapshot, dict) else None
+        pending_bucket = state.get("pending_bucket") if isinstance(state, dict) else None
+        if pending_bucket is None:
+            self.health["pending_canonical_bucket_by_symbol"].pop(symbol, None)
+        else:
+            self.health["pending_canonical_bucket_by_symbol"][symbol] = pending_bucket
 
     def _disk_usage_snapshot(self) -> dict[str, int]:
         usage = os.statvfs(str(Path(self.config.archive_root).parent if not Path(self.config.archive_root).exists() else self.config.archive_root))
