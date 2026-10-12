@@ -33,7 +33,7 @@ from shared.config.trader_config import (
     load_production_renko_config,
     normalize_renko_source,
     validate_renko_trader_source,
-    validate_single_strategy_kernel_config,
+    validate_production_fleet_config,
 )
 from renko_builder import RenkoBuildState, initial_renko_close
 from silver.evidence import EvidenceLogger
@@ -2823,7 +2823,7 @@ def handle_action(runtime: TraderRuntime, signal: Signal, intent: OrderIntent, r
 
 
 def should_isolate_runtime_failure(runtime: TraderRuntime) -> bool:
-    return normalize_optional_namespace(runtime.account_namespace) == "megatron" or runtime.market_data_source == "local_archive_tail"
+    return True
 
 
 def should_isolate_broker_engine_mismatch(runtime: TraderRuntime) -> bool:
@@ -3103,8 +3103,8 @@ async def run_market_stream(
                 while True:
                     done, _pending = await asyncio.wait({next_event_task}, timeout=1.0)
                     if not done:
-                        block_reason = consumer.signal_block_reason()
                         for runtime in runtimes:
+                            block_reason = consumer.signal_block_reason(runtime.symbol)
                             previous_block_reason = runtime.market_data_signal_block_reason
                             object.__setattr__(runtime, "market_data_signal_block_reason", block_reason)
                             if block_reason is not None and block_reason != previous_block_reason:
@@ -3121,8 +3121,8 @@ async def run_market_stream(
                     canonical_event = next_event_task.result()
                     next_event_task = asyncio.create_task(stream.__anext__())
                     tick = canonical_event.to_market_tick()
-                    block_reason = consumer.signal_block_reason()
                     for runtime in by_symbol.get(tick.symbol, []):
+                        block_reason = consumer.signal_block_reason(runtime.symbol)
                         previous_block_reason = runtime.market_data_signal_block_reason
                         if block_reason is not None:
                             object.__setattr__(runtime, "market_data_signal_block_reason", block_reason)
@@ -3328,7 +3328,7 @@ async def async_main() -> None:
         for trader in config.get("traders", [])
     )
     if args.execute_real and active_live_requested:
-        validate_single_strategy_kernel_config(config, config_path=args.config)
+        validate_production_fleet_config(config, config_path=args.config)
     runtimes = build_runtimes(config, args)
     grouped = group_runtimes(runtimes)
     if not grouped:

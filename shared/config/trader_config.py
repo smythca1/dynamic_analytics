@@ -431,6 +431,60 @@ def validate_single_strategy_kernel_config(data: dict[str, Any], *, config_path:
         )
 
 
+def validate_production_fleet_config(data: dict[str, Any], *, config_path: str | None = None) -> None:
+    """Validate a generic multi-trader shared-account production fleet."""
+    source = f"{config_path}: " if config_path else ""
+    active = [
+        trader for trader in data.get("traders", [])
+        if isinstance(trader, dict)
+        and bool(trader.get("enabled", True))
+        and bool(trader.get("execution_enabled", True))
+    ]
+    if not active:
+        raise TraderConfigError(f"{source}production fleet requires at least one active execution trader")
+    ids = [str(trader.get("id") or "") for trader in active]
+    symbols = [str(trader.get("symbol") or "").upper() for trader in active]
+    if any(not value for value in ids + symbols):
+        raise TraderConfigError(f"{source}active execution traders require non-empty ids and symbols")
+    if len(ids) != len(set(ids)):
+        raise TraderConfigError(f"{source}active execution trader ids must be unique: {ids}")
+    if len(symbols) != len(set(symbols)):
+        raise TraderConfigError(f"{source}active execution symbols must be unique: {symbols}")
+    namespaces = {
+        normalized_account_namespace(
+            trader.get("account_namespace") or trader.get("account_alias") or trader.get("credential_profile")
+        )
+        for trader in active
+    }
+    configured_account_ids = {
+        str(trader.get("expected_account_id") or "")
+        for trader in active
+        if trader.get("expected_account_id")
+    }
+    if len(namespaces) != 1 or None in namespaces or len(configured_account_ids) > 1:
+        raise TraderConfigError(f"{source}active execution traders must share one explicit account identity")
+    for trader in active:
+        trader_id = str(trader["id"])
+        if str(trader.get("mode") or "").lower() != "live":
+            raise TraderConfigError(f"{source}{trader_id}: active production trader must use live mode")
+        if str(trader.get("broker") or "").lower() != "alpaca":
+            raise TraderConfigError(f"{source}{trader_id}: active production trader must use Alpaca")
+        data_block = trader.get("data") if isinstance(trader.get("data"), dict) else {}
+        if str(data_block.get("market_data_source") or "").lower() not in {"shared_canonical_stream", "shared_canonical"}:
+            raise TraderConfigError(f"{source}{trader_id}: active production trader must use shared_canonical_stream")
+        if str(data_block.get("feed") or "").lower() != "sip":
+            raise TraderConfigError(f"{source}{trader_id}: active production trader must use SIP")
+        if str(data_block.get("renko_source") or "") != CANONICAL_RENKO_SOURCE:
+            raise TraderConfigError(f"{source}{trader_id}: active production trader must use {CANONICAL_RENKO_SOURCE}")
+        try:
+            strategy_config = build_strategy_config(trader)
+            validate_renko_trader_source(trader)
+        except Exception as exc:
+            raise TraderConfigError(f"{source}{trader_id}: invalid production strategy contract: {exc}") from exc
+        if not isinstance(strategy_config, RenkoStrategyConfig):
+            raise TraderConfigError(f"{source}{trader_id}: production fleet currently supports Renko traders only")
+
+
 def normalize_renko_source(value: Any) -> str:
     try:
         return validate_canonical_renko_source(value)

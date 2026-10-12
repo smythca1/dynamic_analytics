@@ -61,8 +61,10 @@ class SharedCanonicalStreamConsumer:
         self.freshness_threshold_seconds = float(freshness_threshold_seconds)
         self.state = self.load_state()
         self.gapped = False
+        self.gapped_symbols: set[str] = set()
         self.catchup_complete = False
         self.last_observation_at: pd.Timestamp | None = None
+        self.last_observation_at_by_symbol: dict[str, pd.Timestamp] = {}
         self._writer: asyncio.StreamWriter | None = None
 
     @staticmethod
@@ -114,7 +116,11 @@ class SharedCanonicalStreamConsumer:
                     self.catchup_complete = True
                     continue
                 if message_type == "gap":
-                    self.gapped = True
+                    symbol = str(message.get("symbol") or "").upper().strip()
+                    if symbol:
+                        self.gapped_symbols.add(symbol)
+                    else:
+                        self.gapped = True
                     continue
                 if message_type == "contract_mismatch":
                     self.gapped = True
@@ -131,10 +137,12 @@ class SharedCanonicalStreamConsumer:
                     await self.ack(event)
                     continue
                 if event.sequence > current_sequence + 1 and current_sequence > 0:
-                    self.gapped = True
+                    self.gapped_symbols.add(event.symbol)
                     continue
                 seen.add(key)
-                self.last_observation_at = pd.Timestamp(event.payload["observation_timestamp"])
+                observation_at = pd.Timestamp(event.payload["observation_timestamp"])
+                self.last_observation_at = observation_at
+                self.last_observation_at_by_symbol[event.symbol] = observation_at
                 yield event
         finally:
             if self._writer is writer:
@@ -153,14 +161,16 @@ class SharedCanonicalStreamConsumer:
         if self._writer is not None:
             await write_message(self._writer, {"type": "ack", "symbol": event.symbol, "sequence": event.sequence, "event_id": event.event_id})
 
-    def signal_block_reason(self) -> str | None:
-        if self.gapped:
+    def signal_block_reason(self, symbol: str | None = None) -> str | None:
+        normalized_symbol = str(symbol or "").upper().strip() or None
+        if self.gapped or (normalized_symbol and normalized_symbol in self.gapped_symbols):
             return "shared_market_data_gap"
         if not self.catchup_complete:
             return "shared_market_data_not_caught_up"
-        if self.last_observation_at is None:
+        last_observation_at = self.last_observation_at_by_symbol.get(normalized_symbol) if normalized_symbol else self.last_observation_at
+        if last_observation_at is None:
             return "shared_market_data_no_observation"
-        age = (pd.Timestamp.now(tz="UTC") - self.last_observation_at).total_seconds()
+        age = (pd.Timestamp.now(tz="UTC") - last_observation_at).total_seconds()
         if age > self.freshness_threshold_seconds:
             return f"shared_market_data_stale_{age:.3f}s"
         return None

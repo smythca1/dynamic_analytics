@@ -556,7 +556,7 @@ class DeployTradingTests(unittest.TestCase):
         validation = result.stdout.split("Validation commands:", 1)[1]
         self.assertNotIn("--execute-real", validation)
         self.assertIn("python fleet_runner.py --help", validation)
-        self.assertIn("validate_single_strategy_kernel_config", validation)
+        self.assertIn("validate_production_fleet_config", validation)
 
     def test_backup_excludes_persistent_artifacts_and_venv(self) -> None:
         script = (self.repo / "deploy-trading").read_text()
@@ -722,7 +722,7 @@ class DeployTradingTests(unittest.TestCase):
         ssh_log = (fake_bin / "ssh.log").read_text(encoding="utf-8")
         scp_log = (fake_bin / "scp.log").read_text(encoding="utf-8")
         self.assertIn("py_compile", ssh_log)
-        self.assertIn("validate_single_strategy_kernel_config", ssh_log)
+        self.assertIn("validate_production_fleet_config", ssh_log)
         self.assertIn("backup_metadata", ssh_log)
         self.assertIn("activate_dir", ssh_log)
         self.assertIn("DEPLOYED_VERSION.json", ssh_log)

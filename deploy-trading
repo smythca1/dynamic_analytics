@@ -375,12 +375,12 @@ Validation commands:
   import json
   import sys
   from pathlib import Path
-  from shared.config.trader_config import build_strategy_config, validate_single_strategy_kernel_config
+  from shared.config.trader_config import build_strategy_config, validate_production_fleet_config
   data = json.loads(Path(sys.argv[1]).read_text())
   for trader in data.get("traders", []):
       if isinstance(trader, dict) and trader.get("enabled", False):
           build_strategy_config(trader)
-  validate_single_strategy_kernel_config(data, config_path=sys.argv[1])
+  validate_production_fleet_config(data, config_path=sys.argv[1])
   print("enabled trader config validation OK")
   PY
   python fleet_runner.py --help
@@ -442,13 +442,13 @@ python - "$config_path" <<'PY'
 import json
 import sys
 from pathlib import Path
-from shared.config.trader_config import build_strategy_config, validate_single_strategy_kernel_config
+from shared.config.trader_config import build_strategy_config, validate_production_fleet_config
 config_path = Path(sys.argv[1])
 data = json.loads(config_path.read_text())
 for trader in data.get("traders", []):
     if isinstance(trader, dict) and trader.get("enabled", False):
         build_strategy_config(trader)
-validate_single_strategy_kernel_config(data, config_path=str(config_path))
+validate_production_fleet_config(data, config_path=str(config_path))
 print("enabled trader config validation OK")
 PY
 python fleet_runner.py --help >/dev/null
