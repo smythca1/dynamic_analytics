@@ -89,6 +89,10 @@ class DeployTradingTests(unittest.TestCase):
         self._write("silver/evidence/logger.py", "# logger\n")
         self._write("silver/evidence/shadow_sampler.py", "# shadow\n")
         self._write("configs/traders.live.example.json", '{"traders": [{"id": "t1", "enabled": true}]}\n')
+        self._write(
+            "configs/market-data.live.example.json",
+            '{"symbols": ["TSLA"], "contract_fingerprints": {"TSLA": "t"}}\n',
+        )
         self._write("replay/engine.py", "# excluded\n")
         self._write("tests/test_example.py", "# excluded\n")
         self._write("artifacts/live/out.jsonl", "{}\n")
@@ -182,6 +186,7 @@ class DeployTradingTests(unittest.TestCase):
         result = self._run("--commit", self.commit, "--dry-run", "--deploy-config")
         self.assertIn("Config policy: replace_from_commit", result.stdout)
         self.assertIn("  configs/traders.live.example.json", result.stdout)
+        self.assertIn("  configs/market-data.live.example.json", result.stdout)
 
     def test_default_deployment_performs_no_restart(self) -> None:
         result = self._run("--commit", self.commit, "--dry-run")

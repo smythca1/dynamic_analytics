@@ -39,6 +39,7 @@ SPXC_CONFIG_FILE="configs/accounts/spxc.live.json"
 MEGATRON_CONFIG_FILE="configs/accounts/megatron.live.json"
 SPXC_SERVICE_FILE="trading-fleet-spxc-live.service"
 EXTRA_CONFIG_FILE=""
+MARKET_CONFIG_FILE="configs/market-data.live.example.json"
 
 EXCLUDED_PATHS=(
   ".git/"
@@ -124,6 +125,7 @@ parse_args() {
         ;;
       --deploy-config)
         DEPLOY_CONFIG=1
+        EXTRA_CONFIG_FILE="$MARKET_CONFIG_FILE"
         shift
         ;;
       --deploy-services)
@@ -255,7 +257,7 @@ require_payload_exists() {
   if [[ "$DEPLOY_CONFIG" == "1" ]]; then
     [[ -f "${source_dir}/${CONFIG_FILE}" ]] || die "requested config is missing from commit source: ${CONFIG_FILE}"
   fi
-  if [[ -n "$EXTRA_CONFIG_FILE" ]]; then
+  if [[ "$DEPLOY_CONFIG" == "1" && -n "$EXTRA_CONFIG_FILE" ]]; then
     [[ -f "${source_dir}/${EXTRA_CONFIG_FILE}" ]] || die "required supporting config missing from commit source: ${EXTRA_CONFIG_FILE}"
   fi
 }
@@ -276,7 +278,7 @@ print_payload() {
   if [[ "$DEPLOY_CONFIG" == "1" ]]; then
     echo "  ${CONFIG_FILE}"
   fi
-  if [[ -n "$EXTRA_CONFIG_FILE" ]]; then
+  if [[ "$DEPLOY_CONFIG" == "1" && -n "$EXTRA_CONFIG_FILE" ]]; then
     echo "  ${EXTRA_CONFIG_FILE}"
   fi
   echo
@@ -311,7 +313,7 @@ print_payload_hashes() {
   if [[ "$DEPLOY_CONFIG" == "1" ]]; then
     echo "  ${CONFIG_FILE} $(sha256_file "${source_dir}/${CONFIG_FILE}")"
   fi
-  if [[ -n "$EXTRA_CONFIG_FILE" ]]; then
+  if [[ "$DEPLOY_CONFIG" == "1" && -n "$EXTRA_CONFIG_FILE" ]]; then
     echo "  ${EXTRA_CONFIG_FILE} $(sha256_file "${source_dir}/${EXTRA_CONFIG_FILE}")"
   fi
   echo
@@ -415,16 +417,17 @@ make_local_release() {
     mkdir -p "${release_dir}/$(dirname "$CONFIG_FILE")"
     install -m 0644 "${source_dir}/${CONFIG_FILE}" "${release_dir}/${CONFIG_FILE}"
   fi
-  if [[ -n "$EXTRA_CONFIG_FILE" ]]; then
+  if [[ "$DEPLOY_CONFIG" == "1" && -n "$EXTRA_CONFIG_FILE" ]]; then
     mkdir -p "${release_dir}/$(dirname "$EXTRA_CONFIG_FILE")"
     install -m 0644 "${source_dir}/${EXTRA_CONFIG_FILE}" "${release_dir}/${EXTRA_CONFIG_FILE}"
   fi
 }
 
 remote_validation_script() {
-  local staging_dir="$1"
-  local shared_config_path="$2"
-  shift 2
+  local release_commit="$1"
+  local staging_dir="$2"
+  local shared_config_path="$3"
+  shift 3
   local fleet_config_paths=("$@")
   local quoted_fleet_paths=""
   local fleet_config_path
@@ -453,6 +456,7 @@ import sys
 from pathlib import Path
 from shared.config.trader_config import build_strategy_config, validate_production_fleet_config
 from silver.market.shared_service import SharedMarketDataConfig, validate_shared_market_data_config
+from shared.deployment.release_contract import build_release_contract
 
 shared_config_path = Path(sys.argv[1])
 fleet_configs = []
@@ -475,6 +479,17 @@ if not shared_config_path.is_file():
     raise ValueError(f"shared market-data config is missing: {shared_config_path}")
 shared_config = SharedMarketDataConfig.load(shared_config_path)
 validate_shared_market_data_config(shared_config, fleet_configs)
+combined = {"traders": []}
+for fleet in fleet_configs:
+    combined["traders"].extend(fleet.get("traders", []))
+contract = build_release_contract(
+    commit=$(quote "$release_commit"),
+    config_paths=[shared_config_path, *[Path(raw_path) for raw_path in sys.argv[2:]]],
+    trader_config=combined,
+    market_config=json.loads(shared_config_path.read_text(encoding="utf-8")),
+    service_dependencies={"trading-fleet-live.service": [str(path) for path in sys.argv[2:]]},
+)
+print(json.dumps({"release_contract": contract}, sort_keys=True))
 print("shared market-data deployment preflight OK")
 PY
 python fleet_runner.py --help >/dev/null
@@ -494,13 +509,23 @@ deploy_commit() {
   [[ "$DEPLOY_CONFIG" == "1" ]] && config_policy="replace_from_commit"
   requirements_hash="$(sha256_file "${CLEAN_SOURCE}/requirements.txt")"
   config_hash=""
+  config_hashes="{}"
 if [[ "$DEPLOY_CONFIG" == "1" ]]; then
   config_hash="$(sha256_file "${CLEAN_SOURCE}/${CONFIG_FILE}")"
+  config_hashes="$(python3 - "${CLEAN_SOURCE}" "$CONFIG_FILE" "$EXTRA_CONFIG_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+paths = [sys.argv[2]] + ([sys.argv[3]] if sys.argv[3] else [])
+print(json.dumps({path: __import__('hashlib').sha256((root / path).read_bytes()).hexdigest() for path in paths}, sort_keys=True))
+PY
+)"
 fi
 
   make_local_release "$CLEAN_SOURCE" "$LOCAL_RELEASE_DIR"
 
-  python3 - "$manifest_file" "$deployment_id" "$commit" "$SOURCE_REPOSITORY" "$requirements_hash" "$config_policy" "$config_hash" "$backup_dir" "$DEPLOY_CONFIG" "$DEPLOY_SERVICES" "${RUNTIME_FILES[@]}" --packages "${PACKAGE_DIRS[@]}" --services "${SERVICE_FILES[@]}" <<'PY'
+  python3 - "$manifest_file" "$deployment_id" "$commit" "$SOURCE_REPOSITORY" "$requirements_hash" "$config_policy" "$config_hash" "$config_hashes" "$backup_dir" "$DEPLOY_CONFIG" "$DEPLOY_SERVICES" "${RUNTIME_FILES[@]}" --packages "${PACKAGE_DIRS[@]}" --services "${SERVICE_FILES[@]}" <<'PY'
 import json
 import os
 import sys
@@ -512,12 +537,13 @@ source_repository = sys.argv[4]
 requirements_hash = sys.argv[5]
 config_policy = sys.argv[6]
 config_hash = sys.argv[7] or None
-backup_dir = sys.argv[8]
-deploy_config = bool(int(sys.argv[9]))
-deploy_services = bool(int(sys.argv[10]))
-packages_separator = sys.argv.index("--packages", 11)
+config_hashes = json.loads(sys.argv[8])
+backup_dir = sys.argv[9]
+deploy_config = bool(int(sys.argv[10]))
+deploy_services = bool(int(sys.argv[11]))
+packages_separator = sys.argv.index("--packages", 12)
 services_separator = sys.argv.index("--services", packages_separator + 1)
-runtime_files = sys.argv[11:packages_separator]
+runtime_files = sys.argv[12:packages_separator]
 package_dirs = sys.argv[packages_separator + 1:services_separator]
 service_files = sys.argv[services_separator + 1:]
 manifest = {
@@ -536,6 +562,7 @@ manifest = {
     "requirements_hash": requirements_hash,
     "config_policy": config_policy,
     "config_hash": config_hash,
+    "configuration_hashes": config_hashes,
     "backup_id": deployment_id,
     "backup_path": backup_dir,
     "validation_status": os.environ.get("DEPLOY_TEST_MANIFEST_STATUS_OVERRIDE", "generated"),
@@ -555,7 +582,7 @@ PY
   scp_base -r "${LOCAL_RELEASE_DIR}/." "${target}:${staging_dir}/"
 
   local validation_shared_config="${REMOTE_DIR}/configs/market-data.live.example.json"
-  if [[ -n "$EXTRA_CONFIG_FILE" ]]; then
+  if [[ "$DEPLOY_CONFIG" == "1" && -n "$EXTRA_CONFIG_FILE" ]]; then
     validation_shared_config="${staging_dir}/${EXTRA_CONFIG_FILE}"
   fi
   local validation_fleet_configs=()
@@ -569,7 +596,7 @@ PY
   done
 
   echo "Validating staged release without live execution"
-  ssh_base "$target" "bash -lc $(quote "$(remote_validation_script "$staging_dir" "$validation_shared_config" "${validation_fleet_configs[@]}")")"
+  ssh_base "$target" "bash -lc $(quote "$(remote_validation_script "$commit" "$staging_dir" "$validation_shared_config" "${validation_fleet_configs[@]}")")"
 
   echo "Validating deployment manifest before promotion"
   ssh_base "$target" "bash -lc $(quote "$(remote_mark_manifest_validated_script "$deployment_id" "$commit" "${staging_dir}/DEPLOYED_VERSION.json")")"
@@ -777,7 +804,7 @@ if [[ "$DEPLOY_CONFIG" == "1" && -f "$CONFIG_FILE" ]]; then
   backed_up+=("$CONFIG_FILE")
   config_included=true
 fi
-if [[ "$DEPLOY_SPXC" == "1" ]]; then
+if [[ "$DEPLOY_CONFIG" == "1" && -n "$EXTRA_CONFIG_FILE" ]]; then
 if [[ -f $(quote "$EXTRA_CONFIG_FILE") ]]; then
   mkdir -p $(quote "$backup_dir")/$(quote "$(dirname "$EXTRA_CONFIG_FILE")")
   cp -a $(quote "$EXTRA_CONFIG_FILE") $(quote "$backup_dir")/$(quote "$EXTRA_CONFIG_FILE")
@@ -1003,7 +1030,7 @@ done
 if [[ "$DEPLOY_CONFIG" == "1" ]]; then
   activate_file "$CONFIG_FILE"
 fi
-if [[ "$DEPLOY_SPXC" == "1" ]]; then
+if [[ "$DEPLOY_CONFIG" == "1" && -n "$EXTRA_CONFIG_FILE" ]]; then
   activate_file "$(quote "$EXTRA_CONFIG_FILE")"
 fi
 $(remote_service_promotion_script)
@@ -1027,7 +1054,7 @@ done
 if [[ "$DEPLOY_CONFIG" == "1" ]]; then
   rm -f "$CONFIG_FILE.__old__.$deployment_id"
 fi
-if [[ "$DEPLOY_SPXC" == "1" ]]; then
+if [[ "$DEPLOY_CONFIG" == "1" && -n "$EXTRA_CONFIG_FILE" ]]; then
   rm -f "$(quote "$EXTRA_CONFIG_FILE.__old__.$deployment_id")"
 fi
 if [[ "$DEPLOY_SERVICES" == "1" ]]; then
@@ -1262,7 +1289,7 @@ if [[ -f $(quote "$backup_dir")/"$CONFIG_FILE" ]]; then
   mkdir -p "$(dirname "$CONFIG_FILE")"
   activate_backup_file "$CONFIG_FILE"
 fi
-if [[ "$DEPLOY_SPXC" == "1" ]]; then
+if [[ "$DEPLOY_CONFIG" == "1" && -n "$EXTRA_CONFIG_FILE" ]]; then
 if [[ -f $(quote "$backup_dir")/$(quote "$EXTRA_CONFIG_FILE") ]]; then
   mkdir -p $(quote "$(dirname "$EXTRA_CONFIG_FILE")")
   activate_backup_file $(quote "$EXTRA_CONFIG_FILE")
@@ -1309,7 +1336,7 @@ done
 if [[ -f "$CONFIG_FILE" ]]; then
   rm -f "$CONFIG_FILE.__rollback_old__.$deployment_id"
 fi
-if [[ "$DEPLOY_SPXC" == "1" ]]; then
+if [[ "$DEPLOY_CONFIG" == "1" && -n "$EXTRA_CONFIG_FILE" ]]; then
   rm -f "$(quote "$EXTRA_CONFIG_FILE.__rollback_old__.$deployment_id")"
 fi
 for f in ${SERVICE_FILES[*]@Q}; do
