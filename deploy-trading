@@ -503,20 +503,22 @@ remote_activation_gate_script() {
   local baseline_config="$2"
   local candidate_config="$3"
   local market_config="$4"
+  local manifest_path="$5"
   cat <<EOF
 set -euo pipefail
 cd $(quote "$REMOTE_DIR")
 if [[ -f .env ]]; then set -a; . ./.env; set +a; fi
-python - $(quote "$mode") $(quote "$baseline_config") $(quote "$candidate_config") $(quote "$market_config") <<'PY'
+python - $(quote "$mode") $(quote "$baseline_config") $(quote "$candidate_config") $(quote "$market_config") $(quote "$manifest_path") <<'PY'
 import json
+import hashlib
 import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from alpaca_trader import AlpacaTrader, load_alpaca_credentials
-from shared.deployment.release_contract import evaluate_broker_snapshot, evaluate_checkpoint_snapshot
+from shared.deployment.release_contract import evaluate_broker_snapshot, evaluate_checkpoint_snapshot, validate_historical_checkpoint_authorizations
 
-mode, baseline_path, candidate_path, market_path = sys.argv[1:]
+mode, baseline_path, candidate_path, market_path, manifest_path = sys.argv[1:]
 out = {"evaluated_at_utc": datetime.now(timezone.utc).isoformat(), "mode": mode, "broker": "not_evaluated", "checkpoint": "not_evaluated"}
 expected_account = os.environ.get("DEPLOY_EXPECTED_ACCOUNT_ID")
 if not expected_account:
@@ -526,6 +528,12 @@ if not expected_account:
 
 baseline = json.loads(Path(baseline_path).read_text(encoding="utf-8")) if Path(baseline_path).is_file() else {"traders": []}
 candidate = json.loads(Path(candidate_path).read_text(encoding="utf-8"))
+manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+historical_authorizations = manifest.get("historical_checkpoint_authorizations", [])
+if not isinstance(historical_authorizations, list):
+    out["checkpoint"] = {"status": "BLOCKED", "errors": ["historical_checkpoint_authorizations must be a list"]}
+    print(json.dumps(out, sort_keys=True))
+    raise SystemExit(42)
 
 def enabled(config):
     return [t for t in config.get("traders", []) if isinstance(t, dict) and t.get("enabled")]
@@ -569,8 +577,10 @@ try:
     broker_positions = {str(p.get("symbol", "")).upper(): float(p.get("qty") or 0) for p in positions if isinstance(p, dict)}
     checkpoints = {identity: None for identity in new}
     state_root = Path("artifacts/live/state")
+    inventory = []
+    identities_seen = {}
     if state_root.is_dir():
-        for state_path in state_root.glob("*.json"):
+        for state_path in sorted(state_root.rglob("*.json")):
             try:
                 payload = json.loads(state_path.read_text(encoding="utf-8"))
             except Exception as exc:
@@ -583,16 +593,49 @@ try:
                 print(json.dumps(out, sort_keys=True))
                 raise SystemExit(42)
             identity = str(identity)
+            relative_path = state_path.relative_to(Path.cwd()).as_posix()
+            digest = hashlib.sha256(state_path.read_bytes()).hexdigest()
+            source = payload.get("original_state") if isinstance(payload.get("original_state"), dict) else payload
+            engine = source.get("engine") if isinstance(source.get("engine"), dict) else {}
+            inventory.append({
+                "path": relative_path,
+                "sha256": digest,
+                "trader_id": identity,
+                "symbol": str(source.get("symbol") or payload.get("symbol") or "").upper(),
+                "strategy_type": str(engine.get("strategy_type") or engine.get("type") or source.get("strategy_type") or ""),
+                "strategy_identity": str(engine.get("strategy_name") or engine.get("identity") or source.get("strategy_identity") or ""),
+            })
+            if identity in identities_seen:
+                out["checkpoint"] = {"status": "BLOCKED", "errors": [f"duplicate checkpoint identity: {identity}", identities_seen[identity], relative_path]}
+                print(json.dumps(out, sort_keys=True))
+                raise SystemExit(42)
+            identities_seen[identity] = relative_path
             checkpoints[identity] = payload
-            if identity in new and state_path.name != f"{identity}.json":
+            if identity in new and state_path.relative_to(state_root).as_posix() != f"{identity}.json":
                 out["checkpoint"] = {"status": "BLOCKED", "errors": [f"{identity}: checkpoint path is not identity-specific: {state_path.name}"]}
                 print(json.dumps(out, sort_keys=True))
                 raise SystemExit(42)
+    authorization_gate = validate_historical_checkpoint_authorizations(
+        historical_authorizations,
+        inventory,
+        active_trader_ids=set(new),
+    )
+    if authorization_gate["status"] != "PASS":
+        out["checkpoint"] = authorization_gate
+        print(json.dumps(out, sort_keys=True))
+        raise SystemExit(42)
+    authorized_paths = {str(record["checkpoint_path"]) for record in authorization_gate["validated"]}
+    checkpoints = {
+        identity: payload for identity, payload in checkpoints.items()
+        if next((row["path"] for row in inventory if row["trader_id"] == identity), None) not in authorized_paths
+    }
     checkpoint_gate = evaluate_checkpoint_snapshot(checkpoints, candidate_traders=[
         {"id": str(t.get("id")), "symbol": str(t.get("symbol", "")).upper(), "quantity": (t.get("sizing") or {}).get("qty")}
         for t in new.values()
     ], broker_positions=broker_positions, retired_trader_ids=set(old) - set(new))
     out["checkpoint"] = checkpoint_gate
+    out["checkpoint"]["historical_authorizations"] = authorization_gate["validated"]
+    out["checkpoint"]["inventory"] = inventory
 except Exception as exc:
     out["error"] = f"activation gate unavailable: {type(exc).__name__}: {exc}"
     print(json.dumps(out, sort_keys=True))
@@ -677,6 +720,14 @@ manifest = {
     "fleet_restart_status": "not_requested",
     "mission_control_restart_status": "not_requested",
 }
+raw_authorizations = os.environ.get("DEPLOY_HISTORICAL_CHECKPOINT_AUTHORIZATIONS", "[]")
+try:
+    historical_authorizations = json.loads(raw_authorizations)
+except json.JSONDecodeError as exc:
+    raise SystemExit(f"DEPLOY_HISTORICAL_CHECKPOINT_AUTHORIZATIONS must be valid JSON: {exc}")
+if not isinstance(historical_authorizations, list):
+    raise SystemExit("DEPLOY_HISTORICAL_CHECKPOINT_AUTHORIZATIONS must be a JSON list")
+manifest["historical_checkpoint_authorizations"] = historical_authorizations
 with open(manifest_path, "w", encoding="utf-8") as handle:
     json.dump(manifest, handle, indent=2, sort_keys=True)
     handle.write("\n")
@@ -707,7 +758,7 @@ PY
   ssh_base "$target" "bash -lc $(quote "$(remote_validation_script "$commit" "$staging_dir" "$validation_shared_config" "${validation_fleet_configs[@]}")")"
 
   echo "Evaluating broker/checkpoint activation gates before promotion"
-  ssh_base "$target" "bash -lc $(quote "$(remote_activation_gate_script pre_activation "${REMOTE_DIR}/${STANDARD_CONFIG_FILE}" "${staging_dir}/${STANDARD_CONFIG_FILE}" "${validation_shared_config}")")"
+  ssh_base "$target" "bash -lc $(quote "$(remote_activation_gate_script pre_activation "${REMOTE_DIR}/${STANDARD_CONFIG_FILE}" "${staging_dir}/${STANDARD_CONFIG_FILE}" "${validation_shared_config}" "${staging_dir}/DEPLOYED_VERSION.json")")"
 
   echo "Validating deployment manifest before promotion"
   ssh_base "$target" "bash -lc $(quote "$(remote_mark_manifest_validated_script "$deployment_id" "$commit" "${staging_dir}/DEPLOYED_VERSION.json")")"
@@ -719,7 +770,7 @@ PY
   ssh_base "$target" "bash -lc $(quote "$(remote_promote_script "$deployment_id" "$staging_dir")")"
 
   echo "Re-evaluating broker/checkpoint activation gates after promotion"
-  ssh_base "$target" "bash -lc $(quote "$(remote_activation_gate_script post_promotion "${backup_dir}/${STANDARD_CONFIG_FILE}" "${REMOTE_DIR}/${STANDARD_CONFIG_FILE}" "${REMOTE_DIR}/${MARKET_CONFIG_FILE}")")"
+  ssh_base "$target" "bash -lc $(quote "$(remote_activation_gate_script post_promotion "${backup_dir}/${STANDARD_CONFIG_FILE}" "${REMOTE_DIR}/${STANDARD_CONFIG_FILE}" "${REMOTE_DIR}/${MARKET_CONFIG_FILE}" "${staging_dir}/DEPLOYED_VERSION.json")")"
 
   echo "Writing deployment manifest"
   if ! ssh_base "$target" "bash -lc $(quote "$(remote_install_manifest_script "$deployment_id" "$commit" "${staging_dir}/DEPLOYED_VERSION.json" "${REMOTE_DIR}/DEPLOYED_VERSION.json")")"; then
@@ -775,6 +826,8 @@ if data["git_commit"] != commit:
     raise SystemExit("manifest git_commit mismatch")
 if data["validation_status"] != expected_status:
     raise SystemExit("manifest validation_status mismatch")
+if "historical_checkpoint_authorizations" in data and not isinstance(data["historical_checkpoint_authorizations"], list):
+    raise SystemExit("manifest historical_checkpoint_authorizations must be a list")
 PY
 }
 
@@ -804,6 +857,8 @@ def load_manifest(path: Path) -> dict:
     missing = sorted(REQUIRED.difference(data))
     if missing:
         raise SystemExit(f"manifest missing required fields: {missing}")
+    if "historical_checkpoint_authorizations" in data and not isinstance(data["historical_checkpoint_authorizations"], list):
+        raise SystemExit("manifest historical_checkpoint_authorizations must be a list")
     return data
 
 def write_manifest(path: Path, data: dict) -> None:
@@ -1186,7 +1241,7 @@ restart_fleet_only() {
     echo "DRY RUN ONLY - would restart ${FLEET_SERVICE} on ${target}"
     return
   fi
-  ssh_base "$target" "bash -lc $(quote "$(remote_activation_gate_script pre_restart \"${REMOTE_DIR}/${STANDARD_CONFIG_FILE}\" \"${REMOTE_DIR}/${STANDARD_CONFIG_FILE}\" \"${REMOTE_DIR}/${MARKET_CONFIG_FILE}\") && systemctl restart $(quote \"$FLEET_SERVICE\") && systemctl is-active $(quote \"$FLEET_SERVICE\") && if ! $(remote_activation_gate_script post_activation \"${REMOTE_DIR}/${STANDARD_CONFIG_FILE}\" \"${REMOTE_DIR}/${STANDARD_CONFIG_FILE}\" \"${REMOTE_DIR}/${MARKET_CONFIG_FILE}\"); then systemctl stop $(quote \"$FLEET_SERVICE\"); exit 42; fi")"
+  ssh_base "$target" "bash -lc $(quote "$(remote_activation_gate_script pre_restart \"${REMOTE_DIR}/${STANDARD_CONFIG_FILE}\" \"${REMOTE_DIR}/${STANDARD_CONFIG_FILE}\" \"${REMOTE_DIR}/${MARKET_CONFIG_FILE}\" \"${REMOTE_DIR}/DEPLOYED_VERSION.json\") && systemctl restart $(quote \"$FLEET_SERVICE\") && systemctl is-active $(quote \"$FLEET_SERVICE\") && if ! $(remote_activation_gate_script post_activation \"${REMOTE_DIR}/${STANDARD_CONFIG_FILE}\" \"${REMOTE_DIR}/${STANDARD_CONFIG_FILE}\" \"${REMOTE_DIR}/${MARKET_CONFIG_FILE}\" \"${REMOTE_DIR}/DEPLOYED_VERSION.json\"); then systemctl stop $(quote \"$FLEET_SERVICE\"); exit 42; fi")"
 }
 
 restart_mission_only() {

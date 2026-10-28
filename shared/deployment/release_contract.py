@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
 
 CONTRACT_VERSION = "renko.release_contract.v1"
+HISTORICAL_CLASSIFICATIONS = {
+    "verified_historical",
+    "legacy_authorized_non_restorable",
+}
+HISTORICAL_RESTORATION_POLICY = "historical_non_restorable"
 
 
 def _hash_file(path: Path) -> str:
@@ -26,6 +32,79 @@ def _symbols(config: dict[str, Any]) -> set[str]:
     return {str(trader.get("symbol", "")).upper() for trader in _enabled_traders(config) if trader.get("symbol")}
 
 
+def validate_historical_checkpoint_authorizations(
+    authorizations: Iterable[dict[str, Any]],
+    checkpoint_inventory: Iterable[dict[str, Any]],
+    *,
+    active_trader_ids: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Validate explicit, non-restorable authorization records against inventory."""
+    errors: list[str] = []
+    validated: list[dict[str, Any]] = []
+    by_path = {str(row.get("path")): row for row in checkpoint_inventory if isinstance(row, dict)}
+    inventory_supplied = bool(by_path)
+    by_identity: dict[str, list[dict[str, Any]]] = {}
+    for row in checkpoint_inventory:
+        if isinstance(row, dict) and row.get("trader_id"):
+            by_identity.setdefault(str(row["trader_id"]), []).append(row)
+    seen_paths: set[str] = set()
+    seen_ids: set[str] = set()
+    active = {str(value) for value in active_trader_ids}
+    for record in authorizations:
+        if not isinstance(record, dict):
+            errors.append("historical checkpoint authorization must be an object")
+            continue
+        path = str(record.get("checkpoint_path", ""))
+        trader_id = str(record.get("trader_id", ""))
+        classification = str(record.get("classification", ""))
+        if not path or Path(path).is_absolute() or ".." in Path(path).parts:
+            errors.append(f"{trader_id or path}: invalid checkpoint path")
+            continue
+        if not trader_id or not record.get("sha256") or not record.get("symbol") or not record.get("strategy_type") or not record.get("strategy_identity"):
+            errors.append(f"{trader_id or path}: incomplete historical authorization")
+            continue
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", str(record.get("sha256"))):
+            errors.append(f"{trader_id}: sha256 must be a 64-character hexadecimal digest")
+        if classification not in HISTORICAL_CLASSIFICATIONS:
+            errors.append(f"{trader_id}: unsupported historical classification")
+        if record.get("restoration") != HISTORICAL_RESTORATION_POLICY:
+            errors.append(f"{trader_id}: historical restoration policy is not non-restorable")
+        if not record.get("reviewed_by") or not record.get("reviewed_at_utc"):
+            errors.append(f"{trader_id}: reviewer identity and timestamp are required")
+        broker_evidence = record.get("broker_evidence")
+        if not isinstance(broker_evidence, dict) or broker_evidence.get("position_flat") is not True or broker_evidence.get("open_orders") != 0 or not broker_evidence.get("verified_at_utc"):
+            errors.append(f"{trader_id}: fresh broker-flat and zero-order evidence is required")
+        if classification == "verified_historical" and not record.get("provenance"):
+            errors.append(f"{trader_id}: verified historical authorization requires provenance evidence")
+        if classification == "legacy_authorized_non_restorable" and not record.get("provenance_uncertainty"):
+            errors.append(f"{trader_id}: legacy authorization must document provenance uncertainty")
+        if path in seen_paths or trader_id in seen_ids:
+            errors.append(f"{trader_id}: duplicate historical authorization")
+        seen_paths.add(path)
+        seen_ids.add(trader_id)
+        if trader_id in active:
+            errors.append(f"{trader_id}: active trader cannot have historical authorization")
+        inventory = by_path.get(path)
+        if not inventory_supplied:
+            validated.append(record)
+            continue
+        if inventory is None:
+            errors.append(f"{trader_id}: authorized checkpoint path is not in inventory")
+            continue
+        if str(inventory.get("trader_id")) != trader_id:
+            errors.append(f"{trader_id}: checkpoint identity/path conflict")
+        if str(inventory.get("sha256")) != str(record.get("sha256")):
+            errors.append(f"{trader_id}: checkpoint hash mismatch")
+        if str(inventory.get("symbol", "")).upper() != str(record.get("symbol", "")).upper():
+            errors.append(f"{trader_id}: checkpoint symbol mismatch")
+        if str(inventory.get("strategy_type", "")) != str(record.get("strategy_type", "")):
+            errors.append(f"{trader_id}: checkpoint strategy identity mismatch")
+        if str(inventory.get("strategy_identity", "")) != str(record.get("strategy_identity", "")):
+            errors.append(f"{trader_id}: checkpoint strategy identity mismatch")
+        validated.append(record)
+    return {"status": "PASS" if not errors else "BLOCKED", "errors": errors, "validated": validated}
+
+
 def build_release_contract(
     *,
     commit: str,
@@ -37,6 +116,7 @@ def build_release_contract(
     checkpoint_requirements: dict[str, Any] | None = None,
     promotion_policy: str = "replace_from_release",
     retired_symbols: Iterable[str] = (),
+    historical_checkpoint_authorizations: Iterable[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     enabled = _enabled_traders(trader_config)
     symbols = sorted(_symbols(trader_config))
@@ -78,6 +158,7 @@ def build_release_contract(
             "stale_signal_replay": "rejected",
         },
         "retired_symbols": sorted({str(symbol).upper() for symbol in retired_symbols}),
+        "historical_checkpoint_authorizations": list(historical_checkpoint_authorizations),
     }
     validate_release_contract(contract)
     return contract
@@ -102,6 +183,10 @@ def validate_release_contract(contract: dict[str, Any]) -> None:
     resurrected = sorted(retired.intersection(enabled_symbols))
     if resurrected:
         raise ValueError(f"release would resurrect retired symbols: {resurrected}")
+    authorizations = contract.get("historical_checkpoint_authorizations") or []
+    result = validate_historical_checkpoint_authorizations(authorizations, [])
+    if result["status"] != "PASS":
+        raise ValueError(f"invalid historical checkpoint authorizations: {result['errors']}")
 
 
 def plan_change(current: dict[str, Any] | None, candidate: dict[str, Any]) -> dict[str, Any]:

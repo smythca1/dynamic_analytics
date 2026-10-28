@@ -342,6 +342,29 @@ class DeployTradingTests(unittest.TestCase):
         self.assertEqual(1, text.count('"git_commit"'))
         self.assertFalse(text.endswith("\\n"))
 
+    def test_manifest_carries_explicit_historical_authorizations_without_remote_inference(self) -> None:
+        fake_bin = self._fake_bin()
+        authorization = json.dumps([{
+            "trader_id": "retired-tsla",
+            "checkpoint_path": "artifacts/live/state/retired-tsla.json",
+            "sha256": "a" * 64,
+            "symbol": "TSLA",
+            "strategy_type": "renko_reversal",
+            "strategy_identity": "canonical_e1",
+            "classification": "verified_historical",
+            "restoration": "historical_non_restorable",
+            "provenance": {"release_commit": "b" * 40},
+            "reviewed_by": "operator",
+            "reviewed_at_utc": "2026-10-28T18:00:00Z",
+            "broker_evidence": {"position_flat": True, "open_orders": 0, "verified_at_utc": "2026-10-28T18:00:00Z"},
+        }])
+        self._run("--commit", self.commit, "--no-restart", env={
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "DEPLOY_HISTORICAL_CHECKPOINT_AUTHORIZATIONS": authorization,
+        })
+        manifest = json.loads((fake_bin / "scp_payload/DEPLOYED_VERSION.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["historical_checkpoint_authorizations"][0]["trader_id"], "retired-tsla")
+
     def test_generated_manifest_parses_and_has_one_real_trailing_newline(self) -> None:
         fake_bin = self._fake_bin()
         self._run("--commit", self.commit, "--no-restart", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})

@@ -10,6 +10,7 @@ from shared.deployment.release_contract import (
     evaluate_broker_snapshot,
     evaluate_checkpoint_snapshot,
     plan_change,
+    validate_historical_checkpoint_authorizations,
     validate_release_contract,
 )
 
@@ -157,6 +158,48 @@ class ReleaseContractTests(unittest.TestCase):
             broker_positions={"TSLA": 0},
         )
         self.assertEqual(result["status"], "PASS")
+
+    def _historical_record(self, **overrides):
+        record = {
+            "trader_id": "tsla-qty5-old",
+            "checkpoint_path": "artifacts/live/state/tsla-qty5-old.json",
+            "sha256": "a" * 64,
+            "symbol": "TSLA",
+            "strategy_type": "renko_reversal",
+            "strategy_identity": "canonical_e1",
+            "classification": "verified_historical",
+            "restoration": "historical_non_restorable",
+            "provenance": {"release_commit": "b" * 40},
+            "reviewed_by": "operator",
+            "reviewed_at_utc": "2026-10-28T18:00:00Z",
+            "broker_evidence": {"position_flat": True, "open_orders": 0, "verified_at_utc": "2026-10-28T18:00:00Z"},
+        }
+        record.update(overrides)
+        return record
+
+    def test_verified_historical_authorization_matches_exact_inventory(self):
+        record = self._historical_record()
+        result = validate_historical_checkpoint_authorizations(
+            [record],
+            [{"path": record["checkpoint_path"], "sha256": record["sha256"], "trader_id": record["trader_id"],
+              "symbol": "TSLA", "strategy_type": "renko_reversal", "strategy_identity": "canonical_e1"}],
+        )
+        self.assertEqual(result["status"], "PASS")
+
+    def test_legacy_authorization_requires_explicit_uncertainty(self):
+        record = self._historical_record(classification="legacy_authorized_non_restorable", provenance=None,
+                                         provenance_uncertainty="original release unavailable; operator reviewed")
+        self.assertEqual(validate_historical_checkpoint_authorizations([record], [])["status"], "PASS")
+
+    def test_historical_authorization_rejects_tampering_duplicates_and_active_conflict(self):
+        record = self._historical_record()
+        tampered = validate_historical_checkpoint_authorizations(
+            [record], [{"path": record["checkpoint_path"], "sha256": "c" * 64, "trader_id": record["trader_id"],
+                        "symbol": "TSLA", "strategy_type": "renko_reversal", "strategy_identity": "canonical_e1"}],
+        )
+        self.assertEqual(tampered["status"], "BLOCKED")
+        self.assertEqual(validate_historical_checkpoint_authorizations([record, record], [])["status"], "BLOCKED")
+        self.assertEqual(validate_historical_checkpoint_authorizations([record], [], active_trader_ids=[record["trader_id"]])["status"], "BLOCKED")
 
 
 if __name__ == "__main__":
