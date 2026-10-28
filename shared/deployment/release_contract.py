@@ -134,6 +134,91 @@ def plan_change(current: dict[str, Any] | None, candidate: dict[str, Any]) -> di
     }
 
 
+def evaluate_broker_snapshot(
+    snapshot: dict[str, Any],
+    *,
+    expected_account_id: str,
+    affected_symbols: Iterable[str],
+    require_flat_symbols: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Validate one authoritative, read-only broker observation fail-closed."""
+    required = {str(symbol).upper() for symbol in affected_symbols}
+    flat_required = {str(symbol).upper() for symbol in require_flat_symbols}
+    errors: list[str] = []
+    if snapshot.get("account_id") != expected_account_id:
+        errors.append("broker account identity mismatch")
+    if snapshot.get("api_health") != "ok":
+        errors.append("broker API health is not confirmed")
+    if snapshot.get("complete") is not True:
+        errors.append("broker observation is incomplete")
+    if snapshot.get("stale") is True:
+        errors.append("broker observation is stale")
+    positions = snapshot.get("positions")
+    orders = snapshot.get("open_orders_nested")
+    if not isinstance(positions, list) or not isinstance(orders, list):
+        errors.append("broker positions or orders are not complete lists")
+        positions, orders = [], []
+    by_symbol = {str(row.get("symbol", "")).upper(): row for row in positions if isinstance(row, dict)}
+    order_symbols = {
+        str(row.get("symbol", "")).upper()
+        for row in orders
+        if isinstance(row, dict) and row.get("symbol")
+    }
+    for symbol in sorted(required):
+        position = by_symbol.get(symbol)
+        quantity = 0.0 if position is None else float(position.get("qty") or 0)
+        if symbol in flat_required and abs(quantity) > 0:
+            errors.append(f"{symbol}: broker exposure remains for retired/removed trader")
+        if symbol in flat_required and symbol in order_symbols:
+            errors.append(f"{symbol}: broker orders remain for retired/removed trader")
+    return {
+        "status": "PASS" if not errors else "BLOCKED",
+        "errors": errors,
+        "checked_symbols": sorted(required),
+        "flat_required_symbols": sorted(flat_required),
+    }
+
+
+def evaluate_checkpoint_snapshot(
+    checkpoints: dict[str, dict[str, Any] | None],
+    *,
+    candidate_traders: Iterable[dict[str, Any]],
+    broker_positions: dict[str, float],
+    retired_trader_ids: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Validate persisted state identities without deleting or rewriting state."""
+    errors: list[str] = []
+    retired = set(retired_trader_ids)
+    expected = {str(row.get("id")): row for row in candidate_traders}
+    for trader_id, payload in checkpoints.items():
+        if trader_id in retired:
+            errors.append(f"{trader_id}: retired trader checkpoint is not restorable")
+            continue
+        if trader_id not in expected:
+            errors.append(f"{trader_id}: checkpoint identity is not in candidate release")
+            continue
+        if payload is None:
+            symbol = str(expected[trader_id].get("symbol", "")).upper()
+            if abs(float(broker_positions.get(symbol, 0))) > 0:
+                errors.append(f"{trader_id}: missing checkpoint with non-flat broker position")
+            continue
+        if not isinstance(payload, dict) or payload.get("trader_id", trader_id) != trader_id:
+            errors.append(f"{trader_id}: malformed checkpoint identity")
+            continue
+        expected_symbol = str(expected[trader_id].get("symbol", "")).upper()
+        if str(payload.get("symbol", expected_symbol)).upper() != expected_symbol:
+            errors.append(f"{trader_id}: checkpoint symbol mismatch")
+        expected_qty = float((expected[trader_id].get("quantity") or 0))
+        checkpoint_qty = float(payload.get("quantity", expected_qty) or 0)
+        if abs(checkpoint_qty - expected_qty) > 1e-9:
+            errors.append(f"{trader_id}: checkpoint quantity mismatch")
+        position = payload.get("position")
+        state_qty = 0.0 if not isinstance(position, dict) else float(position.get("qty") or 0)
+        if abs(state_qty - float(broker_positions.get(expected_symbol, 0))) > 1e-9:
+            errors.append(f"{trader_id}: checkpoint and broker position mismatch")
+    return {"status": "PASS" if not errors else "BLOCKED", "errors": errors}
+
+
 def main() -> int:
     import argparse
 

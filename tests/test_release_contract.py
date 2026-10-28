@@ -7,6 +7,8 @@ from pathlib import Path
 
 from shared.deployment.release_contract import (
     build_release_contract,
+    evaluate_broker_snapshot,
+    evaluate_checkpoint_snapshot,
     plan_change,
     validate_release_contract,
 )
@@ -74,6 +76,51 @@ class ReleaseContractTests(unittest.TestCase):
         validate_release_contract(contract)
         with self.assertRaisesRegex(ValueError, "immutable git commit"):
             validate_release_contract({**contract, "git_commit": ""})
+
+    def test_broker_flat_changed_trader_passes(self):
+        result = evaluate_broker_snapshot(
+            {"account_id": "acct", "api_health": "ok", "complete": True, "stale": False,
+             "positions": [], "open_orders_nested": []},
+            expected_account_id="acct", affected_symbols=["TSLA"], require_flat_symbols=["TSLA"],
+        )
+        self.assertEqual(result["status"], "PASS")
+
+    def test_broker_exposure_and_nested_order_block_retirement(self):
+        result = evaluate_broker_snapshot(
+            {"account_id": "acct", "api_health": "ok", "complete": True, "stale": False,
+             "positions": [{"symbol": "MRVL", "qty": "1"}],
+             "open_orders_nested": [{"symbol": "MRVL", "status": "partially_filled"}]},
+            expected_account_id="acct", affected_symbols=["MRVL"], require_flat_symbols=["MRVL"],
+        )
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(len(result["errors"]), 2)
+
+    def test_missing_or_wrong_account_fails_closed(self):
+        result = evaluate_broker_snapshot(
+            {"account_id": "other", "api_health": "ok", "complete": False,
+             "positions": [], "open_orders_nested": []},
+            expected_account_id="acct", affected_symbols=["TSLA"],
+        )
+        self.assertEqual(result["status"], "BLOCKED")
+
+    def test_incompatible_and_retired_checkpoints_are_rejected(self):
+        result = evaluate_checkpoint_snapshot(
+            {"tsla-qty8": {"trader_id": "tsla-qty8", "symbol": "TSLA", "quantity": 5,
+                           "position": {"qty": 0}},
+             "old-mrvl": {"trader_id": "old-mrvl"}},
+            candidate_traders=[{"id": "tsla-qty8", "symbol": "TSLA", "quantity": 8}],
+            broker_positions={"TSLA": 0, "MRVL": 0}, retired_trader_ids=["old-mrvl"],
+        )
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(len(result["errors"]), 2)
+
+    def test_missing_checkpoint_is_safe_only_when_broker_flat(self):
+        result = evaluate_checkpoint_snapshot(
+            {"tsla-qty8": None},
+            candidate_traders=[{"id": "tsla-qty8", "symbol": "TSLA", "quantity": 8}],
+            broker_positions={"TSLA": 0},
+        )
+        self.assertEqual(result["status"], "PASS")
 
 
 if __name__ == "__main__":

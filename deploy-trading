@@ -365,6 +365,8 @@ Config policy: ${config_policy}
 Service file policy: $(if [[ "$DEPLOY_SERVICES" == "1" ]]; then echo "replace_from_commit"; else echo "preserve_remote"; fi)
 Config path used by service: ${REMOTE_DIR}/${CONFIG_FILE}
 Services restarted by this command: none
+Activation gates: broker and checkpoint gates required; not evaluated in dry-run
+Live activation status: blocked pending authenticated broker and runtime checkpoint evidence
 
 EOF
   print_payload
@@ -496,6 +498,91 @@ python fleet_runner.py --help >/dev/null
 EOF
 }
 
+remote_activation_gate_script() {
+  local mode="$1"
+  local baseline_config="$2"
+  local candidate_config="$3"
+  local market_config="$4"
+  cat <<EOF
+set -euo pipefail
+cd $(quote "$REMOTE_DIR")
+if [[ -f .env ]]; then set -a; . ./.env; set +a; fi
+python - $(quote "$mode") $(quote "$baseline_config") $(quote "$candidate_config") $(quote "$market_config") <<'PY'
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from alpaca_trader import AlpacaTrader, load_alpaca_credentials
+from shared.deployment.release_contract import evaluate_broker_snapshot, evaluate_checkpoint_snapshot
+
+mode, baseline_path, candidate_path, market_path = sys.argv[1:]
+out = {"evaluated_at_utc": datetime.now(timezone.utc).isoformat(), "mode": mode, "broker": "not_evaluated", "checkpoint": "not_evaluated"}
+expected_account = os.environ.get("DEPLOY_EXPECTED_ACCOUNT_ID")
+if not expected_account:
+    out["error"] = "DEPLOY_EXPECTED_ACCOUNT_ID is required for activation safety"
+    print(json.dumps(out, sort_keys=True))
+    raise SystemExit(42)
+
+baseline = json.loads(Path(baseline_path).read_text(encoding="utf-8")) if Path(baseline_path).is_file() else {"traders": []}
+candidate = json.loads(Path(candidate_path).read_text(encoding="utf-8"))
+old = {str(t.get("id")): t for t in baseline.get("traders", []) if t.get("enabled")}
+new = {str(t.get("id")): t for t in candidate.get("traders", []) if t.get("enabled")}
+affected = set()
+flat_required = set()
+for identity in set(old) | set(new):
+    if old.get(identity) != new.get(identity):
+        for row in (old.get(identity), new.get(identity)):
+            if row and row.get("symbol"):
+                symbol = str(row["symbol"]).upper()
+                affected.add(symbol)
+                flat_required.add(symbol)
+market = json.loads(Path(market_path).read_text(encoding="utf-8"))
+try:
+    trader = AlpacaTrader(load_alpaca_credentials("live"), max_notional=1_000_000)
+    account = trader.get_account()
+    positions = trader.get_positions()
+    orders = trader.get_open_orders_nested(500)
+    snapshot = {
+        "account_id": account.get("id"),
+        "api_health": "ok",
+        "complete": isinstance(positions, list) and isinstance(orders, list),
+        "stale": False,
+        "positions": positions,
+        "open_orders_nested": orders,
+    }
+    gate = evaluate_broker_snapshot(snapshot, expected_account_id=expected_account, affected_symbols=affected, require_flat_symbols=flat_required)
+    out["broker"] = gate
+    broker_positions = {str(p.get("symbol", "")).upper(): float(p.get("qty") or 0) for p in positions if isinstance(p, dict)}
+    checkpoints = {identity: None for identity in new}
+    state_root = Path("artifacts/live/state")
+    if state_root.is_dir():
+        for state_path in state_root.glob("*.json"):
+            try:
+                payload = json.loads(state_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                out["checkpoint"] = {"status": "BLOCKED", "errors": [f"malformed checkpoint {state_path}: {exc}"]}
+                print(json.dumps(out, sort_keys=True))
+                raise SystemExit(42)
+            identity = payload.get("trader_id") if isinstance(payload, dict) else None
+            if identity and str(identity) in (set(new) | set(old)):
+                checkpoints[str(identity)] = payload
+    checkpoint_gate = evaluate_checkpoint_snapshot(checkpoints, candidate_traders=[
+        {"id": str(t.get("id")), "symbol": str(t.get("symbol", "")).upper(), "quantity": (t.get("sizing") or {}).get("qty")}
+        for t in new.values()
+    ], broker_positions=broker_positions, retired_trader_ids=set(old) - set(new))
+    out["checkpoint"] = checkpoint_gate
+except Exception as exc:
+    out["error"] = f"activation gate unavailable: {type(exc).__name__}: {exc}"
+    print(json.dumps(out, sort_keys=True))
+    raise SystemExit(42)
+print(json.dumps(out, sort_keys=True))
+if out["broker"].get("status") != "PASS" or out["checkpoint"].get("status") != "PASS":
+    raise SystemExit(42)
+PY
+EOF
+}
+
 deploy_commit() {
   local commit="$1"
   local deployment_id="$2"
@@ -598,6 +685,9 @@ PY
   echo "Validating staged release without live execution"
   ssh_base "$target" "bash -lc $(quote "$(remote_validation_script "$commit" "$staging_dir" "$validation_shared_config" "${validation_fleet_configs[@]}")")"
 
+  echo "Evaluating broker/checkpoint activation gates before promotion"
+  ssh_base "$target" "bash -lc $(quote "$(remote_activation_gate_script pre_activation "${REMOTE_DIR}/${STANDARD_CONFIG_FILE}" "${staging_dir}/${STANDARD_CONFIG_FILE}" "${validation_shared_config}")")"
+
   echo "Validating deployment manifest before promotion"
   ssh_base "$target" "bash -lc $(quote "$(remote_mark_manifest_validated_script "$deployment_id" "$commit" "${staging_dir}/DEPLOYED_VERSION.json")")"
 
@@ -606,6 +696,9 @@ PY
 
   echo "Promoting staged runtime files"
   ssh_base "$target" "bash -lc $(quote "$(remote_promote_script "$deployment_id" "$staging_dir")")"
+
+  echo "Re-evaluating broker/checkpoint activation gates after promotion"
+  ssh_base "$target" "bash -lc $(quote "$(remote_activation_gate_script post_promotion "${backup_dir}/${STANDARD_CONFIG_FILE}" "${REMOTE_DIR}/${STANDARD_CONFIG_FILE}" "${REMOTE_DIR}/${MARKET_CONFIG_FILE}")")"
 
   echo "Writing deployment manifest"
   if ! ssh_base "$target" "bash -lc $(quote "$(remote_install_manifest_script "$deployment_id" "$commit" "${staging_dir}/DEPLOYED_VERSION.json" "${REMOTE_DIR}/DEPLOYED_VERSION.json")")"; then
@@ -1072,7 +1165,7 @@ restart_fleet_only() {
     echo "DRY RUN ONLY - would restart ${FLEET_SERVICE} on ${target}"
     return
   fi
-  ssh_base "$target" "systemctl restart $(quote "$FLEET_SERVICE") && systemctl is-active $(quote "$FLEET_SERVICE")"
+  ssh_base "$target" "bash -lc $(quote "$(remote_activation_gate_script pre_restart \"${REMOTE_DIR}/${STANDARD_CONFIG_FILE}\" \"${REMOTE_DIR}/${STANDARD_CONFIG_FILE}\" \"${REMOTE_DIR}/${MARKET_CONFIG_FILE}\") && systemctl restart $(quote \"$FLEET_SERVICE\") && systemctl is-active $(quote \"$FLEET_SERVICE\") && if ! $(remote_activation_gate_script post_activation \"${REMOTE_DIR}/${STANDARD_CONFIG_FILE}\" \"${REMOTE_DIR}/${STANDARD_CONFIG_FILE}\" \"${REMOTE_DIR}/${MARKET_CONFIG_FILE}\"); then systemctl stop $(quote \"$FLEET_SERVICE\"); exit 42; fi")"
 }
 
 restart_mission_only() {

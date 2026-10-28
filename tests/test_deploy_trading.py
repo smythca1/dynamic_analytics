@@ -188,6 +188,11 @@ class DeployTradingTests(unittest.TestCase):
         self.assertIn("  configs/traders.live.example.json", result.stdout)
         self.assertIn("  configs/market-data.live.example.json", result.stdout)
 
+    def test_dry_run_reports_activation_gates_as_not_evaluated(self) -> None:
+        result = self._run("--commit", self.commit, "--dry-run", "--deploy-config")
+        self.assertIn("broker and checkpoint gates required; not evaluated in dry-run", result.stdout)
+        self.assertIn("blocked pending authenticated broker and runtime checkpoint evidence", result.stdout)
+
     def test_default_deployment_performs_no_restart(self) -> None:
         result = self._run("--commit", self.commit, "--dry-run")
         self.assertIn("Services restarted by this command: none", result.stdout)
