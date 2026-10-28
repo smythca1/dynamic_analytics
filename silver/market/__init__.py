@@ -32,7 +32,12 @@ from .observation_stream import (
 )
 from .ipc_consumer import CanonicalStreamEvent, SharedCanonicalStreamConsumer
 from .ipc_protocol import PROTOCOL_VERSION as MARKET_IPC_PROTOCOL_VERSION, canonical_event_id
-from .shared_service import SharedMarketDataConfig, SharedCanonicalMarketDataServer, validate_symbol_union
+from .shared_service import (
+    SharedMarketDataConfig,
+    SharedCanonicalMarketDataServer,
+    validate_shared_market_data_config,
+    validate_symbol_union,
+)
 
 __all__ = [
     "CanonicalObservation",
@@ -65,6 +70,7 @@ __all__ = [
     "SharedMarketDataConfig",
     "SharedCanonicalMarketDataServer",
     "SharedCanonicalStreamConsumer",
+    "validate_shared_market_data_config",
     "validate_symbol_union",
     "validate_canonical_renko_source",
 ]

@@ -82,15 +82,27 @@ class SharedMarketDataConfig:
         feed = str(payload.get("feed") or "").strip().lower()
         if feed != "sip":
             raise ValueError("shared production market-data feed must be sip.")
-        fingerprints = dict(payload.get("contract_fingerprints") or {})
-        if not fingerprints:
-            fingerprints = {
-                symbol: market_stream_contract(symbol=symbol, session_timezone="America/New_York").fingerprint
-                for symbol in symbols
-            }
+        fingerprints = {
+            str(key).upper(): str(value)
+            for key, value in dict(payload.get("contract_fingerprints") or {}).items()
+        }
         missing = [symbol for symbol in symbols if not fingerprints.get(symbol)]
         if missing:
             raise ValueError(f"missing contract fingerprints for: {missing}")
+        mismatched = {
+            symbol: {
+                "configured": fingerprints[symbol],
+                "generated": market_stream_contract(
+                    symbol=symbol,
+                    session_timezone="America/New_York",
+                ).fingerprint,
+            }
+            for symbol in symbols
+            if fingerprints[symbol]
+            != market_stream_contract(symbol=symbol, session_timezone="America/New_York").fingerprint
+        }
+        if mismatched:
+            raise ValueError(f"contract fingerprints do not match canonical contracts: {mismatched}")
         return cls(
             feed=feed,
             canonical_source=canonical_source,
@@ -115,7 +127,7 @@ class SharedMarketDataConfig:
             if isinstance(payload.get("socket_mode"), str)
             else int(payload.get("socket_mode", 0o660)),
             lock_path=str(payload.get("lock_path") or f"{payload['socket_path']}.lock"),
-            contract_fingerprints={str(key).upper(): str(value) for key, value in fingerprints.items()},
+            contract_fingerprints=fingerprints,
         )
 
     @classmethod
@@ -146,6 +158,37 @@ def validate_symbol_union(config: SharedMarketDataConfig, fleet_configs: list[di
         raise ValueError(f"shared market-data config missing enabled symbols: {sorted(missing)}")
     if "QQQ" in set(config.symbols) and "QQQ" not in enabled_symbols:
         raise ValueError("QQQ must not be subscribed unless an enabled trader requires it.")
+
+
+def validate_shared_market_data_config(
+    config: SharedMarketDataConfig,
+    fleet_configs: list[dict[str, Any]],
+) -> None:
+    """Validate the shared stream contract against every enabled production trader."""
+    validate_symbol_union(config, fleet_configs, require_shared_source=True)
+
+    # Keep the expected fingerprint calculation on the same canonical path used by
+    # fleet_runner when it constructs each trader runtime.
+    from shared.config.trader_config import build_strategy_config
+
+    mismatches: list[str] = []
+    for fleet in fleet_configs:
+        for trader in fleet.get("traders", []):
+            if not isinstance(trader, dict) or not trader.get("enabled", True):
+                continue
+            strategy_config = build_strategy_config(trader)
+            expected = market_stream_contract(
+                symbol=strategy_config.symbol,
+                session_timezone=strategy_config.timezone,
+            ).fingerprint
+            configured = config.contract_fingerprints.get(strategy_config.symbol)
+            if configured != expected:
+                mismatches.append(
+                    f"{trader.get('id')}: shared fingerprint for {strategy_config.symbol} "
+                    f"is {configured!r}; expected {expected!r}"
+                )
+    if mismatches:
+        raise ValueError("enabled trader market-stream fingerprints do not match shared config: " + "; ".join(mismatches))
 
 
 class SingletonLock:
@@ -1524,9 +1567,8 @@ class SharedCanonicalMarketDataServer:
 
     def _refresh_sampler_activity(self, symbol: str, adapter: CanonicalMarketObservationAdapter) -> None:
         symbol = symbol.upper()
-        snapshot = adapter.snapshot(trader_id="shared_market_data_service", symbol=symbol)
-        state = snapshot.get("state") if isinstance(snapshot, dict) else None
-        pending_bucket = state.get("pending_bucket") if isinstance(state, dict) else None
+        state = adapter.sampler.state(("shared_market_data_service", symbol))
+        pending_bucket = state.pending_bucket.isoformat() if state is not None and state.pending_bucket is not None else None
         if pending_bucket is None:
             self.health["pending_canonical_bucket_by_symbol"].pop(symbol, None)
         else:
@@ -1592,6 +1634,13 @@ class SharedCanonicalMarketDataServer:
         for symbol, timestamp in self._canonical_source_high_water_by_symbol.items():
             source_ages[symbol] = max(0.0, (now - timestamp).total_seconds())
         self.health["canonical_source_freshness_age_seconds"] = source_ages
+        # Keep freshness/safety state current on every event; materialize the
+        # report-only consumer and filesystem aggregates only when writing it.
+        now_monotonic = time.perf_counter()
+        should_write = force or now_monotonic - self._last_health_write_monotonic >= self._health_write_interval_seconds
+        if not should_write and Path(self.config.health_path).exists():
+            self.metrics.increment("health_snapshot_write_skipped")
+            return
         self.health["consumers"] = {
             identity: {
                 "connected": True,
@@ -1606,11 +1655,6 @@ class SharedCanonicalMarketDataServer:
             for identity, state in self.consumers.items()
         }
         self.health["journal_size_bytes"] = Path(self.config.journal_path).stat().st_size if Path(self.config.journal_path).exists() else 0
-        now_monotonic = time.perf_counter()
-        should_write = force or now_monotonic - self._last_health_write_monotonic >= self._health_write_interval_seconds
-        if not should_write and Path(self.config.health_path).exists():
-            self.metrics.increment("health_snapshot_write_skipped")
-            return
         started = time.perf_counter()
         self.health["pipeline_metrics"] = self.metrics.snapshot()
         Path(self.config.health_path).parent.mkdir(parents=True, exist_ok=True)

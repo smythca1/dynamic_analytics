@@ -729,6 +729,27 @@ class DeployTradingTests(unittest.TestCase):
         self.assertIn(".deploy-staging", scp_log)
         self.assertNotIn("systemctl restart", ssh_log)
 
+    def test_shared_market_data_preflight_failure_prevents_backup_and_promotion(self) -> None:
+        fake_bin = self._fake_bin()
+        result = self._run(
+            "--commit",
+            self.commit,
+            "--no-restart",
+            check=False,
+            env={
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "DEPLOY_TEST_FAIL_SSH_CONTAINS": "validate_shared_market_data_config",
+            },
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Validating staged release without live execution", result.stdout)
+        self.assertNotIn("Backing up replaced runtime files", result.stdout)
+        self.assertNotIn("Promoting staged runtime files", result.stdout)
+        ssh_log = (fake_bin / "ssh.log").read_text(encoding="utf-8")
+        self.assertIn("validate_shared_market_data_config", ssh_log)
+        self.assertNotIn("backup_metadata", ssh_log)
+        self.assertNotIn("activate_dir", ssh_log)
+
     def test_safe_promotion_script_uses_staged_activation_for_packages(self) -> None:
         fake_bin = self._fake_bin()
         self._run("--commit", self.commit, "--no-restart", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})

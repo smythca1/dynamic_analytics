@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from hashlib import sha256
 from statistics import median
 from typing import Any
 
@@ -12,6 +13,86 @@ from silver.market import CanonicalObservation
 
 
 METRICS_VERSION = "replay.metrics.v1"
+
+
+class EquitySummary:
+    """Consume every mark; keep exact drawdown witnesses and session closes."""
+
+    def __init__(self):
+        self.count = 0
+        self.peak = None
+        self.dollars = Decimal(0)
+        self.percent = Decimal(0)
+        self.dollar_percent = Decimal(0)
+        self.sessions = {}
+        self.mark_hash = sha256()
+        self.first = None
+        self.last = None
+        self.minimum = None
+
+    def __len__(self):
+        return self.count
+
+    def __iter__(self):
+        return iter(self.sessions.values())
+
+    def append(self, point):
+        self.first = self.first or point
+        self.last = point
+        if self.minimum is None or point.equity < self.minimum.equity:
+            self.minimum = point
+        self.count += 1
+        self.mark_hash.update(f"{point.timestamp.isoformat()}|{point.equity}\n".encode())
+        self.sessions[point.timestamp.date().isoformat()] = point
+        if self.peak is None or point.equity > self.peak.equity:
+            self.peak = point
+        dollars, percent = accounting_metrics.drawdown_metrics((self.peak, point))
+        if dollars > self.dollars:
+            self.dollars, self.dollar_percent = dollars, percent
+        if self.peak.equity > 0:
+            self.percent = max(self.percent, percent)
+
+    def fold_evidence(self):
+        if self.first is None:
+            raise ValueError("Empty equity summary")
+        return {"first": str(self.first.equity), "last": str(self.last.equity),
+                "minimum": str(self.minimum.equity), "maximum": str(self.peak.equity),
+                "drawdown": str(self.dollars),
+                "session_closes": {day: str(point.equity) for day, point in self.sessions.items()}}
+
+
+class PositionSummary:
+    """Same ordered Decimal reductions as build_capital_metrics, no mark list."""
+
+    def __init__(self):
+        self.count = 0
+        self.max_qty = Decimal(0)
+        self.totals = {key: Decimal(0) for key in ("position", "cash", "exposure")}
+        self.minimum = {key: None for key in self.totals}
+        self.maximum = dict(self.minimum)
+        self.sides = {key: 0 for key in ("long", "short", "flat")}
+
+    def __len__(self):
+        return self.count
+
+    def append(self, sample):
+        qty = Decimal(str(sample.get("qty", "0")))
+        mark = Decimal(str(sample.get("mark_price", "0")))
+        equity = Decimal(str(sample["equity"]))
+        position = abs(qty) * mark
+        values = {"position": position, "cash": equity - position,
+                  "exposure": position / equity * Decimal("100") if equity else Decimal(0)}
+        for key, value in values.items():
+            self.totals[key] += value
+            self.minimum[key] = value if self.minimum[key] is None else min(self.minimum[key], value)
+            self.maximum[key] = value if self.maximum[key] is None else max(self.maximum[key], value)
+        side = sample.get("side")
+        if qty == 0 or side in {None, "", "flat"}:
+            self.sides["flat"] += 1
+        elif side in {"long", "short"}:
+            self.sides[side] += 1
+        self.max_qty = max(self.max_qty, abs(qty))
+        self.count += 1
 
 
 def build_metrics(
@@ -49,8 +130,11 @@ def build_metrics(
             buy_hold_return_on_allocated_capital = buy_hold_dollars / allocated_capital * Decimal("100")
     strategy_return_percent = (snapshot.net_pnl / initial_capital * Decimal("100")) if initial_capital else None
     latency_values = [float(value) for value in order_latencies]
-    drawdown_source = tuple(equity_curve) if equity_curve is not None else snapshot.equity_curve
-    max_dd, max_dd_pct = accounting_metrics.drawdown_metrics(drawdown_source)
+    drawdown_source = equity_curve if equity_curve is not None else snapshot.equity_curve
+    if isinstance(drawdown_source, EquitySummary):
+        max_dd, max_dd_pct = drawdown_source.dollars, drawdown_source.dollar_percent
+    else:
+        max_dd, max_dd_pct = accounting_metrics.drawdown_metrics(drawdown_source)
     capital_metrics = build_capital_metrics(
         initial_capital=initial_capital,
         allocated_capital=allocated_capital,
@@ -156,7 +240,7 @@ def build_capital_metrics(
     long_count = 0
     short_count = 0
     flat_count = 0
-    for sample in position_samples:
+    for sample in (() if isinstance(position_samples, PositionSummary) else position_samples):
         qty = Decimal(str(sample.get("qty", "0")))
         mark_price = Decimal(str(sample.get("mark_price", "0")))
         equity = Decimal(str(sample.get("equity", initial_capital)))
@@ -179,6 +263,14 @@ def build_capital_metrics(
             long_count += 1
         elif side == "short":
             short_count += 1
+    if isinstance(position_samples, PositionSummary):
+        summary = position_samples
+        deployed_total = position_total = summary.totals["position"]
+        deployed_min = summary.minimum["position"]
+        deployed_max = position_max = summary.maximum["position"]
+        cash_total, cash_min = summary.totals["cash"], summary.minimum["cash"]
+        exposure_total, exposure_max = summary.totals["exposure"], summary.maximum["exposure"]
+        long_count, short_count, flat_count = (summary.sides[key] for key in ("long", "short", "flat"))
     sample_count = Decimal(len(position_samples)) if position_samples else Decimal("0")
     average_deployed = deployed_total / sample_count if sample_count else None
     average_cash = cash_total / sample_count if sample_count else None

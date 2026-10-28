@@ -177,6 +177,8 @@ def _row_to_trade(row: dict, *, row_order: int, config: ReplayConfig, source_ref
             conditions = [item.strip() for item in stripped.split(",") if item.strip()]
         else:
             conditions = []
+    raw_conditions = tuple(str(item) for item in conditions)
+    canonical_conditions = tuple("@" if item == " " else item for item in raw_conditions)
     broker_trade_id = str(row.get("trade_id") or row.get("i") or "")
     source_row_order = int(row.get("row_order") or row_order)
     return RawSipTrade(
@@ -207,10 +209,12 @@ def _row_to_trade(row: dict, *, row_order: int, config: ReplayConfig, source_ref
             quantity=str(row.get("size") or row.get("s") or row.get("quantity") or row.get("volume") or 1),
             exchange=str(row.get("exchange") or row.get("x") or ""),
             tape=str(row.get("tape") or row.get("z") or ""),
-            conditions=tuple(str(item) for item in conditions),
+            conditions=raw_conditions,
             broker_trade_id=broker_trade_id,
         ),
-        conditions=tuple(str(item) for item in conditions),
+        # Normalize provider-native Regular Sale only at the research
+        # ingestion boundary; the canonical eligibility filter is unchanged.
+        conditions=canonical_conditions,
         source="historical_file",
         source_sequence=int(row.get("source_sequence") or row.get("sequence") or row_order),
         row_order=source_row_order,

@@ -34,7 +34,9 @@ SERVICE_FILES=(
   "trading-fleet-live.service"
 )
 CONFIG_FILE="configs/traders.live.example.json"
+STANDARD_CONFIG_FILE="configs/traders.live.example.json"
 SPXC_CONFIG_FILE="configs/accounts/spxc.live.json"
+MEGATRON_CONFIG_FILE="configs/accounts/megatron.live.json"
 SPXC_SERVICE_FILE="trading-fleet-spxc-live.service"
 EXTRA_CONFIG_FILE=""
 
@@ -421,7 +423,14 @@ make_local_release() {
 
 remote_validation_script() {
   local staging_dir="$1"
-  local config_path="$2"
+  local shared_config_path="$2"
+  shift 2
+  local fleet_config_paths=("$@")
+  local quoted_fleet_paths=""
+  local fleet_config_path
+  for fleet_config_path in "${fleet_config_paths[@]}"; do
+    quoted_fleet_paths+=" $(quote "$fleet_config_path")"
+  done
   cat <<EOF
 set -euo pipefail
 cd $(quote "$staging_dir")
@@ -438,18 +447,35 @@ import silver.evidence.logger
 import silver.evidence.shadow_sampler
 import fleet_runner
 PY
-python - "$config_path" <<'PY'
+python - "$shared_config_path"${quoted_fleet_paths} <<'PY'
 import json
 import sys
 from pathlib import Path
 from shared.config.trader_config import build_strategy_config, validate_production_fleet_config
-config_path = Path(sys.argv[1])
-data = json.loads(config_path.read_text())
-for trader in data.get("traders", []):
-    if isinstance(trader, dict) and trader.get("enabled", False):
+from silver.market.shared_service import SharedMarketDataConfig, validate_shared_market_data_config
+
+shared_config_path = Path(sys.argv[1])
+fleet_configs = []
+for raw_path in sys.argv[2:]:
+    config_path = Path(raw_path)
+    if not config_path.is_file():
+        raise ValueError(f"production fleet config is missing: {config_path}")
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    enabled_traders = [
+        trader for trader in data.get("traders", [])
+        if isinstance(trader, dict) and trader.get("enabled", False)
+    ]
+    for trader in enabled_traders:
         build_strategy_config(trader)
-validate_production_fleet_config(data, config_path=str(config_path))
-print("enabled trader config validation OK")
+    if enabled_traders:
+        validate_production_fleet_config(data, config_path=str(config_path))
+    fleet_configs.append(data)
+
+if not shared_config_path.is_file():
+    raise ValueError(f"shared market-data config is missing: {shared_config_path}")
+shared_config = SharedMarketDataConfig.load(shared_config_path)
+validate_shared_market_data_config(shared_config, fleet_configs)
+print("shared market-data deployment preflight OK")
 PY
 python fleet_runner.py --help >/dev/null
 EOF
@@ -528,13 +554,22 @@ PY
   ssh_base "$target" "rm -rf $(quote "$staging_dir") && mkdir -p $(quote "$staging_dir") $(quote "$backup_dir")"
   scp_base -r "${LOCAL_RELEASE_DIR}/." "${target}:${staging_dir}/"
 
-  local validation_config="${REMOTE_DIR}/configs/traders.live.example.json"
-if [[ "$DEPLOY_CONFIG" == "1" ]]; then
-    validation_config="${staging_dir}/${CONFIG_FILE}"
+  local validation_shared_config="${REMOTE_DIR}/configs/market-data.live.example.json"
+  if [[ -n "$EXTRA_CONFIG_FILE" ]]; then
+    validation_shared_config="${staging_dir}/${EXTRA_CONFIG_FILE}"
   fi
+  local validation_fleet_configs=()
+  local fleet_config_path
+  for fleet_config_path in "$STANDARD_CONFIG_FILE" "$SPXC_CONFIG_FILE" "$MEGATRON_CONFIG_FILE"; do
+    if [[ "$DEPLOY_CONFIG" == "1" && "$fleet_config_path" == "$CONFIG_FILE" ]]; then
+      validation_fleet_configs+=("${staging_dir}/${fleet_config_path}")
+    else
+      validation_fleet_configs+=("${REMOTE_DIR}/${fleet_config_path}")
+    fi
+  done
 
   echo "Validating staged release without live execution"
-  ssh_base "$target" "bash -lc $(quote "$(remote_validation_script "$staging_dir" "$validation_config")")"
+  ssh_base "$target" "bash -lc $(quote "$(remote_validation_script "$staging_dir" "$validation_shared_config" "${validation_fleet_configs[@]}")")"
 
   echo "Validating deployment manifest before promotion"
   ssh_base "$target" "bash -lc $(quote "$(remote_mark_manifest_validated_script "$deployment_id" "$commit" "${staging_dir}/DEPLOYED_VERSION.json")")"

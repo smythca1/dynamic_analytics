@@ -94,6 +94,12 @@ class FakeMigrationTrader:
     def _get_position(self, symbol):
         return self.position
 
+    def get_positions(self):
+        return [self.position] if self.position is not None else []
+
+    def get_orders(self, **kwargs):
+        return self.orders
+
     def get_latest_trade_price(self, symbol, feed=None):
         if self.latest_error is not None:
             raise self.latest_error
@@ -141,6 +147,12 @@ class FakeProtectionTrader:
 
     def _get_position(self, symbol):
         return self.position
+
+    def get_positions(self):
+        return [self.position] if self.position is not None else []
+
+    def get_orders(self, **kwargs):
+        return self.orders
 
     def get_position(self, symbol):
         return self.position
@@ -716,7 +728,7 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
         enabled_megatron = {trader["id"]: trader for trader in megatron["traders"] if trader.get("enabled")}
 
         expected_camatron = {
-            "camatron_tsla_1s_renko_reversal_0p32_e1_qty5_20261005_live": ("TSLA", "renko_reversal", 1.15851136, 1, None, None),
+            "camatron_tsla_1s_renko_reversal_0p32_e1_qty5_20261005_live": ("TSLA", "renko_reversal", 3.40312712, 1, None, None),
         }
         self.assertEqual(set(enabled_camatron), set(expected_camatron))
         self.assertEqual(enabled_megatron, {})
@@ -3870,7 +3882,7 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
                 reconcile_engine_with_broker(Path(temp_dir), runtime)
 
         self.assertIsNotNone(engine.position)
-        self.assertEqual(runtime.log.events[0][1]["reason"], "broker_flat_engine_position_without_pending_close")
+        self.assertEqual(runtime.log.events[0][1]["reason"], "broker_flat_engine_position_without_close_fill_evidence")
 
     def test_reconcile_broker_flat_reversal_stop_wrong_order_id_fails_closed(self):
         engine = RenkoStrategyEngine(

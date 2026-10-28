@@ -23,10 +23,6 @@ TP_SL_SESSION_CONTRACT = {
     "allow_overnight": False,
 }
 
-SINGLE_STRATEGY_KERNEL_TRADER_ID = "camatron_tsla_1s_renko_reversal_0p32_e1_qty5_20261005_live"
-SINGLE_STRATEGY_KERNEL_BRICK_PCT = Decimal("0.32")
-SINGLE_STRATEGY_KERNEL_ENTRY_BRICKS = 1
-SINGLE_STRATEGY_KERNEL_QTY = 5
 ISOLATED_SPXC_TRADER_ID = "camatron_spxc_1s_renko_reversal_2p02_e1_qty5_20261007_live"
 ISOLATED_SPXC_BRICK_SIZE = Decimal("3.9390")
 
@@ -366,6 +362,9 @@ def validate_single_strategy_kernel_config(data: dict[str, Any], *, config_path:
         )
 
     trader = active[0]
+    contract = data.get("production_validation_contract")
+    if not isinstance(contract, dict) or str(contract.get("profile") or "") != "single_strategy_kernel_v2":
+        raise TraderConfigError(f"{source}{trader.get('id')}: missing approved production validation contract")
     strategy = trader.get("strategy") if isinstance(trader.get("strategy"), dict) else {}
     data_block = trader.get("data") if isinstance(trader.get("data"), dict) else {}
     sizing = trader.get("sizing") if isinstance(trader.get("sizing"), dict) else {}
@@ -376,6 +375,18 @@ def validate_single_strategy_kernel_config(data: dict[str, Any], *, config_path:
     )
     qty = as_float(sizing.get("qty"), default=0.0)
     brick_pct = _decimal_or_none(strategy.get("brick_pct") or profile.get("renko_brick_pct"))
+    expected_trader_id = str(contract.get("trader_id") or "")
+    expected_symbol = str(contract.get("symbol") or "").upper()
+    expected_brick_pct = _decimal_or_none(contract.get("brick_percentage"))
+    expected_reference_price = _decimal_or_none(contract.get("reference_price"))
+    expected_fixed_brick = _decimal_or_none(contract.get("fixed_dollar_brick"))
+    expected_quantity = _decimal_or_none(contract.get("quantity"))
+    expected_canonical_source = str(contract.get("canonical_source") or "")
+    expected_reference_identity = str(contract.get("canonical_reference_identity") or "")
+    configured_reference_price = _decimal_or_none(profile.get("ltp_reference"))
+    configured_fixed_brick = _decimal_or_none(profile.get("fixed_dollar_brick"))
+    configured_strategy_brick = _decimal_or_none(strategy.get("brick_size"))
+    configured_reference_identity = str(profile.get("canonical_reference_identity") or "")
     validation_profile = str(data.get("production_validation_profile") or "").strip().lower()
     if validation_profile == "isolated_spxc_v1":
         session = trader.get("session") if isinstance(trader.get("session"), dict) else {}
@@ -408,18 +419,23 @@ def validate_single_strategy_kernel_config(data: dict[str, Any], *, config_path:
         return
 
     checks = {
-        "trader_id": trader_id == SINGLE_STRATEGY_KERNEL_TRADER_ID,
-        "symbol": str(trader.get("symbol") or "").upper() == "TSLA",
+        "trader_id": trader_id == expected_trader_id,
+        "symbol": str(trader.get("symbol") or "").upper() == expected_symbol,
         "broker": str(trader.get("broker") or "").lower() == "alpaca",
         "account_namespace": account_namespace == "camatron",
         "mode": str(trader.get("mode") or "").lower() == "live",
         "strategy_type": str(strategy.get("type") or "").lower() == "renko_reversal",
-        "brick_pct": brick_pct == SINGLE_STRATEGY_KERNEL_BRICK_PCT,
-        "entry_bricks": int(strategy.get("entry_bricks") or 0) == SINGLE_STRATEGY_KERNEL_ENTRY_BRICKS,
+        "brick_pct": brick_pct is not None and brick_pct == expected_brick_pct,
+        "reference_price": configured_reference_price == expected_reference_price,
+        "fixed_dollar_brick": configured_fixed_brick == expected_fixed_brick,
+        "strategy_brick_size": configured_strategy_brick == expected_fixed_brick,
+        "canonical_reference_identity": configured_reference_identity == expected_reference_identity,
+        "canonical_source": str(data_block.get("renko_source") or "") == expected_canonical_source,
+        "entry_bricks": int(strategy.get("entry_bricks") or 0) == 1,
         "take_profit_bricks": strategy.get("take_profit_bricks") is None,
         "stop_loss_bricks": strategy.get("stop_loss_bricks") is None,
         "exit_management": str(strategy.get("exit_management") or "").lower() == "strategy",
-        "qty": abs(qty - SINGLE_STRATEGY_KERNEL_QTY) <= 1e-9,
+        "qty": expected_quantity is not None and abs(Decimal(str(qty)) - expected_quantity) <= Decimal("0.000000001"),
         "market_data_source": str(data_block.get("market_data_source") or "").lower() == "shared_canonical_stream",
         "feed": str(data_block.get("feed") or "").lower() == "sip",
         "renko_source": str(data_block.get("renko_source") or "").lower() == CANONICAL_RENKO_SOURCE,

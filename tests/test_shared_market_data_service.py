@@ -9,7 +9,9 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, Mock, patch
 
 import pandas as pd
 
@@ -26,6 +28,7 @@ from silver.market import (
 )
 import silver.market.shared_service as shared_service_module
 from silver.market.canonical_journal import CanonicalJournal
+from silver.market.ipc_consumer import CanonicalStreamEvent
 from silver.market.shared_service import (
     AlpacaSipUpstream,
     AsyncArchiveWriter,
@@ -404,16 +407,36 @@ class SharedMarketDataServiceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await asyncio.wait_for(server.monitor_disk_safety(interval_seconds=60), timeout=2)
 
-    async def test_journal_size_limit_blocks_ingestion(self):
+    async def test_journal_size_limit_rotates_without_dropping_observation(self):
         strict_payload = config_payload(self.temp.name, symbols=("AAPL",))
-        strict_payload["journal_max_bytes"] = 1
+        strict_payload["journal_max_bytes"] = 700
         strict = SharedMarketDataConfig.from_mapping(strict_payload)
         server = SharedCanonicalMarketDataServer(strict)
         adapter = CanonicalMarketObservationAdapter(run_id="journal-size")
         await server.ingest_raw_trade(trade("AAPL", "2026-08-21T14:00:00.100Z", 100.0, 1), adapter)
         await server.ingest_raw_trade(trade("AAPL", "2026-08-21T14:00:01.100Z", 101.0, 2), adapter)
-        with self.assertRaises(RuntimeError):
-            await server.ingest_raw_trade(trade("AAPL", "2026-08-21T14:00:02.100Z", 102.0, 3), adapter)
+        await server.ingest_raw_trade(trade("AAPL", "2026-08-21T14:00:02.100Z", 102.0, 3), adapter)
+        await server.ingest_raw_trade(trade("AAPL", "2026-08-21T14:00:03.100Z", 103.0, 4), adapter)
+        active = Path(strict.journal_path)
+        archives = sorted(active.parent.glob("canonical_journal_*.jsonl"))
+        self.assertTrue(archives)
+        self.assertEqual([event["sequence"] for event in server.events_by_symbol["AAPL"]], [1, 2, 3])
+        self.assertEqual(json.loads(active.read_text(encoding="utf-8").splitlines()[0])["payload"]["sequence"], 3)
+
+    def test_journal_rotation_preserves_archive_and_creates_append_target(self):
+        with temporary_directory() as temp_dir:
+            path = Path(temp_dir) / "canonical_journal.jsonl"
+            journal = CanonicalJournal(path)
+            journal.append(journal_event(sequence=1))
+            original = path.read_bytes()
+            archive = journal.rotate(timestamp="2026-08-21T14:00:01Z", latest_sequences={"AAPL": 1})
+            self.assertIsNotNone(archive)
+            assert archive is not None
+            self.assertEqual(archive.read_bytes(), original)
+            self.assertTrue(path.exists())
+            self.assertEqual(path.read_bytes(), b"")
+            journal.append(journal_event(sequence=2))
+            self.assertEqual(journal.latest_sequence_by_symbol()["AAPL"], 2)
 
     async def test_queue_overflow_marks_consumer_stale_and_records_drop(self):
         writer = DummyWriter()
@@ -581,6 +604,107 @@ class SharedMarketDataServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(path.stat().st_mtime_ns, first_mtime)
         self.assertGreaterEqual(self.server.metrics.snapshot()["counts"]["health_snapshot_write_skipped"], 1)
+
+    async def test_sampler_activity_reads_pending_state_without_full_snapshot(self):
+        adapter = CanonicalMarketObservationAdapter(run_id="lightweight-pending")
+        self.server.health["pending_canonical_bucket_by_symbol"]["AAPL"] = "obsolete"
+        with patch.object(adapter, "snapshot", side_effect=AssertionError("full snapshot on hot path")):
+            self.server._refresh_sampler_activity("aapl", adapter)
+            self.assertNotIn("AAPL", self.server.health["pending_canonical_bucket_by_symbol"])
+            await self.server.ingest_raw_trade(trade("AAPL", "2026-08-21T14:00:00.100Z", 100, 1), adapter)
+            self.assertEqual(self.server.health["pending_canonical_bucket_by_symbol"]["AAPL"], "2026-08-21T14:00:00+00:00")
+            emitted = await self.server.ingest_raw_trade(trade("AAPL", "2026-08-21T14:00:01.100Z", 101, 2), adapter)
+        self.assertEqual([row["sequence"] for row in emitted], [1])
+        self.assertEqual(self.server.health["pending_canonical_bucket_by_symbol"]["AAPL"], "2026-08-21T14:00:01+00:00")
+
+    async def test_throttled_health_skips_reports_but_keeps_freshness_and_safety(self):
+        self.server._refresh_health(force=True)
+        self.server._health_write_interval_seconds = 3600
+        now = pd.Timestamp.now(tz="UTC")
+        self.server.health["last_canonical_observation_by_symbol"]["AAPL"] = now.isoformat()
+        self.server._canonical_source_high_water_by_symbol["AAPL"] = now
+        self.server._canonical_heartbeat_monotonic_by_symbol["AAPL"] = time.monotonic()
+        self.server.health["journal_healthy"] = False
+        self.server.health["gap_count"] = 1
+        self.server.health["dropped_message_count"] = 2
+        stat = Path.stat
+
+        def report_stat(path, *args, **kwargs):
+            self.assertNotEqual(path, Path(self.config.journal_path), "journal stat on throttled report")
+            return stat(path, *args, **kwargs)
+
+        class ReportConsumers(dict):
+            def items(self):
+                raise AssertionError("consumer aggregation on throttled report")
+
+        self.server.consumers = ReportConsumers()
+        with patch.object(Path, "stat", report_stat), patch.object(
+            self.server.metrics, "snapshot", side_effect=AssertionError("metrics report on hot path")
+        ):
+            self.server._refresh_health()
+        self.assertLess(self.server.health["canonical_heartbeat_age_seconds"]["AAPL"], 5)
+        self.assertLess(self.server.health["canonical_source_freshness_age_seconds"]["AAPL"], 5)
+        self.assertIn("AAPL", self.server.health["observation_age_seconds"])
+        self.assertFalse(self.server.health["journal_healthy"])
+        self.assertEqual(self.server.health["gap_count"], 1)
+        self.assertEqual(self.server.health["dropped_message_count"], 2)
+
+    async def test_health_report_aggregates_when_forced_or_due(self):
+        self.server._refresh_health(force=True)
+        queue = asyncio.Queue()
+        self.server.consumers["report"] = ConsumerState(
+            identity="report", writer=DummyWriter(), queue=queue,
+            connected_at=pd.Timestamp.now(tz="UTC").isoformat(),
+        )
+        for force in (True, False):
+            with self.subTest(force=force):
+                queue.put_nowait({"test": True})
+                if not force:
+                    self.server._last_health_write_monotonic -= self.server._health_write_interval_seconds + 1
+                with patch.object(self.server.metrics, "snapshot", wraps=self.server.metrics.snapshot) as snapshot:
+                    self.server._refresh_health(force=force)
+                snapshot.assert_called_once()
+                report = json.loads(Path(self.config.health_path).read_text())
+                self.assertEqual(report["consumers"]["report"]["queue_size"], queue.qsize())
+
+    async def test_journal_fsync_finishes_before_observation_enqueue(self):
+        fsync = os.fsync
+        durable = []
+
+        def record_fsync(fd):
+            fsync(fd)
+            durable.append(True)
+
+        testcase = self
+
+        class DurableQueue(asyncio.Queue):
+            def put_nowait(self, row):
+                testcase.assertTrue(durable, "observation enqueued before journal fsync")
+                super().put_nowait(row)
+
+        queue = DurableQueue()
+        self.server.consumers["durable"] = ConsumerState(
+            identity="durable", writer=DummyWriter(), queue=queue,
+            connected_at=pd.Timestamp.now(tz="UTC").isoformat(),
+        )
+        event = journal_event()
+        with patch.object(os, "fsync", side_effect=record_fsync):
+            await self.server.publish_event(event)
+        self.assertEqual(len(durable), 1)
+        self.assertEqual(queue.get_nowait(), event)
+        self.assertEqual(self.server.journal.recover().events[-1], event)
+
+    async def test_journal_failure_does_not_enqueue_observation(self):
+        queue = asyncio.Queue()
+        self.server.consumers["durable"] = ConsumerState(
+            identity="durable", writer=DummyWriter(), queue=queue,
+            connected_at=pd.Timestamp.now(tz="UTC").isoformat(),
+        )
+        with patch.object(self.server.journal, "append", side_effect=OSError("durability failure")):
+            with self.assertRaisesRegex(OSError, "durability failure"):
+                await self.server.publish_event(journal_event())
+        self.assertTrue(queue.empty())
+        self.assertEqual(self.server.events_by_symbol["AAPL"], [])
 
     async def test_canonical_journal_only_policy_disables_archive_files_not_journal(self):
         await self.server_context.__aexit__(None, None, None)
@@ -1351,6 +1475,120 @@ class SharedMarketDataUnitTests(unittest.TestCase):
         self.assertIn("--market-data-source shared_canonical_stream", megatron)
         self.assertNotIn("--market-data-profile", camatron)
         self.assertNotIn("--market-data-profile", megatron)
+
+
+class SharedStreamGateSynchronizationTests(unittest.IsolatedAsyncioTestCase):
+    async def _process_two_observations(self, *, consumer_block=None, enabled=True, unsafe=False, limit=10000, pending_close=False):
+        import fleet_runner
+        from strategy_engine import RenkoStrategyConfig, RenkoStrategyEngine
+        from trading_events import Signal, OrderIntent
+
+        with temporary_directory() as directory:
+            consumer = SharedCanonicalStreamConsumer(
+                socket_path="/unused-offline.sock", identity="offline", expected_contract_fingerprints={},
+                state_path=Path(directory) / "unused.json", symbols=("AAPL",),
+            )
+            consumer.catchup_complete = True
+            consumer.startup_ready_symbols.add("AAPL")
+            consumer.symbol_health["AAPL"] = {"journal_healthy": True, "gap_count": 0}
+            if consumer_block == "gap":
+                consumer.gapped = True
+            elif consumer_block == "catchup":
+                consumer.catchup_complete = False
+            elif consumer_block == "not_ready":
+                consumer.startup_ready_symbols.clear()
+            elif consumer_block == "journal":
+                consumer.symbol_health["AAPL"]["journal_healthy"] = False
+            elif consumer_block == "delivery":
+                consumer.symbol_health["AAPL"]["symbol_delivery_failure"] = "subscription_not_acknowledged"
+            elif consumer_block == "emission":
+                consumer.symbol_health["AAPL"].update({
+                    "canonical_flush_expected": True,
+                    "canonical_flush_expected_at": (pd.Timestamp.now(tz="UTC") - pd.Timedelta(seconds=30)).isoformat(),
+                })
+
+            async def observations():
+                for sequence in (1, 2):
+                    yield CanonicalStreamEvent(journal_event(sequence=sequence))
+                await asyncio.Future()
+
+            consumer.connect = observations
+            consumer.ack = AsyncMock()
+            engine = RenkoStrategyEngine(RenkoStrategyConfig(
+                symbol="AAPL", brick_size=1, entry_bricks=1, qty=1,
+                strategy_type="renko_tp_sl" if pending_close else "renko_reversal",
+                take_profit_bricks=3 if pending_close else None,
+                stop_loss_bricks=3 if pending_close else None,
+            ))
+            engine.reconciliation_unsafe = unsafe
+            engine.pending_exit = {"broker_order_id": "existing-close"} if pending_close else None
+            runtime = SimpleNamespace(
+                trader_id="offline", symbol="AAPL", mode="live", credential_profile=None,
+                account_namespace="test", feed="sip", renko_source="1s_close", enabled=enabled,
+                execution_enabled=False, contract_fingerprints={}, evidence=None, log=Mock(),
+                market_data_signal_block_reason="shared_market_data_not_ready",
+                max_position_notional=limit, max_daily_loss=0, execution=Mock(),
+                engine=engine,
+            )
+            timestamp = pd.Timestamp("2026-08-21T14:00:00Z")
+            signal = Signal("offline", "exit" if pending_close else "entry", timestamp, "AAPL", "long", "buy", 100, "reversal", "offline")
+            intent = OrderIntent("offline", timestamp, "AAPL", "buy", signal.signal_type, "market", "offline", "reversal", qty=1, close_position=pending_close)
+            seen = []
+
+            def process(**kwargs):
+                reason = fleet_runner.should_block_for_risk(runtime, signal, intent)
+                if reason is not None:
+                    self.assertFalse(fleet_runner.handle_action(runtime, signal, intent))
+                    runtime.execution.execute.assert_not_called()
+                source = kwargs["source_event"]
+                seen.append((runtime.market_data_signal_block_reason, reason, source.source_record_id, source.source_sequence))
+                if len(seen) == 2:
+                    raise asyncio.CancelledError()
+
+            args = SimpleNamespace(shared_market_socket="/unused-offline.sock", execute_real=False, reconnect_delay=0)
+            with patch.object(fleet_runner, "archive_root", return_value=Path(directory)), patch.object(
+                fleet_runner, "archive_engine_state"
+            ), patch.object(fleet_runner, "SharedCanonicalStreamConsumer", return_value=consumer), patch.object(
+                fleet_runner, "process_market_tick_for_runtime", side_effect=process
+            ), patch.object(fleet_runner, "flush_evidence"), patch.object(
+                fleet_runner, "reconcile_broker_state_if_due_or_halt", side_effect=AssertionError("unexpected broker access")
+            ):
+                with self.assertRaises(asyncio.CancelledError):
+                    await fleet_runner.run_market_stream("shared_canonical_stream", None, "live", "sip", [runtime], args)
+            self.assertEqual([item[2:] for item in seen], [("aapl-1", 1), ("aapl-2", 2)])
+            consumer.ack.assert_awaited_once()
+            self.assertEqual(consumer.ack.await_args.args[0].sequence, 1)
+            return runtime, seen
+
+    async def test_ready_consumer_clears_cached_gate_without_restoring_it(self):
+        runtime, seen = await self._process_two_observations()
+        self.assertEqual([item[:2] for item in seen], [(None, None), (None, None)])
+        self.assertIsNone(runtime.market_data_signal_block_reason)
+
+    async def test_consumer_safety_conditions_remain_fail_closed(self):
+        cases = {
+            "gap": "shared_market_data_gap", "catchup": "shared_market_data_not_caught_up",
+            "not_ready": "shared_market_data_not_ready", "journal": "shared_market_data_gap",
+            "delivery": "shared_market_data_symbol_delivery_failed_subscription_not_acknowledged",
+            "emission": "shared_market_data_canonical_emission_failed",
+        }
+        for state, reason in cases.items():
+            with self.subTest(state=state):
+                runtime, seen = await self._process_two_observations(consumer_block=state)
+                self.assertEqual([item[:2] for item in seen], [(reason, reason), (reason, reason)])
+                self.assertEqual(runtime.market_data_signal_block_reason, reason)
+
+    async def test_consumer_readiness_does_not_clear_independent_execution_gates(self):
+        cases = [
+            ({"enabled": False}, "runtime_disabled"),
+            ({"unsafe": True}, "reconciliation_unsafe"),
+            ({"limit": 10}, "entry_notional_exceeds_limit_10"),
+            ({"pending_close": True}, "tp_sl_close_already_submitted"),
+        ]
+        for kwargs, reason in cases:
+            with self.subTest(reason=reason):
+                _runtime, seen = await self._process_two_observations(**kwargs)
+                self.assertEqual([item[:2] for item in seen], [(None, reason), (None, reason)])
 
 
 if __name__ == "__main__":

@@ -43,6 +43,7 @@ from silver.evidence.shadow_sampler import EvidenceShadowSampler, ShadowSamplerS
 from silver.market import (
     CANONICAL_RENKO_SOURCE,
     CanonicalMarketObservationAdapter,
+    CanonicalStreamEvent,
     SharedCanonicalStreamConsumer,
     LiveMarketEvent,
     LocalArchiveMarketDataTail,
@@ -73,6 +74,17 @@ class BrokerEngineStateMismatch(RuntimeError):
     pass
 
 
+def live_market_event_from_canonical_stream_event(event: CanonicalStreamEvent) -> LiveMarketEvent:
+    """Adapt a canonical IPC event to the runtime's existing event interface."""
+    return LiveMarketEvent(
+        tick=event.to_market_tick(),
+        source_record_id=event.event_id,
+        broker_trade_id=event.event_id,
+        source_sequence=event.sequence,
+        eligible=True,
+    )
+
+
 @dataclass(frozen=True)
 class TraderRuntime:
     trader_id: str
@@ -100,6 +112,7 @@ class TraderRuntime:
     migration_evidence_path: str | None = None
     market_data_signal_block_reason: str | None = None
     processed_canonical_event_ids: dict[str, str] = field(default_factory=dict)
+    processed_canonical_event_sequences: dict[str, Any] = field(default_factory=dict)
 
 
 _PRODUCTION_OBSERVATION_SEQUENCES: dict[tuple[str, str], int] = {}
@@ -287,6 +300,7 @@ def archive_engine_state(root: Path, runtime: TraderRuntime, reason: str) -> Non
         },
         "canonical_market_checkpoints": {
             "processed_event_ids": runtime.processed_canonical_event_ids,
+            "processed_event_sequences": runtime.processed_canonical_event_sequences,
         },
         "configured_brick_size": getattr(strategy_config, "brick_size", None),
         "configured_quantity": getattr(strategy_config, "qty", None),
@@ -438,6 +452,8 @@ def record_evidence_checkpoint(runtime: TraderRuntime, *, reason: str, checkpoin
         },
         completeness=completeness,
         unknown_fields=production_sampler_state.get("unknown_fields", []) + ["broker_confirmed_quantity", "accounting_quantity", "accounting_basis_status"],
+        canonical_sequence=runtime.processed_canonical_event_sequences.get(runtime.symbol, UNKNOWN),
+        canonical_event_id=runtime.processed_canonical_event_ids.get(runtime.symbol, UNKNOWN),
     )
     safe_evidence_call(runtime, "checkpoint_record", lambda: runtime.evidence.record_checkpoint(checkpoint))
     safe_evidence_call(
@@ -519,6 +535,11 @@ def restore_canonical_market_checkpoints(runtime: TraderRuntime, state_payload: 
         runtime.processed_canonical_event_ids.update(
             {str(symbol).upper(): str(event_id) for symbol, event_id in processed.items() if event_id}
         )
+    sequences = checkpoints.get("processed_event_sequences")
+    if isinstance(sequences, dict):
+        runtime.processed_canonical_event_sequences.update(
+            {str(symbol).upper(): value for symbol, value in sequences.items() if value is not None}
+        )
 
 
 def shared_canonical_event_id_from_tick(runtime: TraderRuntime, tick: MarketTick) -> str | None:
@@ -528,10 +549,16 @@ def shared_canonical_event_id_from_tick(runtime: TraderRuntime, tick: MarketTick
     return event_id or None
 
 
-def mark_processed_shared_canonical_event(runtime: TraderRuntime, tick: MarketTick) -> None:
+def mark_processed_shared_canonical_event(
+    runtime: TraderRuntime,
+    tick: MarketTick,
+    source_event: LiveMarketEvent | None = None,
+) -> None:
     event_id = shared_canonical_event_id_from_tick(runtime, tick)
     if event_id:
         runtime.processed_canonical_event_ids[runtime.symbol] = event_id
+        if source_event is not None and source_event.source_sequence is not None:
+            runtime.processed_canonical_event_sequences[runtime.symbol] = source_event.source_sequence
 
 
 def restore_engine_state(root: Path, trader_id: str, engine: RenkoStrategyEngine) -> tuple[bool, str | None]:
@@ -1004,6 +1031,62 @@ def unexpected_symbol_open_orders(runtime: TraderRuntime, *, allowed_order_ids: 
     return unexpected
 
 
+def observe_broker_position(runtime: TraderRuntime) -> tuple[dict[str, Any] | None, str, dict[str, Any]]:
+    """Return a broker position only after the broker observation is complete enough to use."""
+    if not isinstance(runtime.execution, AlpacaExecutionEngine):
+        return None, "confirmed_flat", {"source": "non_alpaca_execution"}
+
+    trader = runtime.execution.trader
+    try:
+        direct_position = trader._get_position(runtime.symbol)
+    except Exception as exc:
+        return None, "uncertain", {"source": "symbol_position", "error": str(exc)}
+    if isinstance(direct_position, dict):
+        return direct_position, "position", {"source": "symbol_position"}
+
+    if not hasattr(trader, "get_positions"):
+        return None, "uncertain", {"source": "full_positions", "error": "positions_endpoint_unavailable"}
+    try:
+        all_positions = list(trader.get_positions())
+    except Exception as exc:
+        return None, "uncertain", {"source": "full_positions", "error": str(exc)}
+
+    matching_positions = [
+        position
+        for position in all_positions
+        if isinstance(position, dict)
+        and str(position.get("symbol") or "").upper().strip() == runtime.symbol.upper()
+    ]
+    if matching_positions:
+        return matching_positions[0], "position", {
+            "source": "full_positions",
+            "direct_symbol_position": "empty",
+            "matching_positions": matching_positions,
+        }
+
+    try:
+        open_orders = broker_nested_open_orders(runtime)
+    except Exception as exc:
+        return None, "uncertain", {"source": "open_orders", "error": str(exc)}
+    symbol_orders = [
+        _summarize_order(order)
+        for order in open_orders
+        if isinstance(order, dict) and str(order.get("symbol") or "").upper().strip() == runtime.symbol.upper()
+    ]
+    if symbol_orders:
+        return None, "confirmed_flat_with_orders", {
+            "source": "full_positions_and_open_orders",
+            "direct_symbol_position": "empty",
+            "symbol_open_orders": symbol_orders,
+        }
+    return None, "confirmed_flat", {
+        "source": "full_positions_and_open_orders",
+        "direct_symbol_position": "empty",
+        "full_positions_count": len(all_positions),
+        "symbol_open_orders": [],
+    }
+
+
 def protection_allowed_order_ids(verification: Any) -> set[str]:
     ids = {
         getattr(verification, "parent_order_id", None),
@@ -1406,7 +1489,16 @@ def matching_external_close_fill(runtime: TraderRuntime, engine_position: dict[s
         return None
     expected_side = "sell" if str(engine_position.get("side") or "").lower().strip() == "long" else "buy"
     expected_qty = Decimal(str(abs(float(engine_position.get("qty") or 0))))
-    for fill in trader.get_recent_fills(runtime.symbol):
+    try:
+        fills = trader.get_recent_fills(runtime.symbol, limit=1000)
+    except TypeError:
+        try:
+            fills = trader.get_recent_fills(runtime.symbol)
+        except Exception:
+            return None
+    except Exception:
+        return None
+    for fill in fills:
         side = str(fill.get("side") or "").lower().strip()
         qty = Decimal(str(fill.get("qty") or 0))
         if side == expected_side and qty >= expected_qty:
@@ -1693,9 +1785,28 @@ def reconcile_engine_with_broker(root: Path, runtime: TraderRuntime) -> None:
     if not isinstance(runtime.execution, AlpacaExecutionEngine):
         return
 
-    broker_position = runtime.execution.trader._get_position(runtime.symbol)
+    broker_position, broker_observation_state, broker_observation_evidence = observe_broker_position(runtime)
     engine_trade = runtime.engine.trade_state_snapshot()
     engine_position = engine_trade.get("position")
+
+    if broker_observation_state == "uncertain":
+        error = {
+            "reason": "broker_position_observation_uncertain",
+            "observation": broker_observation_evidence,
+            "previous_trade_state": engine_trade,
+        }
+        runtime.log.write(
+            "state_reconcile_error",
+            {
+                "trader_id": runtime.trader_id,
+                "symbol": runtime.symbol,
+                **error,
+            },
+        )
+        halt_runtime(root, runtime, str(error["reason"]), error)
+        raise BrokerEngineStateMismatch(
+            f"{runtime.trader_id} {runtime.symbol} broker position observation is incomplete"
+        )
 
     broker_native_runtime = (
         is_renko_tp_sl_runtime(runtime)
@@ -1865,6 +1976,30 @@ def reconcile_engine_with_broker(root: Path, runtime: TraderRuntime) -> None:
                 f"{runtime.trader_id} {runtime.symbol} broker position lacks valid broker-native protection"
             )
 
+    if (
+        broker_position is None
+        and engine_position is None
+        and broker_observation_state == "confirmed_flat_with_orders"
+        and not broker_native_runtime
+        and not reversal_stop_runtime
+    ):
+        error = {
+            "reason": "broker_flat_engine_flat_unexpected_symbol_open_order",
+            "observation": broker_observation_evidence,
+        }
+        runtime.log.write(
+            "state_reconcile_error",
+            {
+                "trader_id": runtime.trader_id,
+                "symbol": runtime.symbol,
+                **error,
+            },
+        )
+        halt_runtime(root, runtime, str(error["reason"]), error)
+        raise BrokerEngineStateMismatch(
+            f"{runtime.trader_id} {runtime.symbol} has unexpected open broker orders while flat"
+        )
+
     if broker_position is None and engine_position is not None:
         if is_renko_tp_sl_runtime(runtime) or reversal_stop_runtime:
             lifecycle_state = str(getattr(runtime.engine, "tp_sl_lifecycle_state", ""))
@@ -1915,44 +2050,74 @@ def reconcile_engine_with_broker(root: Path, runtime: TraderRuntime) -> None:
                     )
                     archive_engine_state(root, runtime, reason="broker_flat_manual_external_close_reconciled")
                     return
+            error = {
+                "reason": "broker_flat_engine_position_without_close_fill_evidence",
+                "observation": broker_observation_evidence,
+                "previous_trade_state": engine_trade,
+            }
             runtime.log.write(
                 "state_reconcile_error",
                 {
                     "trader_id": runtime.trader_id,
                     "symbol": runtime.symbol,
-                    "reason": "broker_flat_engine_position_without_pending_close",
-                    "previous_trade_state": engine_trade,
+                    **error,
                 },
             )
             halt_runtime(
                 root,
                 runtime,
-                "broker_flat_engine_position_without_pending_close",
-                {"previous_trade_state": engine_trade},
+                str(error["reason"]),
+                error,
             )
             raise BrokerEngineStateMismatch(
                 f"{runtime.trader_id} engine has {runtime.symbol} position but broker is flat"
             )
-        runtime.engine.restore_trade_state(
-            {
-                "position": None,
-                "psar_sar": None,
-                "psar_ep": None,
-                "psar_af": None,
-                "force_flat_dates": engine_trade.get("force_flat_dates", []),
-            }
-        )
+        if isinstance(engine_position, dict):
+            external_fill = matching_external_close_fill(runtime, engine_position)
+            if external_fill is not None and hasattr(runtime.engine, "mark_external_close_filled"):
+                entry_price = Decimal(str(engine_position.get("entry_price") or 0))
+                fill_price = Decimal(str(external_fill.get("price") or external_fill.get("filled_avg_price") or 0))
+                qty = Decimal(str(external_fill.get("qty") or external_fill.get("filled_qty") or 0))
+                side_mult = Decimal("1") if engine_position.get("side") == "long" else Decimal("-1")
+                realized_pnl = (fill_price - entry_price) * qty * side_mult
+                runtime.engine.mark_external_close_filled(
+                    timestamp=external_fill.get("transaction_time") or external_fill.get("filled_at"),
+                    reason="manual_external_close",
+                    order_id=str(external_fill.get("order_id") or external_fill.get("id") or ""),
+                    source="alpaca_manual_close_reconciliation",
+                    fill_price=str(fill_price),
+                    filled_qty=str(qty),
+                    realized_pnl=str(realized_pnl),
+                )
+                runtime.log.write(
+                    "state_reconciled",
+                    {
+                        "trader_id": runtime.trader_id,
+                        "symbol": runtime.symbol,
+                        "reason": "broker_flat_manual_external_close_reconciled",
+                        "fill": external_fill,
+                        "previous_trade_state": engine_trade,
+                    },
+                )
+                archive_engine_state(root, runtime, reason="broker_flat_manual_external_close_reconciled")
+                return
+        error = {
+            "reason": "broker_flat_engine_position_without_close_fill_evidence",
+            "observation": broker_observation_evidence,
+            "previous_trade_state": engine_trade,
+        }
         runtime.log.write(
-            "state_reconciled",
+            "state_reconcile_error",
             {
                 "trader_id": runtime.trader_id,
                 "symbol": runtime.symbol,
-                "reason": "broker_flat_engine_position_cleared",
-                "previous_trade_state": engine_trade,
+                **error,
             },
         )
-        archive_engine_state(root, runtime, reason="broker_reconciled_flat")
-        return
+        halt_runtime(root, runtime, str(error["reason"]), error)
+        raise BrokerEngineStateMismatch(
+            f"{runtime.trader_id} engine has {runtime.symbol} position but broker is flat"
+        )
 
     if broker_position is not None and engine_position is None:
         runtime.log.write(
@@ -1975,6 +2140,22 @@ def reconcile_engine_with_broker(root: Path, runtime: TraderRuntime) -> None:
             archive_engine_state(root, runtime, reason="broker_position_exists_engine_flat")
         raise BrokerEngineStateMismatch(
             f"{runtime.trader_id} has broker {runtime.symbol} position but engine is flat"
+        )
+
+    if (
+        broker_position is not None
+        and isinstance(engine_position, dict)
+        and not is_renko_tp_sl_runtime(runtime)
+        and not reversal_stop_runtime
+    ):
+        mark_reconciliation_safe(
+            root,
+            runtime,
+            reason="broker_engine_position_confirmed",
+            evidence={
+                "broker_position": broker_position,
+                "observation": broker_observation_evidence,
+            },
         )
 
     if broker_position is not None and is_renko_tp_sl_runtime(runtime):
@@ -2718,6 +2899,18 @@ def should_block_for_risk(runtime: TraderRuntime, signal: Signal, intent: OrderI
 def handle_action(runtime: TraderRuntime, signal: Signal, intent: OrderIntent, root: Path | None = None) -> bool:
     block_reason = should_block_for_risk(runtime, signal, intent)
     if block_reason:
+        safe_evidence_call(
+            runtime,
+            "gate_decision",
+            lambda: runtime.evidence.record_gate_decision(
+                trader_id=runtime.trader_id,
+                symbol=runtime.symbol,
+                decision="blocked",
+                reason=block_reason,
+                signal=signal,
+                intent=intent,
+            ) if runtime.evidence is not None else None,
+        )
         runtime.log.write(
             "risk_block",
             {
@@ -2730,10 +2923,41 @@ def handle_action(runtime: TraderRuntime, signal: Signal, intent: OrderIntent, r
         )
         return False
 
+    safe_evidence_call(
+        runtime,
+        "gate_decision",
+        lambda: runtime.evidence.record_gate_decision(
+            trader_id=runtime.trader_id,
+            symbol=runtime.symbol,
+            decision="allowed",
+            reason=None,
+            signal=signal,
+            intent=intent,
+        ) if runtime.evidence is not None else None,
+    )
+    safe_evidence_call(
+        runtime,
+        "order_intent",
+        lambda: runtime.evidence.record_order_intent(
+            trader_id=runtime.trader_id,
+            symbol=runtime.symbol,
+            intent=intent,
+        ) if runtime.evidence is not None else None,
+    )
+
     runtime.log.write("signal", dataclass_to_jsonable(signal))
     try:
         event = runtime.execution.execute(intent)
     except Exception as exc:
+        safe_evidence_call(
+            runtime,
+            "execution",
+            lambda: runtime.evidence.record_execution(
+                trader_id=runtime.trader_id,
+                symbol=runtime.symbol,
+                event={"status": "error", "error": str(exc), "intent": dataclass_to_jsonable(intent)},
+            ) if runtime.evidence is not None else None,
+        )
         if root is not None and is_reversal_catastrophic_stop_runtime(runtime):
             try:
                 _recover_runtime_reversal_catastrophic_stop(root, runtime)
@@ -2757,6 +2981,15 @@ def handle_action(runtime: TraderRuntime, signal: Signal, intent: OrderIntent, r
             },
         )
         return False
+    safe_evidence_call(
+        runtime,
+        "execution",
+        lambda: runtime.evidence.record_execution(
+            trader_id=runtime.trader_id,
+            symbol=runtime.symbol,
+            event=event,
+        ) if runtime.evidence is not None else None,
+    )
     status = str(getattr(event, "status", "") or "").lower()
     if status in TERMINAL_EXECUTION_FAILURE_STATUSES:
         if (
@@ -2959,6 +3192,8 @@ def _process_market_tick_for_runtime(
                     observation_bucket_timestamp=source_tick.timestamp,
                     close_price=source_tick.price,
                     production_source_mode=runtime.renko_source,
+                    source_event_id=source_tick.trade_id or None,
+                    source_sequence=getattr(source_event, "source_sequence", UNKNOWN),
                 ),
             )
             source_trade_identity = getattr(observation, "source_record_id", None) or (
@@ -3001,6 +3236,12 @@ def _process_market_tick_for_runtime(
                         symbol=runtime.symbol,
                         brick=brick,
                         source_observation_bucket_timestamp=source_tick.timestamp,
+                        source_event_id=source_event.source_record_id if source_event is not None else UNKNOWN,
+                        source_sequence=(
+                            source_event.source_sequence
+                            if source_event is not None and source_event.source_sequence is not None
+                            else UNKNOWN
+                        ),
                     ),
                 )
             brick_payload = dataclass_to_jsonable(brick)
@@ -3026,6 +3267,12 @@ def _process_market_tick_for_runtime(
                         signal=signal,
                         intent=intent,
                         source_brick_timestamp=source_brick_timestamp,
+                        source_event_id=source_event.source_record_id if source_event is not None else UNKNOWN,
+                        source_sequence=(
+                            source_event.source_sequence
+                            if source_event is not None and source_event.source_sequence is not None
+                            else UNKNOWN
+                        ),
                     ),
                 )
                 safe_evidence_call(
@@ -3043,13 +3290,13 @@ def _process_market_tick_for_runtime(
             if not handle_action(runtime, signal, intent, root=root):
                 runtime.engine.restore_trade_state(trade_snapshot)
                 reconcile_engine_with_broker(root, runtime)
-                mark_processed_shared_canonical_event(runtime, source_tick)
+                mark_processed_shared_canonical_event(runtime, source_tick, source_event)
                 archive_engine_state(root, runtime, reason="action_rejected")
                 break
-            mark_processed_shared_canonical_event(runtime, source_tick)
+            mark_processed_shared_canonical_event(runtime, source_tick, source_event)
             archive_engine_state(root, runtime, reason="action_executed")
         else:
-            mark_processed_shared_canonical_event(runtime, source_tick)
+            mark_processed_shared_canonical_event(runtime, source_tick, source_event)
             archive_engine_state(root, runtime, reason=runtime.renko_source)
 
 
@@ -3125,6 +3372,16 @@ async def run_market_stream(
                             previous_block_reason = runtime.market_data_signal_block_reason
                             object.__setattr__(runtime, "market_data_signal_block_reason", block_reason)
                             if block_reason is not None and block_reason != previous_block_reason:
+                                safe_evidence_call(
+                                    runtime,
+                                    "market_data_gate",
+                                    lambda: runtime.evidence.record_gate_decision(
+                                        trader_id=runtime.trader_id,
+                                        symbol=runtime.symbol,
+                                        decision="blocked",
+                                        reason=block_reason,
+                                    ) if runtime.evidence is not None else None,
+                                )
                                 runtime.log.write(
                                     "market_data_signal_block",
                                     {
@@ -3144,9 +3401,21 @@ async def run_market_stream(
                         runtime = next(item for item in runtimes if item.trader_id == trader_id)
                         tick = canonical_event.to_market_tick()
                         block_reason = consumer.signal_block_reason(runtime.symbol)
-                        previous_block_reason = runtime.market_data_signal_block_reason
+                        # This is authoritative market-data state, not a temporary
+                        # override. Independent risk/reconciliation gates still
+                        # run in handle_action when the consumer becomes ready.
+                        object.__setattr__(runtime, "market_data_signal_block_reason", block_reason)
                         if block_reason is not None:
-                            object.__setattr__(runtime, "market_data_signal_block_reason", block_reason)
+                            safe_evidence_call(
+                                runtime,
+                                "market_data_gate",
+                                lambda: runtime.evidence.record_gate_decision(
+                                    trader_id=runtime.trader_id,
+                                    symbol=runtime.symbol,
+                                    decision="blocked",
+                                    reason=block_reason,
+                                ) if runtime.evidence is not None else None,
+                            )
                             runtime.log.write(
                                 "market_data_signal_block",
                                 {
@@ -3157,8 +3426,13 @@ async def run_market_stream(
                                     "sequence": canonical_event.sequence,
                                 },
                             )
-                        process_market_tick_for_runtime(root=root, args=args, runtime=runtime, tick=tick, source_event=None)
-                        object.__setattr__(runtime, "market_data_signal_block_reason", previous_block_reason)
+                        process_market_tick_for_runtime(
+                            root=root,
+                            args=args,
+                            runtime=runtime,
+                            tick=tick,
+                            source_event=live_market_event_from_canonical_stream_event(canonical_event),
+                        )
                         await consumer.ack(canonical_event)
             except asyncio.CancelledError:
                 for task, trader_id in list(pending_reads.items()):

@@ -7,10 +7,11 @@ from typing import Any, Literal
 
 from silver.accounting import PositionState
 from silver.events.models import utc_datetime
+from .execution import ExecutionFriction, RawExecutionAssumptions
 
 
 OutputLevel = Literal["SUMMARY", "TRADES", "AUDIT"]
-ExecutionModel = Literal["NEXT_CANONICAL_OBSERVATION_V1"]
+ExecutionModel = Literal["NEXT_CANONICAL_OBSERVATION_V1", "RAW_SIP_NATIVE_V1"]
 BrickMode = Literal["BRICK_DOLLARS", "BRICK_PERCENT", "PRODUCTION_CONFIG"]
 
 
@@ -66,6 +67,9 @@ class ReplayConfig:
     accounting_version: str = "silver.accounting.v1"
     metrics_version: str = "replay.metrics.v1"
     source_timezone: str | None = None
+    execution_friction: ExecutionFriction = field(default_factory=ExecutionFriction)
+    conservative_protections: bool = False
+    raw_execution: RawExecutionAssumptions = field(default_factory=RawExecutionAssumptions)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "start", utc_datetime(self.start))
@@ -108,8 +112,17 @@ class ReplayConfig:
             raise ValueError("comparison_end must be >= comparison_start.")
         if self.output_level not in {"SUMMARY", "TRADES", "AUDIT"}:
             raise ValueError("output_level must be SUMMARY, TRADES, or AUDIT.")
-        if self.execution_model != "NEXT_CANONICAL_OBSERVATION_V1":
-            raise ValueError("Only NEXT_CANONICAL_OBSERVATION_V1 is supported in V1.")
+        if self.execution_model not in {"NEXT_CANONICAL_OBSERVATION_V1", "RAW_SIP_NATIVE_V1"}:
+            raise ValueError("Unsupported replay execution model")
+        if self.execution_model == "RAW_SIP_NATIVE_V1":
+            object.__setattr__(self, "execution_version", "replay.execution.raw_sip_native.v1")
+            object.__setattr__(self, "force_flat_replay_policy", "RESEARCH_TIMER_NEXT_RAW_PRICE")
+            if self.source_semantic_mode != "raw_sip_trades":
+                raise ValueError("Raw execution requires raw SIP evidence")
+            if self.initial_accounting_position is not None and self.initial_accounting_position.side is not None:
+                raise ValueError("Raw execution cannot reconstruct initial live protection from position alone")
+            if self.initial_strategy_state is not None:
+                raise ValueError("Raw execution requires fresh strategy state; restored broker lifecycle is unavailable")
         if self.brick_mode not in {"BRICK_DOLLARS", "BRICK_PERCENT", "PRODUCTION_CONFIG"}:
             raise ValueError("brick_mode must be BRICK_DOLLARS, BRICK_PERCENT, or PRODUCTION_CONFIG.")
         if self.brick_mode == "BRICK_DOLLARS":

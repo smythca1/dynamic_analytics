@@ -142,6 +142,8 @@ class EvidenceLogger:
         observation_bucket_timestamp: Any,
         close_price: Any,
         production_source_mode: str,
+        source_event_id: str | None = None,
+        source_sequence: Any = UNKNOWN,
     ) -> None:
         self._record_from_factory(
             "production_observation",
@@ -152,6 +154,8 @@ class EvidenceLogger:
                 "observation_bucket_timestamp": jsonable(observation_bucket_timestamp),
                 "close_price": jsonable(close_price),
                 "production_source_mode": production_source_mode,
+                "source_event_id": source_event_id or UNKNOWN,
+                "source_sequence": jsonable(source_sequence),
             },
         )
 
@@ -221,6 +225,8 @@ class EvidenceLogger:
         symbol: str,
         brick: Any,
         source_observation_bucket_timestamp: Any,
+        source_event_id: str | None = UNKNOWN,
+        source_sequence: Any = UNKNOWN,
     ) -> None:
         self._record_from_factory(
             "renko_brick",
@@ -229,6 +235,8 @@ class EvidenceLogger:
             lambda: {
                 "brick_logical_timestamp": jsonable(getattr(brick, "timestamp", None)),
                 "source_observation_bucket_timestamp": jsonable(source_observation_bucket_timestamp),
+                "source_event_id": source_event_id or UNKNOWN,
+                "source_sequence": jsonable(source_sequence),
                 "open": jsonable(getattr(brick, "open", None)),
                 "close": jsonable(getattr(brick, "close", None)),
                 "direction": jsonable(getattr(brick, "direction", None)),
@@ -245,6 +253,8 @@ class EvidenceLogger:
         signal: Any,
         intent: Any,
         source_brick_timestamp: Any = UNKNOWN,
+        source_event_id: str | None = UNKNOWN,
+        source_sequence: Any = UNKNOWN,
     ) -> int | None:
         return self._record_from_factory(
             "strategy_signal",
@@ -253,6 +263,8 @@ class EvidenceLogger:
             lambda: {
                 "logical_signal_timestamp": jsonable(getattr(signal, "timestamp", None)),
                 "source_brick_timestamp": jsonable(source_brick_timestamp),
+                "source_event_id": source_event_id or UNKNOWN,
+                "source_sequence": jsonable(source_sequence),
                 "side": jsonable(getattr(signal, "side", None)),
                 "broker_side": jsonable(getattr(signal, "broker_side", None)),
                 "reason": jsonable(getattr(signal, "reason", None)),
@@ -263,6 +275,44 @@ class EvidenceLogger:
                 "signal_id": jsonable(getattr(signal, "signal_id", None)),
                 "client_order_id": jsonable(getattr(intent, "client_order_id", None)),
             },
+        )
+
+    def record_gate_decision(
+        self,
+        *,
+        trader_id: str,
+        symbol: str,
+        decision: str,
+        reason: str | None,
+        signal: Any = None,
+        intent: Any = None,
+    ) -> None:
+        self._record_from_factory(
+            "gate_decision",
+            trader_id,
+            symbol,
+            lambda: {
+                "decision": decision,
+                "reason": reason or UNKNOWN,
+                "signal": jsonable(signal),
+                "intent": jsonable(intent),
+            },
+        )
+
+    def record_order_intent(self, *, trader_id: str, symbol: str, intent: Any) -> None:
+        self._record_from_factory(
+            "order_intent",
+            trader_id,
+            symbol,
+            lambda: {"intent": jsonable(intent)},
+        )
+
+    def record_execution(self, *, trader_id: str, symbol: str, event: Any) -> None:
+        self._record_from_factory(
+            "execution",
+            trader_id,
+            symbol,
+            lambda: {"execution": jsonable(event)},
         )
 
     def record_position_direction(

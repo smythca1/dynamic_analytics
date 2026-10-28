@@ -65,6 +65,9 @@ class EvidenceCheckpoint:
     component_versions: dict[str, str] = field(default_factory=dict)
     completeness: list[str] = field(default_factory=list)
     unknown_fields: list[str] = field(default_factory=list)
+    canonical_sequence: Any = UNKNOWN
+    canonical_event_id: str = UNKNOWN
+    evidence_chain_hash: str = UNKNOWN
 
 
 def stable_path(value: str | Path | None) -> str | None:

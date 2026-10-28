@@ -25,6 +25,137 @@ def load_module(name: str, relative_path: str):
 
 
 class ProductionHealthStateReaderTests(unittest.TestCase):
+    def _reconciliation_fixture(self, *, positions, fills=None, direct_positions=None, positions_error=None):
+        fleet = load_module("fleet_runner_reconciliation_regression", "fleet_runner.py")
+
+        class Trader:
+            def __init__(self):
+                self.direct_positions = list(direct_positions or [])
+                self.positions = list(positions)
+                self.fills = list(fills or [])
+
+            def _get_position(self, symbol):
+                if self.direct_positions:
+                    value = self.direct_positions.pop(0)
+                    return value
+                return None
+
+            def get_positions(self):
+                if positions_error:
+                    raise RuntimeError(positions_error)
+                if self.positions:
+                    return self.positions.pop(0)
+                return []
+
+            def get_orders(self, **kwargs):
+                return []
+
+            def get_recent_fills(self, symbol, limit=100):
+                return self.fills
+
+        class Engine:
+            def __init__(self):
+                self.config = SimpleNamespace(strategy_type="renko_reversal", exit_management="strategy")
+                self.reconciliation_unsafe = False
+                self.position = {
+                    "symbol": "TSLA",
+                    "side": "short",
+                    "entry_price": 393.89,
+                    "qty": 5,
+                }
+                self.restored = []
+                self.external_close = []
+
+            def trade_state_snapshot(self):
+                return {"position": self.position, "force_flat_dates": []}
+
+            def mark_reconciliation_unsafe(self, reason, evidence=None):
+                self.reconciliation_unsafe = True
+                return {"reason": reason, "new": True}
+
+            def mark_reconciliation_safe(self, reason, evidence=None):
+                self.reconciliation_unsafe = False
+                return {"reason": reason, "new": False}
+
+            def restore_trade_state(self, state):
+                self.restored.append(state)
+                self.position = state.get("position")
+
+            def mark_external_close_filled(self, **kwargs):
+                self.external_close.append(kwargs)
+                self.position = None
+
+        class Log:
+            def __init__(self):
+                self.events = []
+
+            def write(self, name, payload):
+                self.events.append((name, payload))
+
+        trader = Trader()
+        engine = Engine()
+        execution = fleet.AlpacaExecutionEngine.__new__(fleet.AlpacaExecutionEngine)
+        execution.trader = trader
+        runtime = fleet.TraderRuntime(
+            trader_id="camatron_tsla_test",
+            symbol="TSLA",
+            mode="live",
+            credential_profile="test",
+            feed="sip",
+            enabled=True,
+            execution_enabled=True,
+            max_position_notional=10000,
+            max_daily_loss=250,
+            engine=engine,
+            execution=execution,
+            log=Log(),
+        )
+        return fleet, runtime, engine
+
+    def test_reconciliation_does_not_clear_on_empty_observation_without_close_fill(self):
+        fleet, runtime, engine = self._reconciliation_fixture(
+            positions=[[]],
+            direct_positions=[None],
+        )
+
+        with mock.patch.object(fleet, "archive_engine_state"):
+            with self.assertRaises(fleet.BrokerEngineStateMismatch):
+                fleet.reconcile_engine_with_broker(Path(tempfile.mkdtemp()), runtime)
+
+        self.assertEqual(len(engine.restored), 0)
+        self.assertIsNotNone(engine.position)
+        self.assertTrue(engine.reconciliation_unsafe)
+        self.assertTrue(any(name == "critical_runtime_halt" for name, _ in runtime.log.events))
+
+    def test_reconciliation_accepts_legitimate_flatten_with_close_fill(self):
+        fleet, runtime, engine = self._reconciliation_fixture(
+            positions=[[]],
+            direct_positions=[None],
+            fills=[{"symbol": "TSLA", "side": "buy", "qty": "5", "price": "410.00", "order_id": "close-1"}],
+        )
+
+        with mock.patch.object(fleet, "archive_engine_state"):
+            fleet.reconcile_engine_with_broker(Path(tempfile.mkdtemp()), runtime)
+
+        self.assertEqual(len(engine.external_close), 1)
+        self.assertIsNone(engine.position)
+        self.assertEqual(len(engine.restored), 0)
+
+    def test_reconciliation_halts_and_preserves_position_on_stale_positions_endpoint(self):
+        fleet, runtime, engine = self._reconciliation_fixture(
+            positions=[],
+            direct_positions=[None],
+            positions_error="timeout",
+        )
+
+        with mock.patch.object(fleet, "archive_engine_state"):
+            with self.assertRaises(fleet.BrokerEngineStateMismatch):
+                fleet.reconcile_engine_with_broker(Path(tempfile.mkdtemp()), runtime)
+
+        self.assertIsNotNone(engine.position)
+        self.assertEqual(engine.restored, [])
+        self.assertTrue(engine.reconciliation_unsafe)
+
     def test_build_health_reports_nested_open_position(self) -> None:
         health = load_module(
             "production_health_build_health_artifacts",

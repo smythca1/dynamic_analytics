@@ -23,10 +23,10 @@ from optimization.overlap import compare_overlap
 from optimization.parity_harness import run_deterministic_parity
 from optimization.runner import load_enabled_renko_traders, run_optimization
 from optimization.shadow_capture import ShadowCaptureRequest, capture_shadow_session
-from replay.historical_source import read_historical_source
+from replay.historical_source import _economic_row_fingerprint, _row_to_trade, read_historical_source
 from replay.models import ReplayConfig
-from shared.config.trader_config import load_production_renko_config
-from silver.market import CanonicalObservation
+from shared.config.trader_config import load_production_renko_config, validate_single_strategy_kernel_config
+from silver.market import CanonicalObservation, evaluate_trade_eligibility
 
 
 class Response:
@@ -188,6 +188,65 @@ class ResearchValidationTests(unittest.TestCase):
         )
         self.assertEqual(result.raw_trades_in_window, 1)
 
+    def test_native_regular_sale_is_normalized_before_existing_filter(self) -> None:
+        config = ReplayConfig(
+            run_id="native-condition-normalization", trader_id="spxc", symbol="SPXC",
+            start=datetime(2026, 8, 13, 13, 30, tzinfo=timezone.utc),
+            end=datetime(2026, 8, 13, 20, 0, tzinfo=timezone.utc), timezone="UTC",
+            session_mode="regular", strategy_config={}, initial_capital="1",
+            brick_size_dollars="1", source_data_path="synthetic:spxc",
+        )
+        raw = {"t": "2026-08-13T13:30:00Z", "S": "SPXC", "p": 100, "s": 1,
+               "x": "Q", "z": "C", "c": [" "], "i": "native-1"}
+        trade = _row_to_trade(raw, row_order=0, config=config,
+                              source_ref="synthetic:spxc", source_hash="hash")
+        self.assertEqual(trade.conditions, ("@",))
+        self.assertEqual(
+            trade.economic_event_fingerprint,
+            _economic_row_fingerprint(
+                symbol="SPXC", sip_timestamp="2026-08-13T13:30:00+00:00",
+                price="100", quantity="1", exchange="Q", tape="C",
+                conditions=(" ",), broker_trade_id="native-1",
+            ),
+        )
+        self.assertTrue(evaluate_trade_eligibility(trade).is_eligible)
+
+    def test_native_non_price_forming_combinations_remain_rejected(self) -> None:
+        config = ReplayConfig(
+            run_id="native-condition-rejection", trader_id="spxc", symbol="SPXC",
+            start=datetime(2026, 8, 13, 13, 30, tzinfo=timezone.utc),
+            end=datetime(2026, 8, 13, 20, 0, tzinfo=timezone.utc), timezone="UTC",
+            session_mode="regular", strategy_config={}, initial_capital="1",
+            brick_size_dollars="1", source_data_path="synthetic:spxc",
+        )
+        cases = (([" ", "I"], ("@", "I")), ([" ", "F", "I"], ("@", "F", "I")),
+                 ([" ", "4", "I"], ("@", "4", "I")), ([" ", "B"], ("@", "B")),
+                 ([" ", "O"], ("@", "O")))
+        for conditions, canonical in cases:
+            raw = {"t": "2026-08-13T13:30:00Z", "S": "SPXC", "p": 100, "s": 1,
+                   "x": "Q", "z": "C", "c": conditions,
+                   "i": "native-" + "".join(conditions)}
+            trade = _row_to_trade(raw, row_order=0, config=config,
+                                  source_ref="synthetic:spxc", source_hash="hash")
+            self.assertEqual(trade.conditions, canonical)
+            self.assertFalse(evaluate_trade_eligibility(trade).is_eligible)
+
+    def test_already_normalized_tsla_nvda_conditions_pass_through(self) -> None:
+        config = ReplayConfig(
+            run_id="normalized-condition-pass-through", trader_id="existing", symbol="TSLA",
+            start=datetime(2026, 8, 13, 13, 30, tzinfo=timezone.utc),
+            end=datetime(2026, 8, 13, 20, 0, tzinfo=timezone.utc), timezone="UTC",
+            session_mode="regular", strategy_config={}, initial_capital="1",
+            brick_size_dollars="1", source_data_path="synthetic:existing",
+        )
+        for symbol, conditions in (("TSLA", ["@"]), ("NVDA", ["@", "F"]),
+                                   ("TSLA", ["@", "I"])):
+            raw = {"t": "2026-08-13T13:30:00Z", "S": symbol, "p": 100, "s": 1,
+                   "x": "Q", "z": "C", "c": conditions, "i": symbol + "-pass"}
+            trade = _row_to_trade(raw, row_order=0, config=config,
+                                  source_ref="synthetic:existing", source_hash="hash")
+            self.assertEqual(trade.conditions, tuple(conditions))
+
     def test_coverage_passes_complete_stream_and_fails_partial_stream(self) -> None:
         complete = self.root / "AAPL" / "2026-08-13" / "sip_trades.jsonl.gz"
         partial = self.root / "AAPL" / "2026-08-13-partial" / "sip_trades.jsonl.gz"
@@ -274,12 +333,42 @@ class ResearchValidationTests(unittest.TestCase):
         self.assertEqual(mean.status, "PASS")
 
     def test_tsla_single_strategy_kernel_has_deterministic_strategy_parity(self) -> None:
+        config_path = Path("configs/traders.live.example.json")
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+        validate_single_strategy_kernel_config(data, config_path=str(config_path))
+        active = [
+            trader
+            for trader in data["traders"]
+            if trader.get("enabled", True) and trader.get("execution_enabled", True)
+        ]
+        self.assertEqual(len(active), 1)
+        current = active[0]
+        self.assertEqual(current["id"], "camatron_tsla_1s_renko_reversal_0p32_e1_qty5_20261005_live")
+        self.assertEqual(current["symbol"], "TSLA")
+        self.assertEqual(current["account_alias"], "camatron")
+        self.assertEqual(current["profile"]["renko_brick_pct"], 0.94)
+        self.assertEqual(current["strategy"]["type"], "renko_reversal")
+        self.assertNotIn("brick_pct", current["strategy"])
+        self.assertEqual(current["strategy"]["entry_bricks"], 1)
+        self.assertNotIn("take_profit_bricks", current["strategy"])
+        self.assertNotIn("stop_loss_bricks", current["strategy"])
+        self.assertEqual(current["strategy"]["exit_management"], "strategy")
+        self.assertEqual(current["strategy"]["renko_anchor_mode"], "grid")
+        self.assertEqual(current["strategy"]["renko_anchor_price"], 0.0)
+        self.assertEqual(current["data"]["market_data_source"], "shared_canonical_stream")
+        self.assertEqual(current["sizing"], {"type": "qty", "qty": 5})
         loaded = load_production_renko_config(
-            "configs/traders.live.example.json",
-            "camatron_tsla_1s_renko_0p42_e2_tp1_sl3_qty1_20260917_live",
+            config_path,
+            current["id"],
         )
+        self.assertEqual(loaded.brick_audit.configured_brick_pct, Decimal("0.94"))
+        self.assertEqual(loaded.strategy_config.strategy_type, "renko_reversal")
+        self.assertEqual(loaded.strategy_config.entry_bricks, 1)
+        self.assertIsNone(loaded.strategy_config.take_profit_bricks)
+        self.assertIsNone(loaded.strategy_config.stop_loss_bricks)
+        self.assertEqual(loaded.strategy_config.qty, 5)
         brick = loaded.brick_audit.effective_brick_dollars
-        base = Decimal("327.50")
+        base = Decimal("362.0348")
         prices = [
             base,
             base + brick,

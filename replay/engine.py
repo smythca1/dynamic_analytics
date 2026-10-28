@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass, replace
 from decimal import Decimal
+from hashlib import sha256
 from typing import Any
 
 import pandas as pd
@@ -14,17 +15,58 @@ from strategy_engine import RenkoStrategyConfig, RenkoStrategyEngine
 from trading_events import MarketTick
 
 from .context import ReplayContext, build_context
-from .execution import NextObservationExecution
+from .execution import (NextObservationExecution, RawSipExecution, ResearchFeeLedger,
+                        research_drawdown, deterministic_action, raw_trade_groups)
 from .historical_source import read_historical_source
 from .ledgers import ReplayLedgers
 from .metrics import build_metrics
-from .models import ReplayConfig, ReplayDiagnostic, ReplayResult
+from .models import ReplayConfig, ReplayDiagnostic, ReplayResult, SourceIntegritySummary
 from .output import write_outputs
+from optimization.source_preparation import load_prepared_observations
+from replay.historical_source import file_sha256
+from types import SimpleNamespace
 
 
 def run_replay(config: ReplayConfig) -> ReplayResult:
-    source = read_historical_source(config)
-    config = _resolve_brick_configuration(config, source.trades)
+    canonical_mode = config.source_semantic_mode == "prepared_canonical_observations"
+    if canonical_mode:
+        observations = tuple(
+            item for item in load_prepared_observations(config.source_data_path)
+            if config.start <= item.second_bucket <= config.end and item.symbol == config.symbol
+        )
+        if not observations:
+            raise ValueError("Canonical observation source contains no observations in the requested window.")
+        source_hash = file_sha256(config.source_data_path)
+        first = observations[0].second_bucket
+        last = observations[-1].second_bucket
+        source = SimpleNamespace(
+            trades=(),
+            diagnostics=(),
+            source_hash=source_hash,
+            raw_rows_read=len(observations),
+            malformed_rows=0,
+            raw_trades_in_window=0,
+            integrity=SourceIntegritySummary(
+                total_raw_rows=len(observations),
+                source_rows_scanned=len(observations),
+                raw_trades_in_window=0,
+                unique_source_identities=len(observations),
+                timestamp_range_start=first,
+                timestamp_range_end=last,
+                window_timestamp_start=first,
+                window_timestamp_end=last,
+                source_kind="prepared_canonical_observations",
+            ),
+        )
+    else:
+        observations = None
+        source = read_historical_source(config)
+    if config.execution_model == RawSipExecution.version and (
+        source.integrity.malformed_rows or source.integrity.duplicate_source_id_records
+        or source.integrity.duplicate_ids_with_conflicting_values
+    ):
+        raise ValueError("Raw execution requires unambiguous, well-formed source evidence")
+    config = _resolve_brick_configuration(config, source.trades, observations=observations)
     context = build_context(config, source_dataset_hash=source.source_hash)
     ledgers = ReplayLedgers()
     ledgers.diagnostics.extend(source.diagnostics)
@@ -49,31 +91,48 @@ def run_replay(config: ReplayConfig) -> ReplayResult:
         starting_position=config.initial_accounting_position,
     )
     sampler = CanonicalOneSecondSipSampler(run_id=config.run_id)
-    execution = NextObservationExecution(run_id=config.run_id, trader_id=config.trader_id)
+    raw_mode = config.execution_model == RawSipExecution.version
+    execution = (RawSipExecution(run_id=config.run_id, trader_id=config.trader_id, strategy=strategy,
+                                friction=config.execution_friction, assumptions=config.raw_execution)
+                 if raw_mode else NextObservationExecution(
+                     run_id=config.run_id, trader_id=config.trader_id, friction=config.execution_friction,
+                     conservative_protections=config.conservative_protections))
+    fees = ResearchFeeLedger(config.execution_friction)
+    ledgers.equity_curve.append(EquityPoint(
+        timestamp=config.start, equity=config.initial_capital, realized_pnl=Decimal("0"),
+        unrealized_pnl=Decimal("0"), net_pnl=Decimal("0"), fill_id="initial_capital",
+    ))
     order_latencies: list[Decimal] = []
-    sequence = 0
 
-    for raw_trade in source.trades:
-        result = sampler.process_trade(raw_trade)
-        ledgers.events.extend(result.events)
-        if result.eligibility is not None:
-            ledgers.eligibility_decisions.append(result.eligibility)
-            if result.eligibility.is_eligible:
-                ledgers.eligible_trades.append(raw_trade)
-        ledgers.diagnostics.extend(_sampler_diagnostics(result.diagnostics))
-        for observation in result.observations:
-            sequence += 1
+    final_raw_mark = None
+    groups = raw_trade_groups(source.trades) if raw_mode else ((trade,) for trade in source.trades)
+    if canonical_mode:
+        for observation in observations:
             ledgers.canonical_observations.append(observation)
             _process_observation(
-                config=config,
-                observation=observation,
-                sequence=sequence,
-                strategy=strategy,
-                accounting=accounting,
-                execution=execution,
-                ledgers=ledgers,
-                order_latencies=order_latencies,
+                config=config, observation=observation, sequence=len(ledgers.canonical_observations) + 1,
+                strategy=strategy, accounting=accounting, execution=execution, ledgers=ledgers,
+                order_latencies=order_latencies, fees=fees,
             )
+    for group in () if canonical_mode else groups:
+        if raw_mode:
+            bundles, mark = execution.process_trade_group(group, accounting.position)
+            _apply_fill_bundles(config=config, fill_bundles=bundles, strategy=strategy,
+                                accounting=accounting, execution=execution, ledgers=ledgers,
+                                order_latencies=order_latencies, fees=fees)
+            if mark is not None:
+                final_raw_mark = mark
+                marked = fees.snapshot(accounting.snapshot(mark_price=mark.close_price))
+                ledgers.accounting_snapshots.append(marked)
+                ledgers.equity_curve.append(EquityPoint(
+                    mark.second_bucket, marked.equity, marked.realized_pnl, marked.unrealized_pnl,
+                    marked.net_pnl, f"raw_mark:{mark.observation_id}"))
+        for raw_trade in group:
+            _sample_trade(config, raw_trade, sampler, ledgers, strategy, accounting, execution,
+                          order_latencies, fees)
+
+    if raw_mode:
+        execution.finish(config.end, accounting.position)
 
     if config.sampler_final_flush_policy != "NO_FLUSH":
         ledgers.diagnostics.append(
@@ -82,10 +141,12 @@ def run_replay(config: ReplayConfig) -> ReplayResult:
     ledgers.diagnostics.extend(_pending_sampler_diagnostics(sampler.pending_diagnostics()))
     ledgers.diagnostics.extend(_sanity_warnings(config=config, ledgers=ledgers, pending_orders=execution.pending_orders, source=source))
 
-    final_mark = ledgers.canonical_observations[-1].close_price if ledgers.canonical_observations else None
-    snapshot = accounting.snapshot(mark_price=final_mark)
+    final_mark = (final_raw_mark.close_price if final_raw_mark is not None else
+                  ledgers.canonical_observations[-1].close_price if ledgers.canonical_observations else None)
+    snapshot = fees.snapshot(accounting.snapshot(mark_price=final_mark))
+    ledgers.closed_trades[:] = snapshot.closed_trades
     ledgers.accounting_snapshots.append(snapshot)
-    if ledgers.canonical_observations:
+    if ledgers.canonical_observations and not raw_mode:
         ledgers.equity_curve.append(
             EquityPoint(
                 timestamp=ledgers.canonical_observations[-1].second_bucket,
@@ -103,9 +164,29 @@ def run_replay(config: ReplayConfig) -> ReplayResult:
         order_latencies=order_latencies,
         equity_curve=ledgers.equity_curve,
     )
+    metrics["fees_dollars"] = float(fees.total)
+    metrics["regulatory_fees_dollars"] = float(sum(fees.regulatory_totals.values(), Decimal(0)))
+    metrics["commission_dollars"] = 0.0 if config.execution_friction.regulatory_fees is not None else None
+    metrics["execution_friction_dollars"] = float(fees.friction_total)
+    metrics["pre_friction_gross_pnl_dollars"] = (float(snapshot.net_pnl + fees.total + fees.friction_total)
+                                               if config.execution_friction.application == "PER_FILL_CHARGE_V1" else None)
+    metrics["trade_pnl_basis"] = "AFTER_FRICTION_AND_FEES" if config.execution_friction.application == "PER_FILL_CHARGE_V1" else "AFTER_FEES"
+    dollars, percent = research_drawdown(ledgers.equity_curve)
+    metrics.update(max_drawdown_dollars=float(dollars), max_drawdown_pct=float(percent))
     diagnostics_summary = _diagnostics_summary(ledgers.diagnostics)
     context = replace(context, diagnostics_summary=diagnostics_summary)
     manifest = _manifest(config, context, ledgers, metrics, execution.pending_orders, source)
+    manifest["transaction_fee_evidence"] = fees.fee_evidence()
+    if raw_mode:
+        manifest["execution_evidence"] = {
+            "assumptions": asdict(config.raw_execution),
+            "status": "FIXED_FRICTION_RESEARCH" if config.execution_friction.application == "PER_FILL_CHARGE_V1" else "UNCALIBRATED_TRADE_ONLY_APPROXIMATION",
+            "interval_policy": "unordered_equal_timestamp_stop_first_adverse_endpoint",
+            "tp_policy": "strict_trade_through_ideal_limit_plus_separate_charge" if config.execution_friction.application == "PER_FILL_CHARGE_V1" else "strict_friction_adjusted_trade_through_fill_at_limit",
+            "missing_nbbo_policy": "eligible_consolidated_print_proxy_not_exact_broker_election",
+            "protection_events": execution.protection_events,
+            "completed_trades": execution.trade_evidence(accounting, fees),
+        }
     output_dir = write_outputs(config=config, context=context, ledgers=ledgers, metrics=metrics, manifest=manifest)
     return ReplayResult(
         context=context,
@@ -118,29 +199,48 @@ def run_replay(config: ReplayConfig) -> ReplayResult:
     )
 
 
-def _process_observation(
+def _sample_trade(config, raw_trade, sampler, ledgers, strategy, accounting, execution, order_latencies, fees):
+    result = sampler.process_trade(raw_trade)
+    ledgers.events.extend(result.events)
+    if result.eligibility is not None:
+        ledgers.eligibility_decisions.append(result.eligibility)
+        if result.eligibility.is_eligible:
+            ledgers.eligible_trades.append(raw_trade)
+    ledgers.diagnostics.extend(_sampler_diagnostics(result.diagnostics))
+    for observation in result.observations:
+        ledgers.canonical_observations.append(observation)
+        _process_observation(
+            config=config, observation=observation, sequence=len(ledgers.canonical_observations),
+            strategy=strategy, accounting=accounting, execution=execution, ledgers=ledgers,
+            order_latencies=order_latencies, fees=fees,
+        )
+
+
+def _apply_fill_bundles(
     *,
     config: ReplayConfig,
-    observation: CanonicalObservation,
-    sequence: int,
+    fill_bundles,
     strategy: RenkoStrategyEngine,
     accounting: AccountingLedger,
     execution: NextObservationExecution,
     ledgers: ReplayLedgers,
     order_latencies: list[Decimal],
+    fees: ResearchFeeLedger | None = None,
 ) -> None:
-    fill_bundles = execution.fill_pending(observation=observation, position=accounting.position)
     for bundle in fill_bundles:
         order_latencies.append(bundle.latency_seconds)
         for fill in bundle.fills:
             ledgers.simulated_fills.append(fill)
             before_transition_count = len(accounting.position_transitions)
             before_closed_count = len(accounting.closed_trades)
+            before_position = accounting.position
             snapshot = accounting.process_fill(fill)
+            if fees is not None:
+                fees.record(fill, before_position)
+                snapshot = fees.snapshot(snapshot)
             ledgers.position_transitions.extend(accounting.position_transitions[before_transition_count:])
             ledgers.closed_trades.extend(accounting.closed_trades[before_closed_count:])
             ledgers.accounting_snapshots.append(snapshot)
-            ledgers.equity_curve.extend(snapshot.equity_curve[len(ledgers.equity_curve) :])
             ledgers.events.append(_compact_event(config.run_id, "SimulatedFillCreated", fill.timestamp, len(ledgers.events) + 1, fill.stable_fill_id, {}))
             if fill.leg == "close" and accounting.position.side is None and hasattr(strategy, "mark_close_filled"):
                 strategy.mark_close_filled(
@@ -161,8 +261,23 @@ def _process_observation(
                 _compact_event(config.run_id, "AccountingSnapshotCreated", fill.timestamp, len(ledgers.events) + 1, fill.stable_fill_id, {})
             )
 
-    accounting_snapshot = accounting.snapshot(mark_price=observation.close_price)
-    ledgers.accounting_snapshots.append(accounting_snapshot)
+def _process_observation(
+    *, config, observation, sequence, strategy, accounting, execution, ledgers, order_latencies, fees=None,
+):
+    _apply_fill_bundles(config=config, fill_bundles=execution.fill_pending(
+        observation=observation, position=accounting.position), strategy=strategy,
+        accounting=accounting, execution=execution, ledgers=ledgers,
+        order_latencies=order_latencies, fees=fees)
+    if not isinstance(execution, RawSipExecution):
+        accounting_snapshot = accounting.snapshot(mark_price=observation.close_price)
+        if fees is not None:
+            accounting_snapshot = fees.snapshot(accounting_snapshot)
+        ledgers.accounting_snapshots.append(accounting_snapshot)
+        ledgers.equity_curve.append(EquityPoint(
+            timestamp=observation.second_bucket, equity=accounting_snapshot.equity,
+            realized_pnl=accounting_snapshot.realized_pnl, unrealized_pnl=accounting_snapshot.unrealized_pnl,
+            net_pnl=accounting_snapshot.net_pnl, fill_id=f"mark:{observation.observation_id}",
+        ))
 
     tick = MarketTick(
         timestamp=pd.Timestamp(observation.second_bucket),
@@ -179,6 +294,8 @@ def _process_observation(
     for brick in bricks:
         ledgers.events.append(_compact_event(config.run_id, "RenkoBrickCreated", brick.timestamp, len(ledgers.events) + 1, observation.observation_id, _payload(brick)))
     for signal, intent in actions:
+        identity = sha256(f"{config.run_id}|{observation.observation_id}|{len(ledgers.strategy_signals)}".encode()).hexdigest()[:24]
+        signal, intent = deterministic_action(signal, intent, f"replay-{identity}", f"replay-{identity}")
         ledgers.strategy_signals.append(signal)
         ledgers.events.append(_compact_event(config.run_id, "StrategySignalGenerated", signal.timestamp, len(ledgers.events) + 1, observation.observation_id, _payload(signal)))
         order = execution.queue(signal=signal, intent=intent, observation=observation, position=accounting.position)
@@ -207,8 +324,8 @@ def _process_observation(
         ledgers.events.append(_compact_event(config.run_id, "SimulatedOrderQueued", signal.timestamp, len(ledgers.events) + 1, signal.signal_id, _payload(order)))
 
 
-def _resolve_brick_configuration(config: ReplayConfig, trades) -> ReplayConfig:
-    reference = _first_canonical_observation(config, trades)
+def _resolve_brick_configuration(config: ReplayConfig, trades, *, observations=None) -> ReplayConfig:
+    reference = observations[0] if observations else _first_canonical_observation(config, trades)
     strategy_config = dict(config.strategy_config)
     ref_price = reference.close_price if reference is not None else None
     ref_ts = reference.second_bucket if reference is not None else None
@@ -262,7 +379,8 @@ def _manifest(config: ReplayConfig, context: ReplayContext, ledgers: ReplayLedge
         source_dataset_hash=source.source_hash,
     )
     force_flat = config.strategy_config.get("force_flat")
-    force_flat_status = "NOT_CONFIGURED" if not force_flat else "NOT_MODELED"
+    force_flat_status = ("RESEARCH_TIMER_NEXT_RAW_PRICE" if config.execution_model == RawSipExecution.version
+                         else "NOT_CONFIGURED" if not force_flat else "NOT_MODELED")
     result_quality = _result_quality_classification(config=config, ledgers=ledgers, source=source)
     return {
         "run_id": config.run_id,
@@ -275,6 +393,8 @@ def _manifest(config: ReplayConfig, context: ReplayContext, ledgers: ReplayLedge
         "start": config.start.isoformat(),
         "end": config.end.isoformat(),
         "execution_model": config.execution_model,
+        "execution_friction": {key: str(value) for key, value in asdict(config.execution_friction).items()},
+        "conservative_protections": config.conservative_protections,
         "result_quality_classification": result_quality,
         "brick_configuration": {
             "brick_mode": config.brick_mode,
@@ -400,7 +520,12 @@ def _sanity_warnings(*, config: ReplayConfig, ledgers: ReplayLedgers, pending_or
                 details={"start_state_path": config.start_state_path, "completeness": config.start_state_completeness},
             )
         )
-    if config.strategy_config.get("force_flat"):
+    if config.execution_model == RawSipExecution.version:
+        if config.execution_friction.application == "PER_FILL_CHARGE_V1":
+            warnings.append(ReplayDiagnostic("research_execution_approximation", "Ideal trade-only execution plus fixed per-fill charge; not exact broker simulation. Fee status: " + config.execution_friction.fee_assumption))
+        else:
+            warnings.append(ReplayDiagnostic("raw_execution_uncalibrated", "Trade-only fills, activation and timer delays are research assumptions, not broker execution evidence."))
+    elif config.strategy_config.get("force_flat"):
         warnings.append(ReplayDiagnostic("force_flat_not_modeled", "Configured force-flat behavior is not modeled in replay V1."))
     if pending_orders:
         warnings.append(ReplayDiagnostic("pending_orders_at_end", "Replay ended with pending orders that were not force-filled."))
@@ -440,6 +565,10 @@ def _sanity_warnings(*, config: ReplayConfig, ledgers: ReplayLedgers, pending_or
 
 
 def _result_quality_classification(*, config: ReplayConfig, ledgers: ReplayLedgers, source) -> str:
+    if config.execution_model == RawSipExecution.version:
+        if config.execution_friction.application == "PER_FILL_CHARGE_V1":
+            return "FIXED_FRICTION_RAW_EXECUTION_RESEARCH"
+        return "UNCALIBRATED_RAW_EXECUTION_RESEARCH"
     elapsed_seconds = (config.end - config.start).total_seconds()
     if not ledgers.canonical_observations or elapsed_seconds < 3600:
         return "SMOKE_VALIDATION"
