@@ -343,7 +343,7 @@ class ResearchValidationTests(unittest.TestCase):
         ]
         self.assertEqual(len(active), 1)
         current = active[0]
-        self.assertEqual(current["id"], "camatron_tsla_1s_renko_reversal_0p32_e1_qty5_20261005_live")
+        self.assertEqual(current["id"], "camatron_tsla_1s_renko_reversal_0p32_e1_qty8_20261005_live")
         self.assertEqual(current["symbol"], "TSLA")
         self.assertEqual(current["account_alias"], "camatron")
         self.assertEqual(current["profile"]["renko_brick_pct"], 0.94)
@@ -356,7 +356,7 @@ class ResearchValidationTests(unittest.TestCase):
         self.assertEqual(current["strategy"]["renko_anchor_mode"], "grid")
         self.assertEqual(current["strategy"]["renko_anchor_price"], 0.0)
         self.assertEqual(current["data"]["market_data_source"], "shared_canonical_stream")
-        self.assertEqual(current["sizing"], {"type": "qty", "qty": 5})
+        self.assertEqual(current["sizing"], {"type": "qty", "qty": 8})
         loaded = load_production_renko_config(
             config_path,
             current["id"],
@@ -366,7 +366,7 @@ class ResearchValidationTests(unittest.TestCase):
         self.assertEqual(loaded.strategy_config.entry_bricks, 1)
         self.assertIsNone(loaded.strategy_config.take_profit_bricks)
         self.assertIsNone(loaded.strategy_config.stop_loss_bricks)
-        self.assertEqual(loaded.strategy_config.qty, 5)
+        self.assertEqual(loaded.strategy_config.qty, 8)
         brick = loaded.brick_audit.effective_brick_dollars
         base = Decimal("362.0348")
         prices = [

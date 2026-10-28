@@ -2,12 +2,12 @@
   "fleet_id": "production-camatron-tp-sl-aapl-nvda-tsla-qty1-v2-20260904",
   "production_validation_contract": {
     "profile": "single_strategy_kernel_v2",
-    "trader_id": "camatron_tsla_1s_renko_reversal_0p32_e1_qty5_20261005_live",
+    "trader_id": "camatron_tsla_1s_renko_reversal_0p32_e1_qty8_20261005_live",
     "symbol": "TSLA",
     "brick_percentage": "0.94",
     "reference_price": "362.0348",
     "fixed_dollar_brick": "3.40312712",
-    "quantity": "5",
+    "quantity": "8",
     "canonical_source": "1s_close",
     "canonical_reference_identity": "69720bd9117f39c02db1c13bac27692a09cbc43402887c80a79072e6ad0b0859"
   },
@@ -921,7 +921,7 @@
         "ltp_reference": 327.5,
         "live_qty_contract": 1,
         "canary_topology": "camatron_tp_sl_only",
-        "disabled_by": "camatron_tsla_reversal_0p32_e1_qty5_20261005_live",
+        "disabled_by": "camatron_tsla_1s_renko_reversal_0p32_e1_qty8_20261005_live",
         "disabled_reason": "Replaced by approved static-brick TSLA E1 reversal promotion."
       },
       "data": {
@@ -975,7 +975,7 @@
       }
     },
     {
-      "id": "camatron_tsla_1s_renko_reversal_0p32_e1_qty5_20261005_live",
+      "id": "camatron_tsla_1s_renko_reversal_0p32_e1_qty8_20261005_live",
       "enabled": true,
       "execution_enabled": true,
       "symbol": "TSLA",
@@ -994,7 +994,7 @@
         "brick_sizing_mode": "FIXED_DOLLARS",
         "ltp_reference": 362.0348,
         "fixed_dollar_brick": "3.40312712",
-        "live_qty_contract": 5,
+        "live_qty_contract": 8,
         "canonical_reference_identity": "69720bd9117f39c02db1c13bac27692a09cbc43402887c80a79072e6ad0b0859",
         "historical_study_brick_dollars": "3.421788"
       },
@@ -1025,7 +1025,7 @@
       },
       "sizing": {
         "type": "qty",
-        "qty": 5
+        "qty": 8
       },
       "risk": {
         "max_daily_loss": 250,
