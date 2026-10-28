@@ -526,8 +526,21 @@ if not expected_account:
 
 baseline = json.loads(Path(baseline_path).read_text(encoding="utf-8")) if Path(baseline_path).is_file() else {"traders": []}
 candidate = json.loads(Path(candidate_path).read_text(encoding="utf-8"))
-old = {str(t.get("id")): t for t in baseline.get("traders", []) if t.get("enabled")}
-new = {str(t.get("id")): t for t in candidate.get("traders", []) if t.get("enabled")}
+
+def enabled(config):
+    return [t for t in config.get("traders", []) if isinstance(t, dict) and t.get("enabled")]
+
+def load_authorized_configs(primary):
+    configs = [primary]
+    for path in (Path("configs/accounts/spxc.live.json"), Path("configs/accounts/megatron.live.json")):
+        if path.is_file():
+            configs.append(json.loads(path.read_text(encoding="utf-8")))
+    return configs
+
+baseline_configs = load_authorized_configs(baseline)
+candidate_configs = load_authorized_configs(candidate)
+old = {str(t.get("id")): t for config in baseline_configs for t in enabled(config)}
+new = {str(t.get("id")): t for config in candidate_configs for t in enabled(config)}
 affected = set()
 flat_required = set()
 for identity in set(old) | set(new):
@@ -565,8 +578,16 @@ try:
                 print(json.dumps(out, sort_keys=True))
                 raise SystemExit(42)
             identity = payload.get("trader_id") if isinstance(payload, dict) else None
-            if identity and str(identity) in (set(new) | set(old)):
-                checkpoints[str(identity)] = payload
+            if not identity:
+                out["checkpoint"] = {"status": "BLOCKED", "errors": [f"checkpoint identity missing: {state_path}"]}
+                print(json.dumps(out, sort_keys=True))
+                raise SystemExit(42)
+            identity = str(identity)
+            checkpoints[identity] = payload
+            if identity in new and state_path.name != f"{identity}.json":
+                out["checkpoint"] = {"status": "BLOCKED", "errors": [f"{identity}: checkpoint path is not identity-specific: {state_path.name}"]}
+                print(json.dumps(out, sort_keys=True))
+                raise SystemExit(42)
     checkpoint_gate = evaluate_checkpoint_snapshot(checkpoints, candidate_traders=[
         {"id": str(t.get("id")), "symbol": str(t.get("symbol", "")).upper(), "quantity": (t.get("sizing") or {}).get("qty")}
         for t in new.values()

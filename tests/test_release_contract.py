@@ -103,7 +103,7 @@ class ReleaseContractTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "BLOCKED")
 
-    def test_incompatible_and_retired_checkpoints_are_rejected(self):
+    def test_incompatible_active_checkpoint_is_rejected_and_retired_is_historical(self):
         result = evaluate_checkpoint_snapshot(
             {"tsla-qty8": {"trader_id": "tsla-qty8", "symbol": "TSLA", "quantity": 5,
                            "position": {"qty": 0}},
@@ -112,7 +112,43 @@ class ReleaseContractTests(unittest.TestCase):
             broker_positions={"TSLA": 0, "MRVL": 0}, retired_trader_ids=["old-mrvl"],
         )
         self.assertEqual(result["status"], "BLOCKED")
-        self.assertEqual(len(result["errors"]), 2)
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(result["historical"], [{"trader_id": "old-mrvl", "classification": "historical_non_restorable"}])
+
+    def test_retired_checkpoint_is_safe_when_broker_flat(self):
+        result = evaluate_checkpoint_snapshot(
+            {"old-mrvl": {"trader_id": "old-mrvl", "symbol": "MRVL", "quantity": 1}},
+            candidate_traders=[], broker_positions={"MRVL": 0}, retired_trader_ids=["old-mrvl"],
+        )
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["historical"][0]["classification"], "historical_non_restorable")
+
+    def test_replaced_checkpoint_is_historical_and_new_identity_can_initialize_flat(self):
+        result = evaluate_checkpoint_snapshot(
+            {"tsla-qty5": {"trader_id": "tsla-qty5", "symbol": "TSLA", "quantity": 5}, "tsla-qty8": None},
+            candidate_traders=[{"id": "tsla-qty8", "symbol": "TSLA", "quantity": 8}],
+            broker_positions={"TSLA": 0}, retired_trader_ids=["tsla-qty5"],
+        )
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["historical"][0]["trader_id"], "tsla-qty5")
+
+    def test_unknown_checkpoint_identity_is_rejected(self):
+        result = evaluate_checkpoint_snapshot(
+            {"unknown": {"trader_id": "unknown", "symbol": "TSLA"}},
+            candidate_traders=[{"id": "tsla-qty8", "symbol": "TSLA", "quantity": 8}],
+            broker_positions={"TSLA": 0}, retired_trader_ids=[],
+        )
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertIn("authorized release consumers", result["errors"][0])
+
+    def test_unchanged_independent_consumer_checkpoint_is_active(self):
+        result = evaluate_checkpoint_snapshot(
+            {"spxc": {"trader_id": "spxc", "symbol": "SPXC", "quantity": 2, "position": {"qty": 0}}},
+            candidate_traders=[{"id": "spxc", "symbol": "SPXC", "quantity": 2}],
+            broker_positions={"SPXC": 0}, retired_trader_ids=[],
+        )
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["historical"], [])
 
     def test_missing_checkpoint_is_safe_only_when_broker_flat(self):
         result = evaluate_checkpoint_snapshot(

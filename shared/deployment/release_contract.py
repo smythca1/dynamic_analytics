@@ -188,14 +188,15 @@ def evaluate_checkpoint_snapshot(
 ) -> dict[str, Any]:
     """Validate persisted state identities without deleting or rewriting state."""
     errors: list[str] = []
+    historical: list[dict[str, str]] = []
     retired = set(retired_trader_ids)
     expected = {str(row.get("id")): row for row in candidate_traders}
     for trader_id, payload in checkpoints.items():
         if trader_id in retired:
-            errors.append(f"{trader_id}: retired trader checkpoint is not restorable")
+            historical.append({"trader_id": trader_id, "classification": "historical_non_restorable"})
             continue
         if trader_id not in expected:
-            errors.append(f"{trader_id}: checkpoint identity is not in candidate release")
+            errors.append(f"{trader_id}: checkpoint identity is not in authorized release consumers")
             continue
         if payload is None:
             symbol = str(expected[trader_id].get("symbol", "")).upper()
@@ -216,7 +217,11 @@ def evaluate_checkpoint_snapshot(
         state_qty = 0.0 if not isinstance(position, dict) else float(position.get("qty") or 0)
         if abs(state_qty - float(broker_positions.get(expected_symbol, 0))) > 1e-9:
             errors.append(f"{trader_id}: checkpoint and broker position mismatch")
-    return {"status": "PASS" if not errors else "BLOCKED", "errors": errors}
+    return {
+        "status": "PASS" if not errors else "BLOCKED",
+        "errors": errors,
+        "historical": historical,
+    }
 
 
 def main() -> int:

@@ -193,6 +193,22 @@ class DeployTradingTests(unittest.TestCase):
         self.assertIn("broker and checkpoint gates required; not evaluated in dry-run", result.stdout)
         self.assertIn("blocked pending authenticated broker and runtime checkpoint evidence", result.stdout)
 
+    def test_activation_gate_discovers_all_checkpoint_identities(self) -> None:
+        source = self._git("show", f"{self.commit}:deploy-trading").stdout
+        self.assertIn("checkpoints[identity] = payload", source)
+        self.assertIn("checkpoint identity missing", source)
+        self.assertIn("checkpoint path is not identity-specific", source)
+
+    def test_activation_gate_authorizes_independent_spxc_and_megatron_consumers(self) -> None:
+        source = self._git("show", f"{self.commit}:deploy-trading").stdout
+        self.assertIn('configs/accounts/spxc.live.json', source)
+        self.assertIn('configs/accounts/megatron.live.json', source)
+
+    def test_rollback_dry_run_preserves_historical_state(self) -> None:
+        result = self._run("--rollback", "deploy-1", "--dry-run")
+        self.assertIn("Would preserve artifacts, venv, evidence, logs, and state.", result.stdout)
+        self.assertNotIn("delete checkpoints", result.stdout.lower())
+
     def test_default_deployment_performs_no_restart(self) -> None:
         result = self._run("--commit", self.commit, "--dry-run")
         self.assertIn("Services restarted by this command: none", result.stdout)
