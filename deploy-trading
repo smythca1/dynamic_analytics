@@ -506,14 +506,15 @@ remote_activation_gate_script() {
   local candidate_config="$3"
   local market_config="$4"
   local manifest_path="$5"
+  local candidate_root
+  candidate_root="$(dirname "$(dirname "$candidate_config")")"
   cat <<EOF
 set -euo pipefail
 cd $(quote "$REMOTE_DIR")
 if [[ -f .env ]]; then set -a; . ./.env; set +a; fi
 source $(quote "$REMOTE_DIR")/venv/bin/activate
-candidate_root="$(cd "$(dirname "$(quote "$candidate_config")")/.." && pwd)"
-if [[ -f "${candidate_root}/shared/deployment/release_contract.py" ]]; then
-  export PYTHONPATH="${candidate_root}${PYTHONPATH:+:${PYTHONPATH}}"
+if [[ -f $(quote "$candidate_root")/shared/deployment/release_contract.py ]]; then
+  export PYTHONPATH=$(quote "$candidate_root")\${PYTHONPATH:+:\${PYTHONPATH}}
 fi
 python - $(quote "$mode") $(quote "$baseline_config") $(quote "$candidate_config") $(quote "$market_config") $(quote "$manifest_path") <<'PY'
 import json
