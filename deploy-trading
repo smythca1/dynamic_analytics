@@ -510,6 +510,7 @@ remote_activation_gate_script() {
 set -euo pipefail
 cd $(quote "$REMOTE_DIR")
 if [[ -f .env ]]; then set -a; . ./.env; set +a; fi
+source $(quote "$REMOTE_DIR")/venv/bin/activate
 python - $(quote "$mode") $(quote "$baseline_config") $(quote "$candidate_config") $(quote "$market_config") $(quote "$manifest_path") <<'PY'
 import json
 import hashlib
