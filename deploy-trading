@@ -511,6 +511,10 @@ set -euo pipefail
 cd $(quote "$REMOTE_DIR")
 if [[ -f .env ]]; then set -a; . ./.env; set +a; fi
 source $(quote "$REMOTE_DIR")/venv/bin/activate
+candidate_root="$(cd "$(dirname "$(quote "$candidate_config")")/.." && pwd)"
+if [[ -f "${candidate_root}/shared/deployment/release_contract.py" ]]; then
+  export PYTHONPATH="${candidate_root}${PYTHONPATH:+:${PYTHONPATH}}"
+fi
 python - $(quote "$mode") $(quote "$baseline_config") $(quote "$candidate_config") $(quote "$market_config") $(quote "$manifest_path") <<'PY'
 import json
 import hashlib
@@ -519,9 +523,16 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from alpaca_trader import AlpacaTrader, load_alpaca_credentials
+import shared.deployment.release_contract as release_contract_module
 from shared.deployment.release_contract import evaluate_broker_snapshot, evaluate_checkpoint_snapshot, validate_historical_checkpoint_authorizations
 
 mode, baseline_path, candidate_path, market_path, manifest_path = sys.argv[1:]
+candidate_root = Path(candidate_path).resolve().parent.parent
+release_contract_path = Path(release_contract_module.__file__).resolve()
+try:
+    release_contract_path.relative_to(candidate_root)
+except ValueError as exc:
+    raise RuntimeError(f"release-contract module is outside candidate root: {release_contract_path}") from exc
 out = {"evaluated_at_utc": datetime.now(timezone.utc).isoformat(), "mode": mode, "broker": "not_evaluated", "checkpoint": "not_evaluated"}
 expected_account = os.environ.get("DEPLOY_EXPECTED_ACCOUNT_ID")
 if not expected_account:
