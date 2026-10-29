@@ -429,6 +429,8 @@ remote_validation_script() {
   local release_commit="$1"
   local staging_dir="$2"
   local shared_config_path="$3"
+  local release_commit_literal
+  release_commit_literal="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$release_commit")"
   shift 3
   local fleet_config_paths=("$@")
   local quoted_fleet_paths=""
@@ -485,7 +487,7 @@ combined = {"traders": []}
 for fleet in fleet_configs:
     combined["traders"].extend(fleet.get("traders", []))
 contract = build_release_contract(
-    commit=$(quote "$release_commit"),
+    commit=${release_commit_literal},
     config_paths=[shared_config_path, *[Path(raw_path) for raw_path in sys.argv[2:]]],
     trader_config=combined,
     market_config=json.loads(shared_config_path.read_text(encoding="utf-8")),
