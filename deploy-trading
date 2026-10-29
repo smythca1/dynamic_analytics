@@ -793,10 +793,14 @@ PY
   done
 
   echo "Validating staged release without live execution"
-  ssh_base "$target" "bash -lc $(quote "$(remote_validation_script "$commit" "$staging_dir" "$validation_shared_config" "${validation_fleet_configs[@]}")")"
+  if ! ssh_base "$target" "bash -lc $(quote "$(remote_validation_script "$commit" "$staging_dir" "$validation_shared_config" "${validation_fleet_configs[@]}")")"; then
+    die "staged release validation failed; promotion aborted"
+  fi
 
   echo "Evaluating broker/checkpoint activation gates before promotion"
-  ssh_base "$target" "bash -lc $(quote "$(remote_activation_gate_script pre_activation "${REMOTE_DIR}/${STANDARD_CONFIG_FILE}" "${staging_dir}/${STANDARD_CONFIG_FILE}" "${validation_shared_config}" "${staging_dir}/DEPLOYED_VERSION.json")")"
+  if ! ssh_base "$target" "bash -lc $(quote "$(remote_activation_gate_script pre_activation "${REMOTE_DIR}/${STANDARD_CONFIG_FILE}" "${staging_dir}/${STANDARD_CONFIG_FILE}" "${validation_shared_config}" "${staging_dir}/DEPLOYED_VERSION.json")")"; then
+    die "pre-promotion broker/checkpoint gate failed; promotion aborted"
+  fi
 
   echo "Validating deployment manifest before promotion"
   ssh_base "$target" "bash -lc $(quote "$(remote_mark_manifest_validated_script "$deployment_id" "$commit" "${staging_dir}/DEPLOYED_VERSION.json")")"
@@ -808,7 +812,11 @@ PY
   ssh_base "$target" "bash -lc $(quote "$(remote_promote_script "$deployment_id" "$staging_dir")")"
 
   echo "Re-evaluating broker/checkpoint activation gates after promotion"
-  ssh_base "$target" "bash -lc $(quote "$(remote_activation_gate_script post_promotion "${backup_dir}/${STANDARD_CONFIG_FILE}" "${REMOTE_DIR}/${STANDARD_CONFIG_FILE}" "${REMOTE_DIR}/${MARKET_CONFIG_FILE}" "${staging_dir}/DEPLOYED_VERSION.json")")"
+  if ! ssh_base "$target" "bash -lc $(quote "$(remote_activation_gate_script post_promotion "${backup_dir}/${STANDARD_CONFIG_FILE}" "${REMOTE_DIR}/${STANDARD_CONFIG_FILE}" "${REMOTE_DIR}/${MARKET_CONFIG_FILE}" "${staging_dir}/DEPLOYED_VERSION.json")")"; then
+    echo "INCOMPLETE_DEPLOYMENT: post-promotion broker/checkpoint gate failed; manifest was not installed." >&2
+    echo "INCOMPLETE_DEPLOYMENT deployment_id=${deployment_id}" >&2
+    return 1
+  fi
 
   echo "Writing deployment manifest"
   if ! ssh_base "$target" "bash -lc $(quote "$(remote_install_manifest_script "$deployment_id" "$commit" "${staging_dir}/DEPLOYED_VERSION.json" "${REMOTE_DIR}/DEPLOYED_VERSION.json")")"; then
@@ -1279,7 +1287,9 @@ restart_fleet_only() {
     echo "DRY RUN ONLY - would restart ${FLEET_SERVICE} on ${target}"
     return
   fi
-  ssh_base "$target" "bash -lc $(quote "$(remote_activation_gate_script pre_restart \"${REMOTE_DIR}/${STANDARD_CONFIG_FILE}\" \"${REMOTE_DIR}/${STANDARD_CONFIG_FILE}\" \"${REMOTE_DIR}/${MARKET_CONFIG_FILE}\" \"${REMOTE_DIR}/DEPLOYED_VERSION.json\") && systemctl restart $(quote \"$FLEET_SERVICE\") && systemctl is-active $(quote \"$FLEET_SERVICE\") && if ! $(remote_activation_gate_script post_activation \"${REMOTE_DIR}/${STANDARD_CONFIG_FILE}\" \"${REMOTE_DIR}/${STANDARD_CONFIG_FILE}\" \"${REMOTE_DIR}/${MARKET_CONFIG_FILE}\" \"${REMOTE_DIR}/DEPLOYED_VERSION.json\"); then systemctl stop $(quote \"$FLEET_SERVICE\"); exit 42; fi")"
+  if ! ssh_base "$target" "bash -lc $(quote "$(remote_activation_gate_script pre_restart \"${REMOTE_DIR}/${STANDARD_CONFIG_FILE}\" \"${REMOTE_DIR}/${STANDARD_CONFIG_FILE}\" \"${REMOTE_DIR}/${MARKET_CONFIG_FILE}\" \"${REMOTE_DIR}/DEPLOYED_VERSION.json\") && systemctl restart $(quote \"$FLEET_SERVICE\") && systemctl is-active $(quote \"$FLEET_SERVICE\") && if ! $(remote_activation_gate_script post_activation \"${REMOTE_DIR}/${STANDARD_CONFIG_FILE}\" \"${REMOTE_DIR}/${STANDARD_CONFIG_FILE}\" \"${REMOTE_DIR}/${MARKET_CONFIG_FILE}\" \"${REMOTE_DIR}/DEPLOYED_VERSION.json\"); then systemctl stop $(quote \"$FLEET_SERVICE\"); exit 42; fi")"; then
+    die "fleet pre-restart, restart, or post-activation gate failed"
+  fi
 }
 
 restart_mission_only() {
