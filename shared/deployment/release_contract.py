@@ -48,7 +48,7 @@ def validate_historical_checkpoint_authorizations(
         if isinstance(row, dict) and row.get("trader_id"):
             by_identity.setdefault(str(row["trader_id"]), []).append(row)
     seen_paths: set[str] = set()
-    seen_ids: set[str] = set()
+    authorized_records_by_id: dict[str, list[dict[str, Any]]] = {}
     active = {str(value) for value in active_trader_ids}
     for record in authorizations:
         if not isinstance(record, dict):
@@ -78,10 +78,10 @@ def validate_historical_checkpoint_authorizations(
             errors.append(f"{trader_id}: verified historical authorization requires provenance evidence")
         if classification == "legacy_authorized_non_restorable" and not record.get("provenance_uncertainty"):
             errors.append(f"{trader_id}: legacy authorization must document provenance uncertainty")
-        if path in seen_paths or trader_id in seen_ids:
-            errors.append(f"{trader_id}: duplicate historical authorization")
+        if path in seen_paths:
+            errors.append(f"{trader_id}: duplicate historical authorization path")
         seen_paths.add(path)
-        seen_ids.add(trader_id)
+        authorized_records_by_id.setdefault(trader_id, []).append(record)
         if trader_id in active:
             errors.append(f"{trader_id}: active trader cannot have historical authorization")
         inventory = by_path.get(path)
@@ -91,6 +91,15 @@ def validate_historical_checkpoint_authorizations(
         if inventory is None:
             errors.append(f"{trader_id}: authorized checkpoint path is not in inventory")
             continue
+        artifact_kind = str(inventory.get("artifact_kind", ""))
+        if artifact_kind == "rejected_evidence":
+            parts = Path(path).parts
+            if not any(parts[index:index + 2] == ("state", "rejected") for index in range(len(parts) - 1)):
+                errors.append(f"{trader_id}: rejected-state evidence is outside the approved directory")
+            if inventory.get("rejection_metadata_valid") is not True:
+                errors.append(f"{trader_id}: rejected-state metadata is invalid")
+        elif artifact_kind != "runtime_checkpoint":
+            errors.append(f"{trader_id}: checkpoint artifact kind is not recognized")
         if str(inventory.get("trader_id")) != trader_id:
             errors.append(f"{trader_id}: checkpoint identity/path conflict")
         if str(inventory.get("sha256")) != str(record.get("sha256")):
@@ -102,6 +111,14 @@ def validate_historical_checkpoint_authorizations(
         if str(inventory.get("strategy_identity", "")) != str(record.get("strategy_identity", "")):
             errors.append(f"{trader_id}: checkpoint strategy identity mismatch")
         validated.append(record)
+    for trader_id, records in authorized_records_by_id.items():
+        top_level = [record for record in records if "/state/rejected/" not in f"/{record['checkpoint_path']}/"]
+        if len(top_level) > 1:
+            errors.append(f"{trader_id}: multiple top-level historical checkpoints are ambiguous")
+        authorized_paths = {str(record["checkpoint_path"]) for record in records}
+        for artifact in by_identity.get(trader_id, []):
+            if str(artifact.get("path")) not in authorized_paths:
+                errors.append(f"{trader_id}: not every discovered artifact is explicitly authorized")
     return {"status": "PASS" if not errors else "BLOCKED", "errors": errors, "validated": validated}
 
 

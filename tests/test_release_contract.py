@@ -182,7 +182,8 @@ class ReleaseContractTests(unittest.TestCase):
         result = validate_historical_checkpoint_authorizations(
             [record],
             [{"path": record["checkpoint_path"], "sha256": record["sha256"], "trader_id": record["trader_id"],
-              "symbol": "TSLA", "strategy_type": "renko_reversal", "strategy_identity": "canonical_e1"}],
+              "symbol": "TSLA", "strategy_type": "renko_reversal", "strategy_identity": "canonical_e1",
+              "artifact_kind": "runtime_checkpoint"}],
         )
         self.assertEqual(result["status"], "PASS")
 
@@ -200,6 +201,80 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertEqual(tampered["status"], "BLOCKED")
         self.assertEqual(validate_historical_checkpoint_authorizations([record, record], [])["status"], "BLOCKED")
         self.assertEqual(validate_historical_checkpoint_authorizations([record], [], active_trader_ids=[record["trader_id"]])["status"], "BLOCKED")
+
+    def test_top_level_and_rejected_historical_artifacts_share_identity_safely(self):
+        top = self._historical_record()
+        rejected = self._historical_record(
+            checkpoint_path="artifacts/live/state/rejected/tsla-qty5-old-rejected.json",
+            sha256="b" * 64,
+        )
+        inventory = [
+            {"path": top["checkpoint_path"], "sha256": top["sha256"], "trader_id": top["trader_id"],
+             "symbol": "TSLA", "strategy_type": "renko_reversal", "strategy_identity": "canonical_e1",
+             "artifact_kind": "runtime_checkpoint"},
+            {"path": rejected["checkpoint_path"], "sha256": rejected["sha256"], "trader_id": rejected["trader_id"],
+             "symbol": "TSLA", "strategy_type": "renko_reversal", "strategy_identity": "canonical_e1",
+             "artifact_kind": "rejected_evidence", "rejection_metadata_valid": True},
+        ]
+        result = validate_historical_checkpoint_authorizations([top, rejected], inventory)
+        self.assertEqual(result["status"], "PASS")
+
+    def test_two_top_level_historical_artifacts_remain_ambiguous(self):
+        first = self._historical_record()
+        second = self._historical_record(checkpoint_path="artifacts/live/state/tsla-qty5-old-copy.json", sha256="b" * 64)
+        inventory = [
+            {"path": first["checkpoint_path"], "sha256": first["sha256"], "trader_id": first["trader_id"],
+             "symbol": "TSLA", "strategy_type": "renko_reversal", "strategy_identity": "canonical_e1",
+             "artifact_kind": "runtime_checkpoint"},
+            {"path": second["checkpoint_path"], "sha256": second["sha256"], "trader_id": second["trader_id"],
+             "symbol": "TSLA", "strategy_type": "renko_reversal", "strategy_identity": "canonical_e1",
+             "artifact_kind": "runtime_checkpoint"},
+        ]
+        self.assertEqual(validate_historical_checkpoint_authorizations([first, second], inventory)["status"], "BLOCKED")
+
+    def test_partially_authorized_shared_identity_is_blocked(self):
+        record = self._historical_record()
+        inventory = [
+            {"path": record["checkpoint_path"], "sha256": record["sha256"], "trader_id": record["trader_id"],
+             "symbol": "TSLA", "strategy_type": "renko_reversal", "strategy_identity": "canonical_e1",
+             "artifact_kind": "runtime_checkpoint"},
+            {"path": "artifacts/live/state/rejected/extra.json", "sha256": "b" * 64,
+             "trader_id": record["trader_id"], "symbol": "TSLA", "strategy_type": "renko_reversal",
+             "strategy_identity": "canonical_e1", "artifact_kind": "rejected_evidence",
+             "rejection_metadata_valid": True},
+        ]
+        self.assertEqual(validate_historical_checkpoint_authorizations([record], inventory)["status"], "BLOCKED")
+
+    def test_rejected_artifact_requires_recognized_path_and_metadata(self):
+        record = self._historical_record(checkpoint_path="artifacts/live/state/not-rejected/file.json")
+        inventory = [{"path": record["checkpoint_path"], "sha256": record["sha256"], "trader_id": record["trader_id"],
+                      "symbol": "TSLA", "strategy_type": "renko_reversal", "strategy_identity": "canonical_e1",
+                      "artifact_kind": "rejected_evidence", "rejection_metadata_valid": False}]
+        result = validate_historical_checkpoint_authorizations([record], inventory)
+        self.assertEqual(result["status"], "BLOCKED")
+
+    def test_real_approved_duplicate_identity_pairs_are_artifact_safe(self):
+        pairs = [
+            ("camatron_aapl_1s_renko_1p3443_e1_reversal_1sh_20260701_live", "AAPL", "5adde06e632762662acf9e546e23bbd0f014aad547912e5593de0f5fc9f08bc9", "feef2c20de68aba726cd9595de0e2134b9bfb52aa3adb3834cea91f437b68fc4"),
+            ("camatron_nvda_1s_renko_1p149851_e1_reversal_1sh_20260701_live", "NVDA", "08337d3780e50bb01725f61f6b65e2bd973bf94beb88ca9f4c3efaec81f0052c", "5ed2175069e70aae67da5100d8a311fd75e6e5e6e69d34f3aa9ce539a730a1ec"),
+            ("camatron_tsla_1s_renko_2p31165_e1_reversal_1sh_20260710_live", "TSLA", "f871efc8012c16031da3d535a470014cb191d0a3a24694a54e60e15545224b8c", "7dc99384ee706bf4d952038b835ea62386e5220f408dd94da8b6be0508641080"),
+        ]
+        for trader_id, symbol, top_hash, rejected_hash in pairs:
+            with self.subTest(trader_id=trader_id):
+                top = self._historical_record(trader_id=trader_id, symbol=symbol,
+                                              sha256=top_hash, strategy_identity="historical")
+                rejected = self._historical_record(trader_id=trader_id, symbol=symbol,
+                                                   checkpoint_path=f"artifacts/live/state/rejected/{trader_id}_evidence.json",
+                                                   sha256=rejected_hash, strategy_identity="historical")
+                inventory = [
+                    {"path": top["checkpoint_path"], "sha256": top_hash, "trader_id": trader_id,
+                     "symbol": symbol, "strategy_type": "renko_reversal", "strategy_identity": "historical",
+                     "artifact_kind": "runtime_checkpoint"},
+                    {"path": rejected["checkpoint_path"], "sha256": rejected_hash, "trader_id": trader_id,
+                     "symbol": symbol, "strategy_type": "renko_reversal", "strategy_identity": "historical",
+                     "artifact_kind": "rejected_evidence", "rejection_metadata_valid": True},
+                ]
+                self.assertEqual(validate_historical_checkpoint_authorizations([top, rejected], inventory)["status"], "PASS")
 
 
 if __name__ == "__main__":

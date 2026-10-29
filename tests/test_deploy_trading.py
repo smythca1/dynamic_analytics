@@ -332,6 +332,13 @@ class DeployTradingTests(unittest.TestCase):
         self.assertIn('"git_commit": os.environ.get("DEPLOY_TEST_MANIFEST_COMMIT_OVERRIDE", commit)', script)
         self.assertIn('"deployment_id": deployment_id', script)
 
+    def test_checkpoint_discovery_separates_rejected_evidence_from_runtime_restore(self) -> None:
+        script = (self.repo / "deploy-trading").read_text()
+        self.assertIn('rejected_evidence', script)
+        self.assertIn('multiple top-level checkpoints for', script)
+        self.assertIn('active trader has unauthorized checkpoint artifact', script)
+        self.assertIn('state_root.rglob("*.json")', script)
+
     def test_generated_manifest_contains_exactly_one_json_object(self) -> None:
         fake_bin = self._fake_bin()
         self._run("--commit", self.commit, "--no-restart", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
