@@ -576,10 +576,33 @@ for identity in set(old) | set(new):
                 flat_required.add(symbol)
 market = json.loads(Path(market_path).read_text(encoding="utf-8"))
 try:
+    # Historical evidence never abandons exposure: verify its symbols on every gate.
+    historical_symbols = {str(record.get("symbol", "")).upper() for record in historical_authorizations if isinstance(record, dict)} - {""}
+    affected.update(historical_symbols)
+    flat_required.update(historical_symbols)
     trader = AlpacaTrader(load_alpaca_credentials("live"), max_notional=1_000_000)
     account = trader.get_account()
     positions = trader.get_positions()
     orders = trader.get_open_orders_nested(500)
+    if not isinstance(account, dict) or account.get("status") != "ACTIVE" or account.get("trading_blocked") is not False or account.get("account_blocked") is not False:
+        raise ValueError("broker account health is not confirmed")
+    if not isinstance(positions, list) or not isinstance(orders, list) or len(orders) >= 500:
+        raise ValueError("incomplete broker positions or open orders")
+    if any(not isinstance(row, dict) or not row.get("symbol") or row.get("qty") is None for row in positions):
+        raise ValueError("malformed broker position response")
+    def flatten_orders(rows):
+        result = []
+        for row in rows:
+            if not isinstance(row, dict) or not row.get("symbol"):
+                raise ValueError("malformed broker order response")
+            result.append(row)
+            legs = row.get("legs")
+            if legs is not None:
+                if not isinstance(legs, list):
+                    raise ValueError("malformed nested broker order response")
+                result.extend(flatten_orders(legs))
+        return result
+    orders = flatten_orders(orders)
     snapshot = {
         "account_id": account.get("id"),
         "api_health": "ok",
@@ -653,14 +676,15 @@ try:
         print(json.dumps(out, sort_keys=True))
         raise SystemExit(42)
     authorized_paths = {str(record["checkpoint_path"]) for record in authorization_gate["validated"]}
-    unauthorized_active_artifacts = [
+    unauthorized_artifacts = [
         row for row in inventory
-        if row["trader_id"] in new and row["path"] not in authorized_paths
+        if row["path"] not in authorized_paths
+        and not (row["trader_id"] in new and row["artifact_kind"] == "runtime_checkpoint")
     ]
-    if unauthorized_active_artifacts:
+    if unauthorized_artifacts:
         out["checkpoint"] = {"status": "BLOCKED", "errors": [
-            f"active trader has unauthorized checkpoint artifact: {row['trader_id']}:{row['path']}"
-            for row in unauthorized_active_artifacts
+            f"checkpoint artifact lacks authorization: {row['trader_id']}:{row['path']}"
+            for row in unauthorized_artifacts
         ]}
         print(json.dumps(out, sort_keys=True))
         raise SystemExit(42)
@@ -668,6 +692,52 @@ try:
         identity: payload for identity, payload in checkpoints.items()
         if not any(row["trader_id"] == identity and row["path"] in authorized_paths for row in inventory)
     }
+    # Active runtime files are restorable state, never historical authorizations.
+    # Validate the actual nested runner snapshot before normalizing for the evaluator.
+    from types import SimpleNamespace
+    from shared.config.trader_config import build_strategy_config
+    from silver.market.contract import contract_snapshot
+    from fleet_runner import verify_flat_reversal_recovery
+    from execution_engine import AlpacaExecutionEngine
+    from strategy_engine import RenkoStrategyEngine
+    recovery_verified = []
+    for identity, payload in list(checkpoints.items()):
+        if identity not in new or payload is None:
+            continue
+        config = build_strategy_config(new[identity])
+        engine = payload.get("engine") or {}
+        trade = engine.get("trade") or {}
+        expected_contract = contract_snapshot(symbol=config.symbol, strategy_config=config, session_timezone=config.timezone)
+        if (
+            payload.get("trader_id") != identity or payload.get("symbol") != config.symbol
+            or payload.get("configured_quantity") != config.qty
+            or payload.get("configured_brick_size") != config.brick_size
+            or engine.get("trader_id") != identity or engine.get("symbol") != config.symbol
+            or engine.get("strategy_name") != config.strategy_name
+            or engine.get("strategy_type") != config.strategy_type
+            or payload.get("contract_fingerprints") != expected_contract
+            or not isinstance(payload.get("sampler_state"), dict)
+        ):
+            raise ValueError(f"{identity}: incompatible active checkpoint identity or contract")
+        position = trade.get("position")
+        if position is not None and (not isinstance(position, dict) or position.get("side") not in {"long", "short"}):
+            raise ValueError(f"{identity}: invalid active checkpoint position")
+        RenkoStrategyEngine(config).restore_snapshot(engine)
+        if trade.get("reconciliation_unsafe"):
+            if config.strategy_type != "renko_reversal" or config.exit_management != "strategy" or position is not None:
+                raise ValueError(f"{identity}: no supported unsafe checkpoint recovery")
+            execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+            execution.trader = trader
+            runtime = SimpleNamespace(
+                trader_id=identity, symbol=config.symbol, expected_account_id=expected_account,
+                execution=execution, engine=SimpleNamespace(config=config), contract_fingerprints=expected_contract,
+            )
+            verify_flat_reversal_recovery(state_root.parent, runtime, trade)
+            recovery_verified.append(identity)
+        normalized = dict(payload, quantity=payload["configured_quantity"], position=position)
+        if position is not None:
+            normalized["position"] = dict(position, qty=abs(float(position["qty"])) * (-1 if position["side"] == "short" else 1))
+        checkpoints[identity] = normalized
     checkpoint_gate = evaluate_checkpoint_snapshot(checkpoints, candidate_traders=[
         {"id": str(t.get("id")), "symbol": str(t.get("symbol", "")).upper(), "quantity": (t.get("sizing") or {}).get("qty")}
         for t in new.values()
@@ -675,6 +745,7 @@ try:
     out["checkpoint"] = checkpoint_gate
     out["checkpoint"]["historical_authorizations"] = authorization_gate["validated"]
     out["checkpoint"]["inventory"] = inventory
+    out["checkpoint"]["recovery_verified"] = recovery_verified
 except Exception as exc:
     out["error"] = f"activation gate unavailable: {type(exc).__name__}: {exc}"
     print(json.dumps(out, sort_keys=True))
@@ -1282,13 +1353,24 @@ EOF
 }
 
 restart_fleet_only() {
-  local target
+  local target pre_restart_gate post_activation_gate restart_script
   target="$(remote_target)"
   if [[ "$DRY_RUN" == "1" ]]; then
     echo "DRY RUN ONLY - would restart ${FLEET_SERVICE} on ${target}"
     return
   fi
-  if ! ssh_base "$target" "bash -lc $(quote "$(remote_activation_gate_script pre_restart \"${REMOTE_DIR}/${STANDARD_CONFIG_FILE}\" \"${REMOTE_DIR}/${STANDARD_CONFIG_FILE}\" \"${REMOTE_DIR}/${MARKET_CONFIG_FILE}\" \"${REMOTE_DIR}/DEPLOYED_VERSION.json\") && systemctl restart $(quote \"$FLEET_SERVICE\") && systemctl is-active $(quote \"$FLEET_SERVICE\") && if ! $(remote_activation_gate_script post_activation \"${REMOTE_DIR}/${STANDARD_CONFIG_FILE}\" \"${REMOTE_DIR}/${STANDARD_CONFIG_FILE}\" \"${REMOTE_DIR}/${MARKET_CONFIG_FILE}\" \"${REMOTE_DIR}/DEPLOYED_VERSION.json\"); then systemctl stop $(quote \"$FLEET_SERVICE\"); exit 42; fi")"; then
+  pre_restart_gate="$(remote_activation_gate_script pre_restart "${REMOTE_DIR}/${STANDARD_CONFIG_FILE}" "${REMOTE_DIR}/${STANDARD_CONFIG_FILE}" "${REMOTE_DIR}/${MARKET_CONFIG_FILE}" "${REMOTE_DIR}/DEPLOYED_VERSION.json")"
+  post_activation_gate="$(remote_activation_gate_script post_activation "${REMOTE_DIR}/${STANDARD_CONFIG_FILE}" "${REMOTE_DIR}/${STANDARD_CONFIG_FILE}" "${REMOTE_DIR}/${MARKET_CONFIG_FILE}" "${REMOTE_DIR}/DEPLOYED_VERSION.json")"
+  restart_script="${pre_restart_gate}
+systemctl restart $(quote "$FLEET_SERVICE")
+systemctl is-active $(quote "$FLEET_SERVICE")
+if ! (
+${post_activation_gate}
+); then
+  systemctl stop $(quote "$FLEET_SERVICE")
+  exit 42
+fi"
+  if ! ssh_base "$target" "bash -lc $(quote "$restart_script")"; then
     die "fleet pre-restart, restart, or post-activation gate failed"
   fi
 }

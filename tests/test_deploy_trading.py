@@ -10,6 +10,10 @@ import sys
 import tempfile
 import unittest
 import json
+import copy
+import io
+import contextlib
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -336,7 +340,7 @@ class DeployTradingTests(unittest.TestCase):
         script = (self.repo / "deploy-trading").read_text()
         self.assertIn('rejected_evidence', script)
         self.assertIn('multiple top-level checkpoints for', script)
-        self.assertIn('active trader has unauthorized checkpoint artifact', script)
+        self.assertIn('checkpoint artifact lacks authorization', script)
         self.assertIn('state_root.rglob("*.json")', script)
 
     def test_generated_manifest_contains_exactly_one_json_object(self) -> None:
@@ -1205,6 +1209,130 @@ class DeployTradingTests(unittest.TestCase):
             "source_repository": "test-repo",
             "validation_status": "generated",
         }
+
+
+class ActiveCheckpointGateTests(unittest.TestCase):
+    def test_restart_controller_success_and_failure_boundaries(self):
+        definitions=SCRIPT.read_text().rsplit('main "$@"',1)[0]
+        for failing,expected in [('none',['restart','is-active']),('pre',[]),('post',['restart','is-active','stop'])]:
+            with self.subTest(failing=failing), tempfile.TemporaryDirectory() as folder:
+                log=Path(folder)/'services'
+                harness='''
+remote_activation_gate_script() {
+  echo 'set -euo pipefail'
+  if [[ "$1" == pre_restart && "$FAIL_GATE" == pre ]] || [[ "$1" == post_activation && "$FAIL_GATE" == post ]]; then echo 'exit 17'; else echo ':'; fi
+}
+systemctl() { echo "$1" >> "$SERVICE_LOG"; }
+export -f systemctl
+ssh_base() { bash -n -c "$2" && bash -c "$2"; }
+restart_fleet_only
+'''
+                result=subprocess.run(['bash'],input=definitions+'\n'+harness,text=True,capture_output=True,env={**os.environ,'FAIL_GATE':failing,'SERVICE_LOG':str(log)})
+                self.assertEqual(log.read_text().splitlines() if log.exists() else [],expected,result.stderr)
+                self.assertEqual(result.returncode==0,failing=='none',result.stderr)
+
+    def run_gate(self, change=None, positions=None, orders=None):
+        from shared.config.trader_config import build_strategy_config
+        from silver.market.contract import contract_snapshot
+        from strategy_engine import RenkoStrategyEngine
+        source = SCRIPT.read_text().split('remote_activation_gate_script() {',1)[1].split('\n}\n',1)[0]
+        python = source.split("<<'PY'\n",1)[1].rsplit('\nPY',1)[0]
+        config_path = REPO_ROOT / 'configs/traders.live.example.json'
+        configuration = json.loads(config_path.read_text())
+        t = next(t for t in configuration['traders'] if t.get('enabled'))
+        config = build_strategy_config(t)
+        snapshot = RenkoStrategyEngine(config).snapshot()
+        checkpoint = {'trader_id':t['id'], 'symbol':config.symbol,
+            'configured_quantity':config.qty, 'configured_brick_size':config.brick_size,
+            'contract_fingerprints':contract_snapshot(symbol=config.symbol,strategy_config=config,session_timezone=config.timezone),
+            'sampler_state':{},'engine':snapshot}
+        broker_positions = positions or []
+        broker_orders = orders or []
+        class Broker:
+            def __init__(self, *args, **kwargs): pass
+            def get_account(self): return {'id':'test-account','status':'ACTIVE','trading_blocked':False,'account_blocked':False}
+            def get_positions(self): return broker_positions
+            def get_open_orders_nested(self, *args): return broker_orders
+            def _get_position(self, symbol): return next((p for p in broker_positions if p['symbol']==symbol),None)
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)
+            path=root/'artifacts/live/state'/f'{t["id"]}.json'
+            path.parent.mkdir(parents=True)
+            authorizations=[]
+            if change: change(checkpoint,path,authorizations)
+            path.write_text(json.dumps(checkpoint))
+            manifest=root/'manifest.json';manifest.write_text(json.dumps({'historical_checkpoint_authorizations':authorizations}))
+            before={str(p):p.read_bytes() for p in path.parent.rglob('*.json')}
+            output=io.StringIO()
+            old_cwd=Path.cwd()
+            exit_code=0
+            try:
+                os.chdir(root)
+                with patch.dict(os.environ,{'DEPLOY_EXPECTED_ACCOUNT_ID':'test-account'}), patch('alpaca_trader.AlpacaTrader',Broker), patch('alpaca_trader.load_alpaca_credentials',return_value=None), patch.object(sys,'argv',['gate','pre_activation',str(config_path),str(config_path),str(REPO_ROOT/'configs/market-data.live.example.json'),str(manifest)]), contextlib.redirect_stdout(output):
+                    try:exec(compile(python,'activation_gate','exec'),{})
+                    except SystemExit as exc:exit_code=exc.code
+            finally:os.chdir(old_cwd)
+            self.assertEqual(before,{str(p):p.read_bytes() for p in path.parent.rglob('*.json')})
+            return exit_code,json.loads(output.getvalue().splitlines()[-1])
+
+    def test_compatible_active_checkpoint_passes_without_historical_authorization(self):
+        code,result=self.run_gate()
+        self.assertEqual(code,0,result)
+        self.assertEqual(result['checkpoint']['status'],'PASS')
+
+    def test_active_incompatible_quantity_strategy_and_contract_fail(self):
+        for field,value in [('configured_quantity',5),('configured_brick_size',1),('contract_fingerprints',{}),('symbol','AAPL')]:
+            with self.subTest(field=field):
+                code,result=self.run_gate(lambda p,path,a:p.update({field:value}))
+                self.assertNotEqual(code,0,result)
+        code,result=self.run_gate(lambda p,path,a:p['engine'].update({'strategy_name':'other'}))
+        self.assertNotEqual(code,0,result)
+
+    def test_unsafe_flat_checkpoint_requires_verified_supported_recovery(self):
+        def unsafe(p,path,a):p['engine']['trade']['reconciliation_unsafe']=True
+        code,result=self.run_gate(unsafe)
+        self.assertEqual(code,0,result)
+        self.assertEqual(len(result['checkpoint']['recovery_verified']),1)
+        def pending(p,path,a):
+            unsafe(p,path,a)
+            p['engine']['trade']['pending_exit']={'broker_order_id':'unresolved'}
+        code,result=self.run_gate(pending)
+        self.assertNotEqual(code,0,result)
+        code,result=self.run_gate(unsafe,orders=[{'symbol':'TSLA','status':'accepted'}])
+        self.assertNotEqual(code,0,result)
+
+    def test_broker_exposure_inconsistent_with_checkpoint_fails(self):
+        code,result=self.run_gate(positions=[{'symbol':'TSLA','qty':'8','side':'long'}])
+        self.assertNotEqual(code,0,result)
+
+    def test_unknown_nested_and_duplicate_artifacts_fail(self):
+        def duplicate(p,path,a):
+            nested=path.parent/'other'/path.name;nested.parent.mkdir();nested.write_text(json.dumps(p))
+        def unknown(p,path,a):
+            other=copy.deepcopy(p);other['trader_id']='unknown'
+            (path.parent/'unknown.json').write_text(json.dumps(other))
+        def rejected(p,path,a):
+            nested=path.parent/'rejected'/path.name;nested.parent.mkdir();nested.write_text(json.dumps(p))
+        for change in [duplicate,unknown,rejected]:
+            with self.subTest(change=change.__name__):
+                code,result=self.run_gate(change)
+                self.assertNotEqual(code,0,result)
+
+    def test_historical_requires_exact_authorization_and_hash(self):
+        import hashlib
+        def historical(p,path,a,tamper=False,authorize=True):
+            old=copy.deepcopy(p);old['trader_id']='retired'
+            oldpath=path.parent/'retired.json';oldpath.write_text(json.dumps(old))
+            record={'trader_id':'retired','checkpoint_path':'artifacts/live/state/retired.json','sha256':hashlib.sha256(oldpath.read_bytes()).hexdigest(),'symbol':old['symbol'],'strategy_type':old['engine']['strategy_type'],'strategy_identity':old['engine']['strategy_name'],'classification':'verified_historical','restoration':'historical_non_restorable','provenance':'immutable prior release','reviewed_by':'Test reviewer','reviewed_at_utc':'2026-11-02T19:00:00Z','broker_evidence':{'position_flat':True,'open_orders':0,'verified_at_utc':'2026-11-02T19:00:00Z'}}
+            if authorize:a.append(record)
+            if tamper:oldpath.write_text(json.dumps(old)+' ')
+        code,result=self.run_gate(historical)
+        self.assertEqual(code,0,result)
+        code,result=self.run_gate(historical,positions=[{'symbol':'TSLA','qty':'5','side':'long'}])
+        self.assertNotEqual(code,0,result)
+        for tamper,authorize in [(True,True),(False,False)]:
+            code,result=self.run_gate(lambda p,path,a:historical(p,path,a,tamper,authorize))
+            self.assertNotEqual(code,0,result)
 
 
 if __name__ == "__main__":
