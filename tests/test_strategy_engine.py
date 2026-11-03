@@ -2,6 +2,7 @@ import asyncio
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,8 +11,10 @@ import pandas as pd
 from fleet_runner import (
     _BROKER_FORCE_FLAT_DATES,
     BrokerEngineStateMismatch,
+    BrokerObservationUncertain,
     TraderRuntime,
     archive_tick,
+    archive_engine_state,
     behavior_profile_block_reason,
     broker_force_flat_if_due,
     build_strategy_config,
@@ -5385,6 +5388,139 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
             actions.extend(emitted)
 
         self.assertEqual(actions, [])
+
+
+class ReversalFlatRecoveryTests(unittest.TestCase):
+    def runtime(self):
+        engine = RenkoStrategyEngine(RenkoStrategyConfig(
+            trader_id="recovery", symbol="TSLA", strategy_type="renko_reversal",
+            strategy_name="recovery_e1", brick_size=3.40312712, entry_bricks=1, qty=8,
+        ))
+        engine.mark_reconciliation_unsafe("broker_position_observation_uncertain")
+        trader = FakeProtectionTrader()
+        trader.get_account = lambda: {"id": "approved-account", "status": "ACTIVE", "trading_blocked": False, "account_blocked": False}
+        execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader = trader
+        execution.log = None
+        return TraderRuntime(
+            trader_id="recovery", symbol="TSLA", mode="live", credential_profile=None,
+            feed="sip", enabled=True, execution_enabled=True, max_position_notional=10000,
+            max_daily_loss=250, engine=engine, execution=execution, log=MemoryLog(),
+            expected_account_id="approved-account", contract_fingerprints={"test": "contract"},
+            processed_canonical_event_sequences={"TSLA": 123},
+            processed_canonical_event_ids={"TSLA": "already-processed"},
+        )
+
+    def test_http_500_then_complete_flat_recovery_persists_without_reenabling(self):
+        runtime = self.runtime()
+        trader = runtime.execution.trader
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            with patch.object(trader, "get_positions", side_effect=RuntimeError('500: {"code":50010000}')):
+                with self.assertRaises(BrokerObservationUncertain):
+                    reconcile_engine_with_broker(root, runtime)
+            self.assertFalse(runtime.enabled)
+            self.assertTrue(runtime.engine.reconciliation_unsafe)
+            reconcile_engine_with_broker(root, runtime)
+            self.assertFalse(runtime.engine.reconciliation_unsafe)
+            self.assertFalse(runtime.enabled)
+            payload = json.loads((root / "state/recovery.json").read_text())
+            restored = RenkoStrategyEngine(runtime.engine.config)
+            restored.restore_snapshot(payload["engine"])
+            self.assertFalse(restored.reconciliation_unsafe)
+            self.assertIsNone(restored.position)
+            self.assertEqual(payload["canonical_market_checkpoints"]["processed_event_sequences"], {"TSLA": 123})
+            self.assertEqual([p["reason"] for e,p in runtime.log.events if e == "critical_runtime_halt"], ["broker_position_observation_uncertain"])
+
+    def test_uncertain_error_is_not_relabelled_position_mismatch(self):
+        runtime = self.runtime()
+        with tempfile.TemporaryDirectory() as folder, patch.object(runtime.execution.trader, "get_positions", side_effect=RuntimeError("HTTP 500")):
+            with patch("fleet_runner._LAST_BROKER_MANAGED_RECONCILE", {}):
+                reconcile_broker_state_if_due_or_halt(Path(folder), runtime)
+        self.assertEqual([p["reason"] for e,p in runtime.log.events if e == "critical_runtime_halt"], ["broker_position_observation_uncertain"])
+
+    def test_incomplete_orders_positions_account_or_stale_recovery_remain_unsafe(self):
+        for case in ["positions_mapping", "positions_malformed", "orders_mapping", "orders_truncated", "nested_pending", "invalid_legs", "account_mismatch", "account_unhealthy", "stale", "contradiction", "pending_exit"]:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as folder:
+                runtime = self.runtime()
+                trader = runtime.execution.trader
+                if case == "positions_mapping": trader.get_positions = lambda: {}
+                if case == "positions_malformed": trader.get_positions = lambda: [{}]
+                if case == "orders_mapping": trader.get_open_orders_nested = lambda: {}
+                if case == "orders_truncated": trader.orders = [{"symbol":"AAPL"}] * 500
+                if case == "nested_pending": trader.orders = [{"symbol":"AAPL", "legs":[{"symbol":"TSLA", "status":"partially_filled", "filled_qty":"1"}]}]
+                if case == "invalid_legs": trader.orders = [{"symbol":"AAPL", "legs":{}}]
+                if case == "account_mismatch": trader.get_account = lambda: {"id":"other"}
+                if case == "account_unhealthy": trader.get_account = lambda: {"id":"approved-account", "status":"ACTIVE", "trading_blocked":True, "account_blocked":False}
+                if case == "contradiction":
+                    count = iter([[], [{"symbol":"TSLA", "qty":"8", "side":"long"}]])
+                    trader.get_positions = lambda: next(count)
+                if case == "pending_exit": runtime.engine.pending_exit = {"broker_order_id":"unresolved"}
+                clock = patch("fleet_runner.time.monotonic", side_effect=[0, 31]) if case == "stale" else patch("fleet_runner.time.monotonic", return_value=0)
+                with clock, self.assertRaises(BrokerEngineStateMismatch):
+                    reconcile_engine_with_broker(Path(folder), runtime)
+                self.assertTrue(runtime.engine.reconciliation_unsafe)
+
+    def test_incompatible_checkpoint_is_not_discarded(self):
+        for field, value in [("trader_id", "other"), ("configured_quantity",5), ("configured_brick_size",1), ("contract_fingerprints",{})]:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as folder:
+                runtime = self.runtime()
+                root = Path(folder)
+                archive_engine_state(root, runtime, "unsafe")
+                path = root / "state/recovery.json"
+                payload = json.loads(path.read_text())
+                payload[field] = value
+                path.write_text(json.dumps(payload))
+                original = path.read_bytes()
+                with self.assertRaises(BrokerObservationUncertain):
+                    reconcile_engine_with_broker(root, runtime)
+                self.assertTrue(runtime.engine.reconciliation_unsafe)
+                self.assertEqual(path.read_bytes(), original)
+
+    def test_failed_recovery_checkpoint_write_fails_closed(self):
+        runtime = self.runtime()
+        with tempfile.TemporaryDirectory() as folder, patch("fleet_runner.archive_engine_state", side_effect=OSError("disk full")):
+            with self.assertRaises(BrokerObservationUncertain):
+                reconcile_engine_with_broker(Path(folder), runtime)
+        self.assertFalse(runtime.enabled)
+        self.assertTrue(runtime.engine.reconciliation_unsafe)
+
+    def test_nonflat_engine_requires_close_evidence_and_nonflat_broker_blocks(self):
+        for broker_exposed in [False, True]:
+            with self.subTest(broker_exposed=broker_exposed), tempfile.TemporaryDirectory() as folder:
+                runtime = self.runtime()
+                if broker_exposed:
+                    runtime.execution.trader.position = {"symbol":"TSLA", "qty":"8", "side":"long"}
+                else:
+                    runtime.engine.position = PositionState(symbol="TSLA", side="long", qty=8, entry_price=400, entry_time=pd.Timestamp("2026-10-30T14:00:00Z"))
+                with self.assertRaises(BrokerEngineStateMismatch):
+                    reconcile_engine_with_broker(Path(folder), runtime)
+                self.assertTrue(runtime.engine.reconciliation_unsafe)
+                if not broker_exposed: self.assertIsNotNone(runtime.engine.position)
+
+    def test_approved_tsla_risk_limit_and_broker_controls(self):
+        config = json.loads((Path(__file__).resolve().parents[1] / "configs/traders.live.example.json").read_text())
+        trader_config = next(t for t in config["traders"] if t["enabled"] and t["symbol"] == "TSLA")
+        self.assertEqual(trader_config["risk"]["max_position_notional"],10000)
+        self.assertEqual(trader_config["sizing"]["qty"],8)
+        self.assertEqual(trader_config["strategy"]["brick_size"],3.40312712)
+        runtime = self.runtime()
+        runtime.engine.mark_reconciliation_safe("test", evidence={})
+        runtime.execution.trader = FakeRiskTrader()
+        for side in ["long","short"]:
+            signal = Signal(signal_id="risk", signal_type="entry", timestamp=pd.Timestamp("2026-11-02T15:00:00Z"), symbol="TSLA", side=side, broker_side="buy" if side=="long" else "sell", price=400, reason="entry_e1", strategy="e1", trader_id="recovery")
+            intent = OrderIntent(client_order_id="risk", timestamp=signal.timestamp, symbol="TSLA", side=signal.broker_side, signal_type="entry", order_type="market", strategy="e1", reason=signal.reason, qty=8, trader_id="recovery")
+            self.assertIsNone(should_block_for_risk(runtime, signal, intent))
+            expensive = Signal(**{**signal.__dict__, "price":1250.01})
+            self.assertEqual(should_block_for_risk(runtime, expensive, intent),"entry_notional_exceeds_limit_10000")
+            reversal = OrderIntent(**{**intent.__dict__, "qty":16,"target_qty":8,"reason":"entry_e1_reversal"})
+            self.assertIsNone(should_block_for_risk(runtime, Signal(**{**signal.__dict__,"reason":"entry_e1_reversal"}), reversal))
+        runtime.execution.trader = FakeRiskTrader(shortable=False)
+        self.assertIsNotNone(should_block_for_risk(runtime, signal, intent))
+        runtime.execution.trader = FakeRiskTrader(shorting_enabled=False)
+        self.assertEqual(should_block_for_risk(runtime, signal, intent),"account_shorting_disabled")
+        runtime.execution.trader.get_account = lambda: {"buying_power":"0","daytrading_buying_power":"0"}
+        self.assertIn("buying_power_",should_block_for_risk(runtime,signal,intent))
 
 
 if __name__ == "__main__":

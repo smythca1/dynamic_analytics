@@ -74,6 +74,10 @@ class BrokerEngineStateMismatch(RuntimeError):
     pass
 
 
+class BrokerObservationUncertain(BrokerEngineStateMismatch):
+    """The broker observation failed; no position mismatch was established."""
+
+
 def live_market_event_from_canonical_stream_event(event: CanonicalStreamEvent) -> LiveMarketEvent:
     """Adapt a canonical IPC event to the runtime's existing event interface."""
     return LiveMarketEvent(
@@ -841,7 +845,7 @@ def is_reversal_catastrophic_stop_runtime(runtime: TraderRuntime) -> bool:
     )
 
 
-def halt_runtime(root: Path, runtime: TraderRuntime, reason: str, payload: dict[str, Any] | None = None) -> None:
+def halt_runtime(root: Path, runtime: TraderRuntime, reason: str, payload: dict[str, Any] | None = None, *, persist_checkpoint: bool = True) -> None:
     object.__setattr__(runtime, "enabled", False)
     if hasattr(runtime.engine, "mark_reconciliation_unsafe"):
         transition = runtime.engine.mark_reconciliation_unsafe(reason, evidence=payload or {})
@@ -856,7 +860,8 @@ def halt_runtime(root: Path, runtime: TraderRuntime, reason: str, payload: dict[
             "timestamp": pd.Timestamp.now(tz="UTC").isoformat(),
         },
     )
-    archive_engine_state(root, runtime, reason=f"halt_{reason}")
+    if persist_checkpoint:
+        archive_engine_state(root, runtime, reason=f"halt_{reason}")
 
 
 def log_reconciliation_transition(runtime: TraderRuntime, transition: dict[str, Any] | None) -> None:
@@ -943,13 +948,27 @@ def broker_nested_open_orders(runtime: TraderRuntime) -> list[dict[str, Any]]:
         return []
     trader = runtime.execution.trader
     if hasattr(trader, "get_open_orders_nested"):
-        return list(trader.get_open_orders_nested())
-    if hasattr(trader, "get_orders"):
+        orders = trader.get_open_orders_nested()
+    elif hasattr(trader, "get_orders"):
         try:
-            return list(trader.get_orders(status="open", limit=500, nested=True))
+            orders = trader.get_orders(status="open", limit=500, nested=True)
         except TypeError:
-            return list(trader.get_orders(status="open", limit=500))
-    return []
+            orders = trader.get_orders(status="open", limit=500)
+    else:
+        raise ValueError("open_orders_endpoint_unavailable")
+    if not isinstance(orders, list) or len(orders) >= 500:
+        raise ValueError("invalid_or_truncated_open_orders_response")
+    def validate(rows: list[dict[str, Any]]) -> None:
+        for row in rows:
+            if not isinstance(row, dict) or not row.get("symbol"):
+                raise ValueError("invalid_open_order_response")
+            legs = row.get("legs")
+            if legs is not None:
+                if not isinstance(legs, list):
+                    raise ValueError("invalid_nested_orders_response")
+                validate(legs)
+    validate(orders)
+    return orders
 
 
 def _order_ids(order: dict[str, Any]) -> set[str]:
@@ -1043,11 +1062,18 @@ def observe_broker_position(runtime: TraderRuntime) -> tuple[dict[str, Any] | No
         return None, "uncertain", {"source": "symbol_position", "error": str(exc)}
     if isinstance(direct_position, dict):
         return direct_position, "position", {"source": "symbol_position"}
+    if direct_position is not None:
+        return None, "uncertain", {"source": "symbol_position", "error": "invalid_position_response"}
 
     if not hasattr(trader, "get_positions"):
         return None, "uncertain", {"source": "full_positions", "error": "positions_endpoint_unavailable"}
     try:
-        all_positions = list(trader.get_positions())
+        all_positions = trader.get_positions()
+        if not isinstance(all_positions, list) or any(
+            not isinstance(row, dict) or not row.get("symbol") or row.get("qty") is None
+            for row in all_positions
+        ):
+            raise ValueError("invalid_positions_response")
     except Exception as exc:
         return None, "uncertain", {"source": "full_positions", "error": str(exc)}
 
@@ -1068,9 +1094,15 @@ def observe_broker_position(runtime: TraderRuntime) -> tuple[dict[str, Any] | No
         open_orders = broker_nested_open_orders(runtime)
     except Exception as exc:
         return None, "uncertain", {"source": "open_orders", "error": str(exc)}
+    flattened_orders = []
+    def collect(rows):
+        for row in rows:
+            flattened_orders.append(row)
+            collect(row.get("legs") or [])
+    collect(open_orders)
     symbol_orders = [
         _summarize_order(order)
-        for order in open_orders
+        for order in flattened_orders
         if isinstance(order, dict) and str(order.get("symbol") or "").upper().strip() == runtime.symbol.upper()
     ]
     if symbol_orders:
@@ -1781,6 +1813,49 @@ def log_protection_invariant_result(
     archive_engine_state(root, runtime, reason="broker_native_protection_verification_failed")
 
 
+def verify_flat_reversal_recovery(root: Path, runtime: TraderRuntime, trade: dict[str, Any]) -> None:
+    """Validate recovery without changing positions, checkpoints or runtime enablement."""
+    if trade.get("pending_exit") or trade.get("protection_state") or trade.get("tp_sl_lifecycle_state") != "FLAT":
+        raise ValueError("unresolved_local_order_or_protection_state")
+    expected_account = runtime.expected_account_id or os.environ.get("DEPLOY_EXPECTED_ACCOUNT_ID")
+    if not expected_account:
+        raise ValueError("expected_account_identity_unavailable")
+    started = time.monotonic()
+    trader = runtime.execution.trader
+    account = trader.get_account()
+    if not isinstance(account, dict) or account.get("id") != expected_account:
+        raise ValueError("broker_account_identity_mismatch")
+    if account.get("status") != "ACTIVE" or account.get("trading_blocked") is not False or account.get("account_blocked") is not False:
+        raise ValueError("broker_account_health_unverified")
+    # Re-observe after the account check; never recover from cached observation evidence.
+    position, state, _evidence = observe_broker_position(runtime)
+    if position is not None or state != "confirmed_flat" or time.monotonic() - started > 30:
+        raise ValueError("fresh_complete_broker_flat_observation_required")
+    path, payload, snapshot, error = load_state_snapshot_payload(root, runtime.trader_id)
+    if error:
+        raise ValueError(error)
+    if payload is not None:
+        config = runtime.engine.config
+        if (
+            payload.get("trader_id") != runtime.trader_id
+            or payload.get("symbol") != runtime.symbol
+            or payload.get("configured_quantity") != config.qty
+            or payload.get("configured_brick_size") != config.brick_size
+            or snapshot.get("trader_id") != runtime.trader_id
+            or snapshot.get("strategy_name") != config.strategy_name
+            or snapshot.get("strategy_type") != config.strategy_type
+            or snapshot.get("symbol") != runtime.symbol
+            or snapshot.get("trade", {}).get("position") is not None
+            or snapshot.get("trade", {}).get("pending_exit")
+            or snapshot.get("trade", {}).get("protection_state")
+            or snapshot.get("trade", {}).get("tp_sl_lifecycle_state") != "FLAT"
+        ):
+            raise ValueError("incompatible_or_contradictory_recovery_checkpoint")
+        # This check normally ran before restoration. Repeat it for recovery even if halted.
+        if payload.get("contract_fingerprints") != runtime.contract_fingerprints or not runtime.contract_fingerprints:
+            raise ValueError("recovery_checkpoint_contract_mismatch")
+
+
 def reconcile_engine_with_broker(root: Path, runtime: TraderRuntime) -> None:
     if not isinstance(runtime.execution, AlpacaExecutionEngine):
         return
@@ -1804,7 +1879,7 @@ def reconcile_engine_with_broker(root: Path, runtime: TraderRuntime) -> None:
             },
         )
         halt_runtime(root, runtime, str(error["reason"]), error)
-        raise BrokerEngineStateMismatch(
+        raise BrokerObservationUncertain(
             f"{runtime.trader_id} {runtime.symbol} broker position observation is incomplete"
         )
 
@@ -1813,6 +1888,30 @@ def reconcile_engine_with_broker(root: Path, runtime: TraderRuntime) -> None:
         and str(getattr(runtime.engine.config, "exit_management", "")).lower().strip() == "bracket"
     )
     reversal_stop_runtime = is_reversal_catastrophic_stop_runtime(runtime)
+    if (
+        broker_observation_state == "confirmed_flat"
+        and engine_position is None
+        and not broker_native_runtime
+        and not reversal_stop_runtime
+        and runtime.engine.config.strategy_type == "renko_reversal"
+        and bool(getattr(runtime.engine, "reconciliation_unsafe", False))
+    ):
+        try:
+            verify_flat_reversal_recovery(root, runtime, engine_trade)
+        except Exception as exc:
+            # Preserve conflicting checkpoint evidence rather than overwriting it.
+            halt_runtime(root, runtime, "broker_flat_recovery_unverified", {"error": str(exc)}, persist_checkpoint=False)
+            raise BrokerObservationUncertain("flat reconciliation recovery is unverified") from exc
+        try:
+            mark_reconciliation_safe(
+                root, runtime,
+                reason="broker_engine_flat_authoritatively_verified",
+                evidence={"observation": broker_observation_evidence, "account_identity_verified": True},
+            )
+        except Exception as exc:
+            halt_runtime(root, runtime, "recovery_checkpoint_persistence_failed", {}, persist_checkpoint=False)
+            raise BrokerObservationUncertain("recovery checkpoint could not be persisted") from exc
+        return
     if broker_position is None and reversal_stop_runtime and isinstance(engine_position, dict):
         external_fill = matching_reversal_catastrophic_stop_fill(runtime, engine_position)
         if external_fill is not None and hasattr(runtime.engine, "mark_external_close_filled"):
@@ -2841,6 +2940,10 @@ def should_block_for_risk(runtime: TraderRuntime, signal: Signal, intent: OrderI
     ):
         return "tp_sl_exit_pending"
     estimated_order_notional = intent.notional or ((intent.qty or 0.0) * signal.price)
+    target_qty = intent.target_qty if intent.target_qty is not None else intent.qty
+    target_notional = (target_qty * signal.price) if target_qty is not None else intent.notional
+    if runtime.max_position_notional and target_notional and target_notional > runtime.max_position_notional:
+        return f"entry_notional_exceeds_limit_{runtime.max_position_notional:g}"
     reason_text = str(signal.reason or "").lower()
     is_reversal = "reversal" in reason_text or "reverse" in reason_text
     max_order_notional = runtime.max_position_notional * (2 if is_reversal else 1)
@@ -3078,6 +3181,8 @@ def should_isolate_broker_engine_mismatch(runtime: TraderRuntime) -> bool:
 def reconcile_broker_state_if_due_or_halt(root: Path, runtime: TraderRuntime) -> None:
     try:
         reconcile_broker_state_if_due(root, runtime)
+    except BrokerObservationUncertain:
+        return  # Already halted with the actual observation failure, not a mismatch.
     except BrokerEngineStateMismatch as exc:
         if should_isolate_broker_engine_mismatch(runtime):
             halt_runtime(root, runtime, "broker_engine_state_mismatch", {"error": str(exc)})
@@ -3095,6 +3200,8 @@ def process_market_tick_for_runtime(
 ) -> None:
     try:
         _process_market_tick_for_runtime(root=root, args=args, runtime=runtime, tick=tick, source_event=source_event)
+    except BrokerObservationUncertain:
+        return
     except BrokerEngineStateMismatch as exc:
         if should_isolate_broker_engine_mismatch(runtime):
             halt_runtime(root, runtime, "broker_engine_state_mismatch", {"error": str(exc)})

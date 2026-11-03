@@ -1029,7 +1029,7 @@
       },
       "risk": {
         "max_daily_loss": 250,
-        "max_position_notional": 2500
+        "max_position_notional": 10000
       },
       "warm_start": {
         "enabled": false,
