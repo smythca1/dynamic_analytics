@@ -60,6 +60,7 @@ from strategy_engine import (
     RenkoStrategyEngine,
 )
 from trading_events import MarketTick, OrderIntent, Signal, dataclass_to_jsonable, is_price_forming_trade
+from silver.market.canonical_journal import CanonicalJournal
 
 
 DATA_STREAM_URL_TEMPLATE = "wss://stream.data.alpaca.markets/v2/{feed}"
@@ -231,7 +232,14 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     with temp_path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
         handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
     temp_path.replace(path)
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def archive_date(timestamp: pd.Timestamp) -> str:
@@ -3240,6 +3248,17 @@ def _process_market_tick_for_runtime(
 ) -> None:
     if not runtime.enabled:
         return
+    if runtime.market_data_source == "shared_canonical_stream" and source_event is not None and source_event.source_sequence is not None:
+        sequence = int(source_event.source_sequence)
+        previous = int(runtime.processed_canonical_event_sequences.get(runtime.symbol, 0))
+        if sequence < previous:
+            return
+        if sequence == previous:
+            if tick.trade_id != runtime.processed_canonical_event_ids.get(runtime.symbol):
+                raise RuntimeError("canonical sequence has conflicting event identity")
+            return
+        if previous and sequence != previous + 1:
+            raise RuntimeError(f"canonical observation gap: expected {previous + 1}, received {sequence}")
     record_shadow_for_eligible_tick(runtime, tick)
     if args.log_ticks:
         payload = dataclass_to_jsonable(tick)
@@ -3273,13 +3292,14 @@ def _process_market_tick_for_runtime(
         archive_engine_state(root, runtime, reason="duplicate_shared_canonical_event_skipped")
         return
 
-    broker_force_flat_if_due(
-        root,
-        runtime,
-        tick.timestamp,
-        price=tick.price,
-        source="tick",
-    )
+    if runtime.market_data_signal_block_reason != "canonical_historical_replay":
+        broker_force_flat_if_due(
+            root,
+            runtime,
+            tick.timestamp,
+            price=tick.price,
+            source="tick",
+        )
     reconcile_broker_state_if_due_or_halt(root, runtime)
     source_observations = source_observations_for_runtime(runtime, tick, source_event)
     if not source_observations:
@@ -3407,6 +3427,129 @@ def _process_market_tick_for_runtime(
             archive_engine_state(root, runtime, reason=runtime.renko_source)
 
 
+def durable_canonical_cursor(root: Path, runtime: TraderRuntime) -> tuple[int, str | None]:
+    path, payload, snapshot, error = load_state_snapshot_payload(root, runtime.trader_id)
+    if error or payload is None or snapshot is None:
+        raise RuntimeError("canonical resume requires an engine checkpoint")
+    if (
+        payload.get("trader_id") != runtime.trader_id or payload.get("symbol") != runtime.symbol
+        or snapshot.get("trader_id") != runtime.trader_id or snapshot.get("symbol") != runtime.symbol
+        or snapshot.get("strategy_name") != runtime.engine.config.strategy_name
+        or snapshot.get("strategy_type") != runtime.engine.config.strategy_type
+        or payload.get("configured_quantity") != runtime.engine.config.qty
+        or payload.get("configured_brick_size") != getattr(runtime.engine.config, "brick_size", None)
+        or payload.get("contract_fingerprints") != runtime.contract_fingerprints
+    ):
+        raise RuntimeError("canonical resume checkpoint identity or contract mismatch")
+    checkpoints = payload.get("canonical_market_checkpoints") or {}
+    sequence = int((checkpoints.get("processed_event_sequences") or {}).get(runtime.symbol, 0))
+    event_id = (checkpoints.get("processed_event_ids") or {}).get(runtime.symbol)
+    if sequence < 0 or (sequence and not event_id):
+        raise RuntimeError("canonical resume checkpoint cursor is invalid")
+    if sequence != int(runtime.processed_canonical_event_sequences.get(runtime.symbol, 0)) or event_id != runtime.processed_canonical_event_ids.get(runtime.symbol):
+        raise RuntimeError("canonical in-memory cursor is not durably checkpointed")
+    return sequence, event_id
+
+
+def missing_canonical_observations(journal_path: Path, runtime: TraderRuntime, cursor: int, event_id: str | None) -> list[CanonicalStreamEvent]:
+    """Read existing canonical journal files without recovery writes or retention limits."""
+    paths = sorted(journal_path.parent.glob(f"{journal_path.stem}_*{journal_path.suffix}"))
+    paths.append(journal_path)
+    expected_fingerprint = (runtime.contract_fingerprints or {}).get("market_stream", {}).get("fingerprint")
+    if not expected_fingerprint or not journal_path.is_file():
+        raise RuntimeError("canonical recovery journal or fingerprint unavailable")
+    result = []
+    previous = cursor
+    anchor_verified = False
+    for path in paths:
+        with path.open("rb") as handle:
+            # Freeze the readable boundary while the producer may continue appending.
+            remaining = os.fstat(handle.fileno()).st_size
+            while remaining:
+                raw = handle.readline(remaining)
+                remaining -= len(raw)
+                if not raw.endswith(b"\n"):
+                    raise RuntimeError(f"canonical journal has a truncated record: {path}")
+                record = json.loads(raw)
+                payload = record.get("payload") or {}
+                if payload.get("symbol") != runtime.symbol or payload.get("type") != "observation":
+                    continue
+                sequence = int(payload["sequence"])
+                if sequence < cursor:
+                    continue
+                if record.get("type") != "journal_record" or record.get("version") != "canonical_journal.v1" or record.get("payload_sha256") != CanonicalJournal.payload_checksum(payload):
+                    raise RuntimeError(f"canonical journal checksum mismatch: {sequence}")
+                if payload.get("contract_fingerprint") != expected_fingerprint:
+                    raise RuntimeError(f"canonical journal fingerprint mismatch: {sequence}")
+                if sequence == cursor:
+                    if anchor_verified or payload.get("event_id") != event_id:
+                        raise RuntimeError("canonical checkpoint anchor identity conflict")
+                    anchor_verified = True
+                    continue
+                if sequence != previous + 1:
+                    raise RuntimeError(f"canonical journal gap or duplicate: expected {previous + 1}, received {sequence}")
+                result.append(CanonicalStreamEvent(payload))
+                previous = sequence
+    if cursor and not anchor_verified:
+        raise RuntimeError(f"canonical checkpoint anchor is missing from journal: {cursor}")
+    return result
+
+
+def prepare_shared_canonical_resume(root: Path, runtime: TraderRuntime, consumer: SharedCanonicalStreamConsumer, args: argparse.Namespace) -> None:
+    if not runtime.enabled:
+        raise RuntimeError("halted runtime cannot acknowledge canonical observations")
+    cursor, event_id = durable_canonical_cursor(root, runtime)
+    acknowledged = int(consumer.state.get("last_sequences", {}).get(runtime.symbol, 0))
+    if not cursor and acknowledged:
+        raise RuntimeError("consumer has history but engine has no verified canonical cursor")
+    if cursor:
+        with Path(args.shared_market_data_config).open() as handle:
+            journal_path = Path(json.load(handle)["journal_path"])
+        events = missing_canonical_observations(journal_path, runtime, cursor, event_id)
+        head = events[-1].sequence if events else cursor
+        if acknowledged > head:
+            raise RuntimeError("consumer acknowledgement is ahead of available canonical journal")
+        if events:
+            verify_flat_reversal_recovery(root, runtime, runtime.engine.trade_state_snapshot())
+            object.__setattr__(runtime, "market_data_signal_block_reason", "canonical_historical_replay")
+            original_trade = runtime.engine.trade_state_snapshot()
+            for event in events:
+                process_market_tick_for_runtime(
+                    root=root, args=args, runtime=runtime, tick=event.to_market_tick(),
+                    source_event=live_market_event_from_canonical_stream_event(event),
+                )
+                if not runtime.enabled or runtime.engine.trade_state_snapshot() != original_trade:
+                    raise RuntimeError("historical replay changed execution state or halted")
+                applied, applied_id = durable_canonical_cursor(root, runtime)
+                if applied != event.sequence or applied_id != event.event_id:
+                    raise RuntimeError("historical observation was not durably applied")
+            verify_flat_reversal_recovery(root, runtime, runtime.engine.trade_state_snapshot())
+            reconcile_engine_with_broker(root, runtime)
+            if not runtime.enabled or runtime.engine.reconciliation_unsafe:
+                raise RuntimeError("historical replay reconciliation is unsafe")
+            runtime.log.write("canonical_cursor_recovered", {
+                "trader_id": runtime.trader_id, "symbol": runtime.symbol,
+                "original_cursor": cursor, "replayed_observations": len(events),
+                "final_cursor": head, "renko": runtime.engine.snapshot()["renko"],
+            })
+    sequence, event_id = durable_canonical_cursor(root, runtime)
+    consumer.state.setdefault("last_sequences", {})[runtime.symbol] = sequence
+    consumer.state.setdefault("last_event_ids", {})[runtime.symbol] = event_id
+    consumer._persist_state()
+    object.__setattr__(runtime, "market_data_signal_block_reason", "shared_market_data_not_caught_up")
+
+
+async def acknowledge_durable_observation(root: Path, runtime: TraderRuntime, consumer: SharedCanonicalStreamConsumer, event: CanonicalStreamEvent) -> None:
+    if not runtime.enabled or runtime.engine.reconciliation_unsafe:
+        raise RuntimeError("cannot acknowledge an observation for a halted or unsafe runtime")
+    sequence, event_id = durable_canonical_cursor(root, runtime)
+    if event.sequence < sequence:
+        return  # Safely ignore a previously applied observation without regressing acknowledgement.
+    if event.sequence != sequence or event.event_id != event_id:
+        raise RuntimeError("canonical acknowledgement would outrun durable engine state")
+    await consumer.ack(event)
+
+
 async def run_market_stream(
     market_data_source: str,
     market_data_profile: str | None,
@@ -3465,6 +3608,8 @@ async def run_market_stream(
                     symbols=(runtime.symbol,),
                     freshness_threshold_seconds=float(getattr(args, "shared_market_freshness_seconds", 5.0)),
                 )
+                if args.execute_real:
+                    prepare_shared_canonical_resume(root, runtime, consumer, args)
                 consumers[runtime.trader_id] = consumer
                 stream = consumer.connect().__aiter__()
                 streams[runtime.trader_id] = stream
@@ -3540,7 +3685,11 @@ async def run_market_stream(
                             tick=tick,
                             source_event=live_market_event_from_canonical_stream_event(canonical_event),
                         )
-                        await consumer.ack(canonical_event)
+                        if args.execute_real:
+                            await acknowledge_durable_observation(root, runtime, consumer, canonical_event)
+                        else:
+                            # Preserve non-executing diagnostics; live execution never trusts this cursor.
+                            await consumer.ack(canonical_event)
             except asyncio.CancelledError:
                 for task, trader_id in list(pending_reads.items()):
                     await close_stream_after_pending_read(streams[trader_id], task)

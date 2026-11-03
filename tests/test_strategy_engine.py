@@ -2,7 +2,7 @@ import asyncio
 import json
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock, AsyncMock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +15,10 @@ from fleet_runner import (
     TraderRuntime,
     archive_tick,
     archive_engine_state,
+    prepare_shared_canonical_resume,
+    acknowledge_durable_observation,
+    durable_canonical_cursor,
+    live_market_event_from_canonical_stream_event,
     behavior_profile_block_reason,
     broker_force_flat_if_due,
     build_strategy_config,
@@ -37,6 +41,9 @@ from silver.market import (
     live_market_event_from_alpaca_message,
     live_market_event_from_archive_payload,
 )
+from silver.market.canonical_journal import CanonicalJournal
+from silver.market.ipc_consumer import CanonicalStreamEvent
+from silver.market.contract import contract_snapshot
 from shared.config.trader_config import TraderConfigError, validate_single_strategy_kernel_config
 from scripts.live_signal_parity import iter_source_ticks
 from strategy_engine import (
@@ -5521,6 +5528,170 @@ class ReversalFlatRecoveryTests(unittest.TestCase):
         self.assertEqual(should_block_for_risk(runtime, signal, intent),"account_shorting_disabled")
         runtime.execution.trader.get_account = lambda: {"buying_power":"0","daytrading_buying_power":"0"}
         self.assertIn("buying_power_",should_block_for_risk(runtime,signal,intent))
+
+
+class CanonicalCursorRecoveryTests(unittest.TestCase):
+    def setup_recovery(self, folder):
+        root=Path(folder)
+        runtime=ReversalFlatRecoveryTests().runtime()
+        runtime.engine.mark_reconciliation_safe("test",evidence={})
+        object.__setattr__(runtime,"market_data_source","shared_canonical_stream")
+        object.__setattr__(runtime,"market_adapter",CanonicalMarketObservationAdapter(run_id="cursor-test"))
+        object.__setattr__(runtime,"contract_fingerprints",contract_snapshot(symbol="TSLA",strategy_config=runtime.engine.config,session_timezone=runtime.engine.config.timezone))
+        object.__setattr__(runtime,"market_data_signal_block_reason","canonical_historical_replay")
+        runtime.processed_canonical_event_sequences.clear();runtime.processed_canonical_event_ids.clear()
+        runtime.execution.execute=Mock(side_effect=AssertionError("historical broker order"))
+        fp=runtime.contract_fingerprints['market_stream']['fingerprint']
+        events=[CanonicalStreamEvent({'version':'canonical_market_ipc.v1','type':'observation','symbol':'TSLA','sequence':n,'event_id':f'event-{n}','close_price':str(price),'observation_timestamp':f'2026-11-02T15:00:0{n}+00:00','contract_fingerprint':fp}) for n,price in enumerate([400,410,390,420,380],1)]
+        journal=root/'market-data/canonical_journal.jsonl';journal.parent.mkdir()
+        journal.write_bytes(b''.join(CanonicalJournal.encode_record(e.payload)+b'\n' for e in events))
+        config=root/'market.json';config.write_text(json.dumps({'journal_path':str(journal)}))
+        args=SimpleNamespace(log_ticks=False,shared_market_data_config=str(config))
+        first=events[0]
+        process_market_tick_for_runtime(root=root,args=args,runtime=runtime,tick=first.to_market_tick(),source_event=live_market_event_from_canonical_stream_event(first))
+        consumer=SimpleNamespace(state={'last_sequences':{'TSLA':5},'last_event_ids':{'TSLA':'event-5'}},_persist_state=Mock(),ack=AsyncMock())
+        return root,runtime,consumer,args,events,journal
+
+    def test_ahead_ack_replays_exactly_once_with_uninterrupted_state_equivalence(self):
+        with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as reference_folder:
+            root,runtime,consumer,args,events,journal=self.setup_recovery(folder)
+            rr,reference,rc,ra,re,rj=self.setup_recovery(reference_folder)
+            for event in re[1:]:
+                process_market_tick_for_runtime(root=rr,args=ra,runtime=reference,tick=event.to_market_tick(),source_event=live_market_event_from_canonical_stream_event(event))
+            prepare_shared_canonical_resume(root,runtime,consumer,args)
+            self.assertEqual(runtime.engine.snapshot(),reference.engine.snapshot())
+            self.assertEqual(durable_canonical_cursor(root,runtime),(5,'event-5'))
+            self.assertEqual(consumer.state['last_sequences']['TSLA'],5)
+            self.assertIsNone(runtime.engine.position)
+            runtime.execution.execute.assert_not_called()
+            blocked=[p for e,p in runtime.log.events if e=='risk_block' and p.get('reason')=='canonical_historical_replay']
+            self.assertTrue(blocked)
+            before=runtime.engine.snapshot()
+            prepare_shared_canonical_resume(root,runtime,consumer,args)
+            self.assertEqual(runtime.engine.snapshot(),before)
+            recovery=[p for e,p in runtime.log.events if e=='canonical_cursor_recovered']
+            self.assertEqual(len(recovery),1)
+            self.assertEqual(recovery[0]['replayed_observations'],4)
+
+    def test_gap_truncation_checksum_fingerprint_and_duplicates_fail_before_replay(self):
+        for failure in ['gap','truncated','checksum','fingerprint','duplicate','identity','missing_anchor']:
+            with self.subTest(failure=failure),tempfile.TemporaryDirectory() as folder:
+                root,runtime,consumer,args,events,journal=self.setup_recovery(folder)
+                records=[json.loads(line) for line in journal.read_bytes().splitlines()]
+                if failure=='gap':records.pop(2)
+                if failure=='duplicate':records.insert(2,records[1])
+                if failure=='missing_anchor':records.pop(0)
+                if failure=='checksum':records[2]['payload_sha256']='0'*64
+                if failure=='fingerprint':
+                    records[2]['payload']['contract_fingerprint']='wrong'
+                    records[2]['payload_sha256']=CanonicalJournal.payload_checksum(records[2]['payload'])
+                raw=b''.join(json.dumps(r).encode()+b'\n' for r in records)
+                journal.write_bytes(raw[:-2] if failure=='truncated' else raw)
+                path=root/'state/recovery.json'
+                if failure=='identity':
+                    p=json.loads(path.read_text());p['trader_id']='other';path.write_text(json.dumps(p))
+                before=path.read_bytes()
+                with self.assertRaises(RuntimeError):prepare_shared_canonical_resume(root,runtime,consumer,args)
+                self.assertEqual(path.read_bytes(),before)
+                runtime.execution.execute.assert_not_called()
+                consumer._persist_state.assert_not_called()
+
+    def test_restart_after_interrupted_replay_uses_latest_durable_cursor(self):
+        from fleet_runner import archive_engine_state as real_archive
+        with tempfile.TemporaryDirectory() as folder:
+            root,runtime,consumer,args,events,journal=self.setup_recovery(folder)
+            def crash(root_arg,runtime_arg,reason):
+                if runtime_arg.processed_canonical_event_sequences['TSLA']==3:raise SystemExit('crash')
+                return real_archive(root_arg,runtime_arg,reason)
+            with patch('fleet_runner.archive_engine_state',side_effect=crash),self.assertRaises(SystemExit):
+                prepare_shared_canonical_resume(root,runtime,consumer,args)
+            saved=json.loads((root/'state/recovery.json').read_text())
+            self.assertEqual(saved['canonical_market_checkpoints']['processed_event_sequences']['TSLA'],2)
+            runtime.engine.restore_snapshot(saved['engine'])
+            runtime.processed_canonical_event_sequences.update(saved['canonical_market_checkpoints']['processed_event_sequences'])
+            runtime.processed_canonical_event_ids.update(saved['canonical_market_checkpoints']['processed_event_ids'])
+            prepare_shared_canonical_resume(root,runtime,consumer,args)
+            self.assertEqual(durable_canonical_cursor(root,runtime),(5,'event-5'))
+            runtime.execution.execute.assert_not_called()
+
+    def test_checkpoint_failure_cannot_advance_acknowledgement(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root,runtime,consumer,args,events,journal=self.setup_recovery(folder)
+            with patch('fleet_runner.write_json_atomic',side_effect=OSError('disk full')),self.assertRaises(Exception):
+                prepare_shared_canonical_resume(root,runtime,consumer,args)
+            with self.assertRaises(RuntimeError):asyncio.run(acknowledge_durable_observation(root,runtime,consumer,events[1]))
+            consumer.ack.assert_not_called();consumer._persist_state.assert_not_called()
+            saved=json.loads((root/'state/recovery.json').read_text())
+            self.assertEqual(saved['canonical_market_checkpoints']['processed_event_sequences']['TSLA'],1)
+
+    def test_broker_exposure_during_recovery_fails_closed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root,runtime,consumer,args,events,journal=self.setup_recovery(folder)
+            runtime.execution.trader.position={'symbol':'TSLA','qty':'8','side':'long'}
+            with self.assertRaises(ValueError):prepare_shared_canonical_resume(root,runtime,consumer,args)
+            self.assertEqual(durable_canonical_cursor(root,runtime),(1,'event-1'))
+            runtime.execution.execute.assert_not_called()
+
+    def test_exposure_appearing_mid_replay_prevents_consumer_resume(self):
+        from fleet_runner import process_market_tick_for_runtime as real_process
+        with tempfile.TemporaryDirectory() as folder:
+            root,runtime,consumer,args,events,journal=self.setup_recovery(folder)
+            def expose(**kwargs):
+                real_process(**kwargs)
+                if kwargs['source_event'].source_sequence==3:
+                    runtime.execution.trader.position={'symbol':'TSLA','qty':'8','side':'long'}
+            with patch('fleet_runner.process_market_tick_for_runtime',side_effect=expose),self.assertRaises((ValueError,RuntimeError)):
+                prepare_shared_canonical_resume(root,runtime,consumer,args)
+            runtime.execution.execute.assert_not_called()
+            consumer._persist_state.assert_not_called()
+
+    def test_halted_observation_is_not_acknowledged_and_live_gap_is_rejected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root,runtime,consumer,args,events,journal=self.setup_recovery(folder)
+            # Observation 3 cannot be applied over the durable cursor at 1.
+            process_market_tick_for_runtime(root=root,args=args,runtime=runtime,tick=events[2].to_market_tick(),source_event=live_market_event_from_canonical_stream_event(events[2]))
+            self.assertFalse(runtime.enabled)
+            with self.assertRaises(RuntimeError):asyncio.run(acknowledge_durable_observation(root,runtime,consumer,events[2]))
+            consumer.ack.assert_not_called()
+            saved=json.loads((root/'state/recovery.json').read_text())
+            self.assertEqual(saved['canonical_market_checkpoints']['processed_event_sequences']['TSLA'],1)
+
+    def test_live_observation_requires_persisted_processing_before_ack(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root,runtime,consumer,args,events,journal=self.setup_recovery(folder)
+            with self.assertRaises(RuntimeError):asyncio.run(acknowledge_durable_observation(root,runtime,consumer,events[-1]))
+            prepare_shared_canonical_resume(root,runtime,consumer,args)
+            self.assertEqual(runtime.market_data_signal_block_reason,'shared_market_data_not_caught_up')
+            next_payload={**events[-1].payload,'sequence':6,'event_id':'event-6','close_price':'380.1'}
+            event=CanonicalStreamEvent(next_payload)
+            object.__setattr__(runtime,'market_data_signal_block_reason',None)
+            process_market_tick_for_runtime(root=root,args=args,runtime=runtime,tick=event.to_market_tick(),source_event=live_market_event_from_canonical_stream_event(event))
+            asyncio.run(acknowledge_durable_observation(root,runtime,consumer,event))
+            consumer.ack.assert_awaited_once_with(event)
+            before=runtime.engine.snapshot()
+            process_market_tick_for_runtime(root=root,args=args,runtime=runtime,tick=event.to_market_tick(),source_event=live_market_event_from_canonical_stream_event(event))
+            self.assertEqual(runtime.engine.snapshot(),before)
+            self.assertFalse(runtime.engine.reconciliation_unsafe)
+
+    def test_real_execution_stream_recovers_then_acknowledges_only_persisted_live_data(self):
+        import fleet_runner
+        with tempfile.TemporaryDirectory() as folder:
+            root,runtime,consumer,args,events,journal=self.setup_recovery(folder)
+            object.__setattr__(runtime,'account_namespace','test')
+            args.archive_root=str(root);args.execute_real=True;args.shared_market_socket='/unused';args.reconnect_delay=0
+            event=CanonicalStreamEvent({**events[-1].payload,'sequence':6,'event_id':'event-6','close_price':'380.1'})
+            async def observations():
+                yield event
+                raise asyncio.CancelledError()
+            async def ack(applied):
+                self.assertEqual(durable_canonical_cursor(root,runtime),(applied.sequence,applied.event_id))
+                consumer.state['last_sequences']['TSLA']=applied.sequence
+            consumer.connect=observations;consumer.signal_block_reason=lambda symbol:None;consumer.ack=AsyncMock(side_effect=ack)
+            with patch.object(fleet_runner,'SharedCanonicalStreamConsumer',return_value=consumer),self.assertRaises(asyncio.CancelledError):
+                asyncio.run(fleet_runner.run_market_stream('shared_canonical_stream',None,'live','sip',[runtime],args))
+            self.assertEqual(durable_canonical_cursor(root,runtime),(6,'event-6'))
+            consumer.ack.assert_awaited_once_with(event)
+            runtime.execution.execute.assert_not_called()
 
 
 if __name__ == "__main__":
