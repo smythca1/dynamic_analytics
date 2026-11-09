@@ -7,6 +7,7 @@ from pathlib import Path
 
 from shared.deployment.release_contract import (
     build_release_contract,
+    classify_inactive_checkpoint_artifacts,
     evaluate_broker_snapshot,
     evaluate_checkpoint_snapshot,
     plan_change,
@@ -158,6 +159,52 @@ class ReleaseContractTests(unittest.TestCase):
             broker_positions={"TSLA": 0},
         )
         self.assertEqual(result["status"], "PASS")
+
+    def test_verified_inactive_checkpoint_is_excluded_without_manual_authorization(self):
+        result = classify_inactive_checkpoint_artifacts(
+            [{"path": "artifacts/live/state/old-tqqq.json", "trader_id": "old-tqqq",
+              "runtime_trader_id": "old-tqqq", "symbol": "TQQQ", "strategy_type": "renko_tp_sl",
+              "strategy_identity": "old_tqqq", "artifact_kind": "runtime_checkpoint"}],
+            active_traders=[{"id": "new-tsla", "symbol": "TSLA"}],
+            broker_positions={"TQQQ": 0}, broker_order_symbols=[],
+        )
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["exclusions"][0]["evidence"], "broker_flat_no_open_orders")
+
+    def test_inactive_checkpoint_is_blocked_when_ambiguous_or_exposed(self):
+        artifact = {"path": "artifacts/live/state/not-identity.json", "trader_id": "old-tqqq",
+                    "runtime_trader_id": "other", "symbol": "TQQQ", "strategy_type": "renko_tp_sl",
+                    "strategy_identity": "old_tqqq", "artifact_kind": "runtime_checkpoint"}
+        result = classify_inactive_checkpoint_artifacts(
+            [artifact], active_traders=[], broker_positions={"TQQQ": 20}, broker_order_symbols=["TQQQ"],
+        )
+        self.assertEqual(result["status"], "BLOCKED")
+
+    def test_active_symbol_owns_legacy_state_only_after_active_reconciliation_path(self):
+        result = classify_inactive_checkpoint_artifacts(
+            [{"path": "artifacts/live/state/old-tsla.json", "trader_id": "old-tsla",
+              "runtime_trader_id": "old-tsla", "symbol": "TSLA", "strategy_type": "renko_reversal",
+              "strategy_identity": "old_tsla", "artifact_kind": "runtime_checkpoint"}],
+            active_traders=[{"id": "new-tsla", "symbol": "TSLA"}],
+            broker_positions={"TSLA": 8}, broker_order_symbols=[],
+        )
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["exclusions"][0]["evidence"], "active_runtime_owns_symbol")
+
+    def test_new_tqqq_identity_initializes_without_legacy_tqqq_state(self):
+        inactive = classify_inactive_checkpoint_artifacts(
+            [{"path": "artifacts/live/state/legacy-tqqq.json", "trader_id": "legacy-tqqq",
+              "runtime_trader_id": "legacy-tqqq", "symbol": "TQQQ", "strategy_type": "renko_tp_sl",
+              "strategy_identity": "legacy_tqqq", "artifact_kind": "runtime_checkpoint"}],
+            active_traders=[{"id": "new-tqqq", "symbol": "TQQQ"}],
+            broker_positions={"TQQQ": 0}, broker_order_symbols=[],
+        )
+        active = evaluate_checkpoint_snapshot(
+            {"new-tqqq": None}, candidate_traders=[{"id": "new-tqqq", "symbol": "TQQQ", "quantity": 20}],
+            broker_positions={"TQQQ": 0},
+        )
+        self.assertEqual(inactive["status"], "PASS")
+        self.assertEqual(active["status"], "PASS")
 
     def _historical_record(self, **overrides):
         record = {

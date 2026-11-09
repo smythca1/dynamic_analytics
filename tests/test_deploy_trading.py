@@ -340,7 +340,7 @@ class DeployTradingTests(unittest.TestCase):
         script = (self.repo / "deploy-trading").read_text()
         self.assertIn('rejected_evidence', script)
         self.assertIn('multiple top-level checkpoints for', script)
-        self.assertIn('checkpoint artifact lacks authorization', script)
+        self.assertIn('classify_inactive_checkpoint_artifacts', script)
         self.assertIn('state_root.rglob("*.json")', script)
 
     def test_generated_manifest_contains_exactly_one_json_object(self) -> None:
@@ -1239,7 +1239,7 @@ restart_fleet_only
         python = source.split("<<'PY'\n",1)[1].rsplit('\nPY',1)[0]
         config_path = REPO_ROOT / 'configs/traders.live.example.json'
         configuration = json.loads(config_path.read_text())
-        t = next(t for t in configuration['traders'] if t.get('enabled'))
+        t = next(t for t in configuration['traders'] if t.get('id') == 'camatron_tsla_1s_renko_reversal_0p32_e1_qty8_20261005_live')
         config = build_strategy_config(t)
         snapshot = RenkoStrategyEngine(config).snapshot()
         checkpoint = {'trader_id':t['id'], 'symbol':config.symbol,
@@ -1318,10 +1318,18 @@ restart_fleet_only
                 code,result=self.run_gate(change)
                 self.assertNotEqual(code,0,result)
 
+    def test_legacy_tqqq_checkpoint_cannot_restore_new_tqqq_identity(self):
+        def legacy_tqqq(p,path,a):
+            old=copy.deepcopy(p);old['trader_id']='legacy-tqqq';old['engine']['trader_id']='legacy-tqqq';old['symbol']='TQQQ';old['engine']['symbol']='TQQQ'
+            oldpath=path.parent/'legacy-tqqq.json';oldpath.write_text(json.dumps(old))
+        code,result=self.run_gate(legacy_tqqq)
+        self.assertEqual(code,0,result)
+        self.assertEqual(result['checkpoint']['historical_exclusions'][0]['trader_id'],'legacy-tqqq')
+
     def test_historical_requires_exact_authorization_and_hash(self):
         import hashlib
         def historical(p,path,a,tamper=False,authorize=True):
-            old=copy.deepcopy(p);old['trader_id']='retired'
+            old=copy.deepcopy(p);old['trader_id']='retired';old['engine']['trader_id']='retired'
             oldpath=path.parent/'retired.json';oldpath.write_text(json.dumps(old))
             record={'trader_id':'retired','checkpoint_path':'artifacts/live/state/retired.json','sha256':hashlib.sha256(oldpath.read_bytes()).hexdigest(),'symbol':old['symbol'],'strategy_type':old['engine']['strategy_type'],'strategy_identity':old['engine']['strategy_name'],'classification':'verified_historical','restoration':'historical_non_restorable','provenance':'immutable prior release','reviewed_by':'Test reviewer','reviewed_at_utc':'2026-11-02T19:00:00Z','broker_evidence':{'position_flat':True,'open_orders':0,'verified_at_utc':'2026-11-02T19:00:00Z'}}
             if authorize:a.append(record)
@@ -1330,9 +1338,11 @@ restart_fleet_only
         self.assertEqual(code,0,result)
         code,result=self.run_gate(historical,positions=[{'symbol':'TSLA','qty':'5','side':'long'}])
         self.assertNotEqual(code,0,result)
-        for tamper,authorize in [(True,True),(False,False)]:
-            code,result=self.run_gate(lambda p,path,a:historical(p,path,a,tamper,authorize))
-            self.assertNotEqual(code,0,result)
+        code,result=self.run_gate(lambda p,path,a:historical(p,path,a,True,True))
+        self.assertNotEqual(code,0,result)
+        code,result=self.run_gate(lambda p,path,a:historical(p,path,a,False,False))
+        self.assertEqual(code,0,result)
+        self.assertEqual(result['checkpoint']['historical_exclusions'][0]['trader_id'],'retired')
 
 
 if __name__ == "__main__":

@@ -281,6 +281,81 @@ def evaluate_broker_snapshot(
     }
 
 
+def classify_inactive_checkpoint_artifacts(
+    checkpoint_inventory: Iterable[dict[str, Any]],
+    *,
+    active_traders: Iterable[dict[str, Any]],
+    broker_positions: dict[str, float],
+    broker_order_symbols: Iterable[str],
+) -> dict[str, Any]:
+    """Classify only positively verified inactive state as non-restorable history.
+
+    Active runtime state remains subject to the normal contract/reconciliation path.
+    Historical state is never deleted or restored.  A legacy artifact is excluded only
+    when its embedded identity and identity-specific path agree, and either its symbol
+    is flat with no open orders or a current active runtime owns that symbol.
+    """
+    errors: list[str] = []
+    exclusions: list[dict[str, str]] = []
+    active_by_id = {str(row.get("id")): row for row in active_traders if isinstance(row, dict) and row.get("id")}
+    active_symbols = {
+        str(row.get("symbol", "")).upper()
+        for row in active_by_id.values()
+        if row.get("symbol")
+    }
+    order_symbols = {str(symbol).upper() for symbol in broker_order_symbols}
+    for artifact in checkpoint_inventory:
+        if not isinstance(artifact, dict):
+            errors.append("checkpoint inventory artifact is malformed")
+            continue
+        trader_id = str(artifact.get("trader_id") or "")
+        if trader_id in active_by_id:
+            if str(artifact.get("artifact_kind") or "") != "runtime_checkpoint":
+                errors.append(f"{trader_id}: active trader has non-runtime checkpoint evidence")
+            continue
+        path = str(artifact.get("path") or "")
+        symbol = str(artifact.get("symbol") or "").upper()
+        strategy_type = str(artifact.get("strategy_type") or "")
+        strategy_identity = str(artifact.get("strategy_identity") or "")
+        runtime_trader_id = str(artifact.get("runtime_trader_id") or "")
+        kind = str(artifact.get("artifact_kind") or "")
+        if not trader_id or not path or not symbol or not strategy_type or not strategy_identity:
+            errors.append(f"{trader_id or path}: inactive checkpoint identity is incomplete")
+            continue
+        if runtime_trader_id != trader_id:
+            errors.append(f"{trader_id}: inactive checkpoint runtime identity mismatch")
+            continue
+        if kind == "runtime_checkpoint":
+            if Path(path).name != f"{trader_id}.json":
+                errors.append(f"{trader_id}: inactive checkpoint path is not identity-specific")
+                continue
+        elif kind == "rejected_evidence":
+            if artifact.get("rejection_metadata_valid") is not True:
+                errors.append(f"{trader_id}: rejected checkpoint metadata is invalid")
+                continue
+        else:
+            errors.append(f"{trader_id}: checkpoint artifact kind is not recognized")
+            continue
+        if symbol in active_symbols:
+            evidence = "active_runtime_owns_symbol"
+        else:
+            if abs(float(broker_positions.get(symbol, 0.0))) > 1e-9:
+                errors.append(f"{trader_id}: inactive checkpoint symbol has broker exposure")
+                continue
+            if symbol in order_symbols:
+                errors.append(f"{trader_id}: inactive checkpoint symbol has open broker orders")
+                continue
+            evidence = "broker_flat_no_open_orders"
+        exclusions.append({
+            "trader_id": trader_id,
+            "checkpoint_path": path,
+            "symbol": symbol,
+            "classification": "verified_inactive_non_restorable",
+            "evidence": evidence,
+        })
+    return {"status": "PASS" if not errors else "BLOCKED", "errors": errors, "exclusions": exclusions}
+
+
 def evaluate_checkpoint_snapshot(
     checkpoints: dict[str, dict[str, Any] | None],
     *,

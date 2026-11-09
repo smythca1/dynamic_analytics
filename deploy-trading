@@ -529,7 +529,12 @@ mode, baseline_path, candidate_path, market_path, manifest_path = sys.argv[1:]
 candidate_root = Path(candidate_path).resolve().parent.parent
 sys.path.insert(0, str(candidate_root))
 import shared.deployment.release_contract as release_contract_module
-from shared.deployment.release_contract import evaluate_broker_snapshot, evaluate_checkpoint_snapshot, validate_historical_checkpoint_authorizations
+from shared.deployment.release_contract import (
+    classify_inactive_checkpoint_artifacts,
+    evaluate_broker_snapshot,
+    evaluate_checkpoint_snapshot,
+    validate_historical_checkpoint_authorizations,
+)
 release_contract_path = Path(release_contract_module.__file__).resolve()
 try:
     release_contract_path.relative_to(candidate_root)
@@ -576,10 +581,13 @@ for identity in set(old) | set(new):
                 flat_required.add(symbol)
 market = json.loads(Path(market_path).read_text(encoding="utf-8"))
 try:
-    # Historical evidence never abandons exposure: verify its symbols on every gate.
+    active_symbols = {str(row.get("symbol", "")).upper() for row in new.values() if row.get("symbol")}
+    # Historical evidence for an otherwise inactive symbol never abandons exposure.
+    # A legacy identity sharing an active symbol is instead protected by that active
+    # runtime's mandatory reconciliation below.
     historical_symbols = {str(record.get("symbol", "")).upper() for record in historical_authorizations if isinstance(record, dict)} - {""}
     affected.update(historical_symbols)
-    flat_required.update(historical_symbols)
+    flat_required.update(historical_symbols - active_symbols)
     trader = AlpacaTrader(load_alpaca_credentials("live"), max_notional=1_000_000)
     account = trader.get_account()
     positions = trader.get_positions()
@@ -614,6 +622,7 @@ try:
     gate = evaluate_broker_snapshot(snapshot, expected_account_id=expected_account, affected_symbols=affected, require_flat_symbols=flat_required)
     out["broker"] = gate
     broker_positions = {str(p.get("symbol", "")).upper(): float(p.get("qty") or 0) for p in positions if isinstance(p, dict)}
+    broker_order_symbols = {str(order.get("symbol", "")).upper() for order in orders if isinstance(order, dict) and order.get("symbol")}
     checkpoints = {identity: None for identity in new}
     state_root = Path("artifacts/live/state")
     inventory = []
@@ -649,6 +658,7 @@ try:
                 "path": relative_path,
                 "sha256": digest,
                 "trader_id": identity,
+                "runtime_trader_id": str(engine.get("trader_id") or source.get("trader_id") or ""),
                 "symbol": str(source.get("symbol") or payload.get("symbol") or "").upper(),
                 "strategy_type": str(engine.get("strategy_type") or engine.get("type") or source.get("strategy_type") or ""),
                 "strategy_identity": str(engine.get("strategy_name") or engine.get("identity") or source.get("strategy_identity") or ""),
@@ -675,22 +685,19 @@ try:
         out["checkpoint"] = authorization_gate
         print(json.dumps(out, sort_keys=True))
         raise SystemExit(42)
-    authorized_paths = {str(record["checkpoint_path"]) for record in authorization_gate["validated"]}
-    unauthorized_artifacts = [
-        row for row in inventory
-        if row["path"] not in authorized_paths
-        and not (row["trader_id"] in new and row["artifact_kind"] == "runtime_checkpoint")
-    ]
-    if unauthorized_artifacts:
-        out["checkpoint"] = {"status": "BLOCKED", "errors": [
-            f"checkpoint artifact lacks authorization: {row['trader_id']}:{row['path']}"
-            for row in unauthorized_artifacts
-        ]}
+    inactive_gate = classify_inactive_checkpoint_artifacts(
+        inventory,
+        active_traders=new.values(),
+        broker_positions=broker_positions,
+        broker_order_symbols=broker_order_symbols,
+    )
+    if inactive_gate["status"] != "PASS":
+        out["checkpoint"] = inactive_gate
         print(json.dumps(out, sort_keys=True))
         raise SystemExit(42)
     checkpoints = {
         identity: payload for identity, payload in checkpoints.items()
-        if not any(row["trader_id"] == identity and row["path"] in authorized_paths for row in inventory)
+        if identity in new
     }
     # Active runtime files are restorable state, never historical authorizations.
     # Validate the actual nested runner snapshot before normalizing for the evaluator.
@@ -744,6 +751,7 @@ try:
     ], broker_positions=broker_positions, retired_trader_ids=set(old) - set(new))
     out["checkpoint"] = checkpoint_gate
     out["checkpoint"]["historical_authorizations"] = authorization_gate["validated"]
+    out["checkpoint"]["historical_exclusions"] = inactive_gate["exclusions"]
     out["checkpoint"]["inventory"] = inventory
     out["checkpoint"]["recovery_verified"] = recovery_verified
 except Exception as exc:
