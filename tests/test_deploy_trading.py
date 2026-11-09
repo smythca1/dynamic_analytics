@@ -208,6 +208,11 @@ class DeployTradingTests(unittest.TestCase):
         self.assertIn('configs/accounts/spxc.live.json', source)
         self.assertIn('configs/accounts/megatron.live.json', source)
 
+    def test_activation_gate_scopes_runtime_reconciliation_to_promoted_fleet(self) -> None:
+        source = self._git("show", f"{self.commit}:deploy-trading").stdout
+        self.assertIn('new = {str(t.get("id")): t for t in enabled(candidate)}', source)
+        self.assertNotIn('load_authorized_configs', source)
+
     def test_rollback_dry_run_preserves_historical_state(self) -> None:
         result = self._run("--rollback", "deploy-1", "--dry-run")
         self.assertIn("Would preserve artifacts, venv, evidence, logs, and state.", result.stdout)
