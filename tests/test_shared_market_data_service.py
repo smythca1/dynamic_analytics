@@ -422,6 +422,19 @@ class SharedMarketDataServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(archives)
         self.assertEqual([event["sequence"] for event in server.events_by_symbol["AAPL"]], [1, 2, 3])
         self.assertEqual(json.loads(active.read_text(encoding="utf-8").splitlines()[0])["payload"]["sequence"], 3)
+        # Reconstruct the service just as a real process restart does. The old
+        # allocator checkpointed sequence 3 even though only 1/2 were archived.
+        restarted = SharedCanonicalMarketDataServer(strict)
+        self.assertTrue(restarted.recovery.healthy)
+        self.assertEqual(restarted.sequences["AAPL"], 3)
+        self.assertEqual(restarted.recovery.events[-1]["sequence"], 3)
+
+    async def test_failed_durable_append_does_not_advance_sequence(self):
+        before = dict(self.server.sequences)
+        self.server.journal.append = Mock(side_effect=OSError("incomplete write"))
+        with self.assertRaises(OSError):
+            await self.server.publish_event(journal_event())
+        self.assertEqual(self.server.sequences, before)
 
     def test_journal_rotation_preserves_archive_and_creates_append_target(self):
         with temporary_directory() as temp_dir:
@@ -1282,6 +1295,100 @@ class SharedMarketDataServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SharedMarketDataUnitTests(unittest.TestCase):
+    @staticmethod
+    def verified_event(symbol, sequence):
+        event = journal_event(symbol, sequence)
+        event["contract_fingerprint"] = market_stream_contract(symbol=symbol, session_timezone="America/New_York").fingerprint
+        event["event_id"] = canonical_event_id(**{key: event[key] for key in (
+            "contract_fingerprint", "symbol", "sequence", "observation_timestamp", "close_price", "source_record_id"
+        )})
+        return event
+
+    def boundary_fixture(self, root):
+        from silver.market.journal_recovery import durable_json
+        journal = CanonicalJournal(root / "journal.jsonl")
+        write_journal(journal.path, self.verified_event("AAPL", 1), self.verified_event("TSLA", 1))
+        archive = journal.rotate(latest_sequences={"AAPL": 2, "TSLA": 1})
+        write_journal(journal.path, self.verified_event("AAPL", 2), self.verified_event("TSLA", 2), self.verified_event("AAPL", 3))
+        quarantine = journal.path.with_suffix(".jsonl.corrupt.jsonl")
+        durable_json(quarantine, {"reason": "non_monotonic_sequence", "raw_line": "preserve"})
+        return journal, archive, quarantine
+
+    def test_audited_boundary_recovery_survives_repeated_restarts(self):
+        from silver.market.journal_recovery import apply_recovery, file_hash, plan_recovery
+        with temporary_directory() as tmp:
+            root = Path(tmp)
+            journal, archive, quarantine = self.boundary_fixture(root)
+            original = {p: p.read_bytes() for p in (journal.path, archive, quarantine, journal.checkpoint_path)}
+            plan = plan_recovery(journal.path)
+            self.assertEqual(plan["advanced_symbol"], "AAPL")
+            audit = apply_recovery(journal.path, root / "audit")
+            self.assertEqual(audit["status"], "PASS")
+            for name, source in audit["sources"].items():
+                self.assertEqual(file_hash(Path(audit["evidence_path"]) / (name + ".original")), source["sha256"])
+            for p in (journal.path, archive, quarantine):
+                self.assertEqual(p.read_bytes(), original[p])
+            for _ in range(3):
+                recovery = CanonicalJournal(journal.path).recover()
+                self.assertTrue(recovery.healthy)
+                self.assertEqual(recovery.latest_sequences, {"AAPL": 3, "TSLA": 2})
+            checkpoint = journal.checkpoint_path.read_bytes()
+            with self.assertRaises(ValueError):
+                apply_recovery(journal.path, root / "audit")
+            self.assertEqual(journal.checkpoint_path.read_bytes(), checkpoint)
+
+    def test_boundary_recovery_rejects_corrupt_or_ambiguous_evidence(self):
+        from silver.market.journal_recovery import apply_recovery
+        for damage in ("duplicate", "out_of_order", "missing", "checksum", "truncated", "archive_checksum", "missing_archive", "multiple_advanced", "identity"):
+            with self.subTest(damage=damage), temporary_directory() as tmp:
+                root = Path(tmp)
+                journal, archive, _ = self.boundary_fixture(root)
+                if damage == "duplicate":
+                    journal.append(self.verified_event("AAPL", 3))
+                elif damage == "out_of_order":
+                    journal.append(self.verified_event("AAPL", 2))
+                elif damage == "missing":
+                    write_journal(journal.path, self.verified_event("AAPL", 3))
+                elif damage in ("checksum", "identity", "archive_checksum"):
+                    target = archive if damage == "archive_checksum" else journal.path
+                    rows = target.read_text().splitlines()
+                    record = json.loads(rows[0])
+                    if damage == "identity":
+                        record["payload"]["event_id"] = "unverifiable"
+                        record["payload_sha256"] = CanonicalJournal.payload_checksum(record["payload"])
+                    else:
+                        record["payload_sha256"] = "wrong"
+                    rows[0] = json.dumps(record)
+                    target.write_text("\n".join(rows) + "\n")
+                elif damage == "truncated":
+                    with journal.path.open("ab") as handle:
+                        handle.write(b'{"payload":')
+                elif damage == "missing_archive":
+                    archive.unlink()
+                elif damage == "multiple_advanced":
+                    cp = json.loads(journal.checkpoint_path.read_text())
+                    cp["latest_sequences"]["TSLA"] = 2
+                    journal.checkpoint_path.write_text(json.dumps(cp))
+                checkpoint = journal.checkpoint_path.read_bytes()
+                with self.assertRaises((ValueError, FileNotFoundError)):
+                    apply_recovery(journal.path, root / "audit")
+                self.assertEqual(journal.checkpoint_path.read_bytes(), checkpoint)
+
+    def test_interrupted_recovery_preserves_original_checkpoint_and_evidence(self):
+        from silver.market.journal_recovery import apply_recovery
+        with temporary_directory() as tmp:
+            root = Path(tmp)
+            journal, _, _ = self.boundary_fixture(root)
+            original = journal.checkpoint_path.read_bytes()
+            with patch("silver.market.journal_recovery.os.replace", side_effect=OSError("interrupted")):
+                with self.assertRaises(OSError):
+                    apply_recovery(journal.path, root / "audit")
+            self.assertEqual(journal.checkpoint_path.read_bytes(), original)
+            prepared = list((root / "audit").glob("*/prepared.json"))
+            self.assertEqual(len(prepared), 1)
+            self.assertEqual((prepared[0].parent / "checkpoint.original").read_bytes(), original)
+            self.assertEqual(apply_recovery(journal.path, root / "audit")["status"], "PASS")
+
     def test_singleton_lock_recovers_stale_legacy_dead_pid(self):
         with temporary_directory() as temp_dir:
             path = Path(temp_dir) / "live.lock"

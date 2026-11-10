@@ -1366,6 +1366,9 @@ class SharedCanonicalMarketDataServer:
         symbol = str(event["symbol"]).upper()
         journal_started = time.perf_counter()
         self.journal.append(event)
+        # Rotation boundaries must describe durable records, never an event
+        # allocated by the sampler but not yet appended and fsynced.
+        self.sequences[symbol] = int(event["sequence"])
         self.metrics.observe("canonical_journal_durable_write_seconds", time.perf_counter() - journal_started)
         self.metrics.increment("canonical_journal_writes")
         self.events_by_symbol.setdefault(symbol, []).append(event)
@@ -1519,7 +1522,6 @@ class SharedCanonicalMarketDataServer:
         for observation in result.observations:
             finalize_started = time.perf_counter()
             sequence = self.sequences[symbol] + 1
-            self.sequences[symbol] = sequence
             close_price = str(observation.close_price)
             observation_timestamp = pd.Timestamp(observation.second_bucket).isoformat()
             contract_fingerprint = self.config.contract_fingerprints[symbol]
