@@ -6,7 +6,7 @@ from typing import Protocol
 
 import pandas as pd
 
-from alpaca_trader import AlpacaTrader, child_client_order_id, load_alpaca_credentials, validate_live_tp_sl_entry
+from alpaca_trader import AlpacaTrader, child_client_order_id, load_alpaca_credentials
 from trading_events import ExecutionEvent, OrderIntent, dataclass_to_jsonable
 
 
@@ -131,6 +131,10 @@ class AlpacaExecutionEngine:
             payload["market_contract_fingerprint"] = intent.market_contract_fingerprint
 
         if getattr(getattr(self.trader, "credentials", None), "mode", None) == "live":
+            # Promotion gates may hold the deployed adapter in sys.modules while
+            # inspecting a candidate release. Resolve execution-only validation
+            # when executing an intent, not while importing candidate code.
+            from alpaca_trader import validate_live_tp_sl_entry
             validate_live_tp_sl_entry(payload)
         response = self.trader.submit_order(payload, action=action, side=intent.side)
         if (

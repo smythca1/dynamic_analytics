@@ -34,6 +34,14 @@ class RecordingTrader:
 
 
 class AlpacaExecutionEngineTests(unittest.TestCase):
+    def test_candidate_import_does_not_require_execution_helper_on_deployed_adapter(self):
+        import subprocess
+        import sys
+        result=subprocess.run([sys.executable,"-c",
+            "import alpaca_trader; del alpaca_trader.validate_live_tp_sl_entry; import execution_engine"],
+            capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+
     @staticmethod
     def bracket_intent(side="buy", symbol="TQQQ"):
         strategy = RenkoStrategyEngine(RenkoStrategyConfig(
@@ -100,6 +108,34 @@ class AlpacaExecutionEngineTests(unittest.TestCase):
                 with self.assertRaises(HTTPException):
                     self.live_engine().execute(replace(intent,**changes))
                 request.assert_not_called()
+
+    def test_partial_entry_uses_one_bracket_and_verifies_actual_filled_quantity(self):
+        for side in ("buy","sell"):
+            with self.subTest(side=side):
+                _,intent=self.bracket_intent(side)
+                engine=self.live_engine(); posted=[]
+                closing="sell" if side=="buy" else "buy"
+                def request(**kwargs):
+                    if kwargs["method"]=="GET":
+                        return SimpleNamespace(status_code=404,text="{}",json=lambda:{})
+                    body=kwargs["json"]; posted.append(body)
+                    parent=dict(body,id="parent",status="partially_filled",filled_qty="5",legs=[
+                        {"id":"tp","symbol":intent.symbol,"side":closing,"qty":"5","filled_qty":"0","status":"new","limit_price":body["take_profit"]["limit_price"]},
+                        {"id":"sl","symbol":intent.symbol,"side":closing,"qty":"5","filled_qty":"0","status":"new","stop_price":body["stop_loss"]["stop_price"]},
+                    ])
+                    return SimpleNamespace(status_code=200,text=json.dumps(parent),json=lambda:parent)
+                with patch("alpaca_trader.requests.request",side_effect=request):
+                    event=engine.execute(intent)
+                parent=event.response["response"]
+                position={"symbol":intent.symbol,"side":"long" if side=="buy" else "short","qty":"5","avg_entry_price":intent.exit_plan["entry_reference_price"]}
+                result=verify_broker_native_protection(symbol=intent.symbol,broker_position=position,
+                    nested_orders=[parent],exit_plan=intent.exit_plan)
+                self.assertTrue(result.protected,result.issues)
+                parent["legs"][1]["status"]="rejected"
+                self.assertFalse(verify_broker_native_protection(symbol=intent.symbol,broker_position=position,
+                    nested_orders=[parent],exit_plan=intent.exit_plan).protected)
+                self.assertEqual(len(posted),1)
+                self.assertEqual(posted[0]["qty"],"20")
 
     def test_rejected_or_unacknowledged_bracket_never_falls_back_to_naked_order(self):
         _,intent=self.bracket_intent()
