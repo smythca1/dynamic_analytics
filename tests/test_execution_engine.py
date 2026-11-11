@@ -1,9 +1,18 @@
 import unittest
+import json
+from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import patch
+from fastapi import HTTPException
 
 import pandas as pd
 
 from execution_engine import AlpacaExecutionEngine
 from trading_events import OrderIntent
+from trading_events import MarketTick
+from alpaca_trader import AlpacaTrader, AlpacaCredentials
+from strategy_engine import RenkoStrategyEngine, RenkoStrategyConfig
+from broker_protection import verify_broker_native_protection
 
 
 class RecordingTrader:
@@ -25,6 +34,91 @@ class RecordingTrader:
 
 
 class AlpacaExecutionEngineTests(unittest.TestCase):
+    @staticmethod
+    def bracket_intent(side="buy", symbol="TQQQ"):
+        strategy = RenkoStrategyEngine(RenkoStrategyConfig(
+            trader_id="generic_tp_sl", symbol=symbol, strategy_type="renko_tp_sl",
+            strategy_name="generic_tp_sl", brick_size=0.700920, entry_bricks=2,
+            take_profit_bricks=1, stop_loss_bricks=3, qty=20,
+            exit_management="bracket", candidate_config_fingerprint="candidate",
+            market_contract_fingerprint="market", entry_start="09:30:15", entry_end="15:50:15",
+        ))
+        prices = [100,100.8,101.5] if side=="buy" else [100,99.2,98.5]
+        actions=[]
+        for i, price in enumerate(prices):
+            _, emitted = strategy.on_tick(MarketTick(pd.Timestamp("2026-11-11T15:00:00Z")+pd.Timedelta(seconds=i),symbol,price,1))
+            actions.extend(emitted)
+        return strategy, actions[0][1]
+
+    @staticmethod
+    def live_engine():
+        engine=AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        engine.trader=AlpacaTrader(AlpacaCredentials(mode="live",key_id="test",secret_key="test",base_url="https://example.test"),max_notional=250000)
+        engine.log=None
+        return engine
+
+    def test_real_adapter_posts_one_atomic_long_and_short_bracket(self):
+        for side in ("buy","sell"):
+            for symbol in ("TQQQ","AMD"):
+                with self.subTest(side=side,symbol=symbol):
+                    strategy,intent=self.bracket_intent(side,symbol)
+                    engine=self.live_engine()
+                    posts=[]
+                    def request(**kwargs):
+                        if kwargs["method"]=="GET":
+                            return SimpleNamespace(status_code=404,text="{}",json=lambda: {})
+                        body=kwargs["json"]; posts.append(body)
+                        closing="sell" if side=="buy" else "buy"
+                        parent=dict(body,id="parent",status="filled",filled_qty="20",legs=[
+                            {"id":"tp","symbol":symbol,"side":closing,"qty":"20","filled_qty":"0","status":"new","limit_price":body["take_profit"]["limit_price"]},
+                            {"id":"sl","symbol":symbol,"side":closing,"qty":"20","filled_qty":"0","status":"new","stop_price":body["stop_loss"]["stop_price"]},
+                        ])
+                        return SimpleNamespace(status_code=200,text=json.dumps(parent),json=lambda:parent)
+                    with patch("alpaca_trader.requests.request",side_effect=request):
+                        event=engine.execute(intent)
+                    self.assertEqual(len(posts),1)
+                    self.assertEqual(posts[0]["order_class"],"bracket")
+                    self.assertEqual(posts[0]["qty"],"20")
+                    self.assertFalse(posts[0]["extended_hours"])
+                    self.assertEqual(posts[0]["take_profit"]["limit_price"],intent.exit_plan["take_profit_limit_price"])
+                    self.assertEqual(posts[0]["stop_loss"]["stop_price"],intent.exit_plan["stop_loss_trigger_price"])
+                    verified=verify_broker_native_protection(
+                        symbol=symbol,broker_position={"symbol":symbol,"side":"long" if side=="buy" else "short","qty":"20","avg_entry_price":intent.exit_plan["entry_reference_price"]},
+                        nested_orders=[event.response["response"]],exit_plan=intent.exit_plan,
+                        expected_config_fingerprint="candidate",expected_market_contract_fingerprint="market",
+                    )
+                    self.assertTrue(verified.protected,verified.issues)
+                    strategy.mark_entry_protection_submitted(intent,event.response)
+                    self.assertEqual(strategy.protection_state["take_profit_order_id"],"tp")
+                    self.assertEqual(strategy.protection_state["stop_loss_order_id"],"sl")
+
+    def test_live_tp_sl_cannot_reach_adapter_without_canonical_bracket(self):
+        _,intent=self.bracket_intent()
+        for changes in ({"exit_management":"strategy"},{"exit_management":"oco"},{"exit_plan":None},
+                        {"qty":21},{"take_profit_limit_price":123},{"candidate_config_fingerprint":"other"}):
+            with self.subTest(changes=changes), patch("alpaca_trader.requests.request") as request:
+                with self.assertRaises(HTTPException):
+                    self.live_engine().execute(replace(intent,**changes))
+                request.assert_not_called()
+
+    def test_rejected_or_unacknowledged_bracket_never_falls_back_to_naked_order(self):
+        _,intent=self.bracket_intent()
+        for status,order_class in (("rejected","bracket"),("accepted",""),("","bracket")):
+            with self.subTest(status=status,order_class=order_class):
+                engine=self.live_engine()
+                posted=[]
+                def request(**kwargs):
+                    if kwargs["method"]=="GET":
+                        return SimpleNamespace(status_code=404,text="{}",json=lambda:{})
+                    posted.append(kwargs["json"])
+                    body={"id":"parent","status":status,"order_class":order_class}
+                    return SimpleNamespace(status_code=200,text=json.dumps(body),json=lambda:body)
+                with patch("alpaca_trader.requests.request",side_effect=request):
+                    with self.assertRaises(HTTPException):
+                        engine.execute(intent)
+                self.assertEqual(len(posted),1)
+                self.assertEqual(posted[0]["order_class"],"bracket")
+
     def test_oco_child_order_id_keeps_unique_suffix_for_long_entry_ids(self):
         engine = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
         engine.trader = RecordingTrader()

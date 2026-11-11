@@ -5,6 +5,7 @@ import time
 
 import requests
 from fastapi import HTTPException
+from exit_plan import ExitPlan, PriceRounding, build_renko_tp_sl_exit_plan, validate_exit_plan
 
 from reversal_protection import build_reversal_catastrophic_stop_plan, catastrophic_stop_order_payload
 from silver.execution import authoritative_position_from_alpaca, resolve_close_intent
@@ -14,6 +15,53 @@ DEFAULT_ALPACA_LIVE_BASE_URL = "https://api.alpaca.markets"
 DEFAULT_ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets"
 DEFAULT_ALPACA_DATA_BASE_URL = "https://data.alpaca.markets"
 MAX_CLIENT_ORDER_ID_LENGTH = 48
+
+
+def validate_live_tp_sl_entry(data: dict) -> None:
+    """Validate the existing ExitPlan before any live TP/SL entry can reach POST."""
+    if data.get("strategy_type") != "renko_tp_sl" or data.get("close_position"):
+        return
+    try:
+        if data.get("signal_type") != "entry" or data.get("exit_management") != "bracket":
+            raise ValueError("live TP/SL entry requires atomic bracket protection")
+        raw = data.get("exit_plan")
+        if not isinstance(raw, dict):
+            raise ValueError("live TP/SL entry requires a valid ExitPlan")
+        plan = ExitPlan(**dict(raw, price_rounding=PriceRounding(**raw["price_rounding"])))
+        validate_exit_plan(plan)
+        expected = build_renko_tp_sl_exit_plan(
+            trader_id=plan.trader_id, strategy_id=plan.strategy_id, symbol=plan.symbol,
+            entry_side=plan.intended_entry_side, quantity=plan.quantity,
+            entry_reference_type=plan.entry_reference_type, entry_reference_price=plan.entry_reference_price,
+            brick_size=plan.brick_size, take_profit_bricks=plan.take_profit_bricks,
+            stop_loss_bricks=plan.stop_loss_bricks, time_in_force=plan.time_in_force,
+            order_class="bracket", client_order_id=plan.client_order_id,
+            candidate_config_fingerprint=plan.candidate_config_fingerprint,
+            market_contract_fingerprint=plan.market_contract_fingerprint,
+        )
+        if plan.to_dict() != expected.to_dict():
+            raise ValueError("ExitPlan does not match canonical Renko TP/SL prices")
+        from decimal import Decimal
+        if Decimal(plan.quantity) != Decimal(plan.quantity).to_integral_value():
+            raise ValueError("live bracket requires whole shares")
+        pairs = {
+            "symbol": plan.symbol, "side": plan.intended_entry_side,
+            "trader_id": plan.trader_id, "strategy": plan.strategy_id,
+            "client_order_id": plan.client_order_id,
+            "candidate_config_fingerprint": plan.candidate_config_fingerprint,
+            "market_contract_fingerprint": plan.market_contract_fingerprint,
+        }
+        if any(data.get(key) != value for key, value in pairs.items()):
+            raise ValueError("ExitPlan execution identity mismatch")
+        for key, value in (("qty", plan.quantity), ("brick_size", plan.brick_size),
+                           ("take_profit_limit_price", plan.take_profit_limit_price),
+                           ("stop_loss_stop_price", plan.stop_loss_trigger_price)):
+            if Decimal(str(data.get(key))) != Decimal(value):
+                raise ValueError(f"ExitPlan {key} mismatch")
+        if data.get("notional") is not None or data.get("target_qty") is not None:
+            raise ValueError("live TP/SL bracket must use fixed entry quantity")
+    except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def child_client_order_id(parent_client_order_id: object, suffix: str) -> str:
@@ -818,6 +866,8 @@ class AlpacaTrader:
         order_type = str(data.get("order_type", "market")).lower().strip()
         close_position = self._as_bool(data.get("close_position"))
         is_exit_action = action in {"tp", "sl", "close"} or (action == "sell" and close_position)
+        if self.credentials.mode == "live":
+            validate_live_tp_sl_entry(dict(data, side=side, close_position=is_exit_action))
         close_resolution_payload: dict[str, object] | None = None
 
         if is_exit_action:
@@ -993,6 +1043,16 @@ class AlpacaTrader:
             reason=reason,
             close_position=close_position,
         )
+
+        if self.credentials.mode == "live" and data.get("strategy_type") == "renko_tp_sl" and not is_exit_action:
+            if (not isinstance(order_response, dict) or not order_response.get("id")
+                or order_response.get("order_class") != "bracket"
+                or str(order_response.get("status") or "").lower() not in {
+                    "new", "accepted", "pending_new", "partially_filled", "filled", "accepted_for_bidding", "held"
+                }):
+                raise HTTPException(status_code=409, detail={
+                    "error": "live_tp_sl_bracket_not_acknowledged", "broker_order": order_response,
+                })
 
         result = {
             "status": "order sent",

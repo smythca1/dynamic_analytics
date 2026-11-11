@@ -1217,6 +1217,19 @@ class DeployTradingTests(unittest.TestCase):
 
 
 class ActiveCheckpointGateTests(unittest.TestCase):
+    def test_production_preflight_rejects_live_tp_sl_engine_only_mode(self):
+        from shared.config.trader_config import validate_production_fleet_config, TraderConfigError
+        original=json.loads((REPO_ROOT/"configs/traders.live.example.json").read_text())
+        validate_production_fleet_config(original)
+        for mode in ("strategy","oco",None):
+            config=copy.deepcopy(original)
+            trader=next(t for t in config["traders"] if t.get("enabled") and t["strategy"]["type"]=="renko_tp_sl")
+            if mode is None: trader["strategy"].pop("exit_management")
+            else: trader["strategy"]["exit_management"]=mode
+            with self.subTest(mode=mode), self.assertRaisesRegex(TraderConfigError,"requires exit_management=bracket"):
+                validate_production_fleet_config(config)
+        self.assertIn("validate_production_fleet_config(data, config_path=str(config_path))",SCRIPT.read_text())
+
     def test_restart_controller_success_and_failure_boundaries(self):
         definitions=SCRIPT.read_text().rsplit('main "$@"',1)[0]
         for failing,expected in [('none',['restart','is-active']),('pre',[]),('post',['restart','is-active','stop'])]:

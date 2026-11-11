@@ -6,7 +6,7 @@ from typing import Protocol
 
 import pandas as pd
 
-from alpaca_trader import AlpacaTrader, child_client_order_id, load_alpaca_credentials
+from alpaca_trader import AlpacaTrader, child_client_order_id, load_alpaca_credentials, validate_live_tp_sl_entry
 from trading_events import ExecutionEvent, OrderIntent, dataclass_to_jsonable
 
 
@@ -80,6 +80,8 @@ class AlpacaExecutionEngine:
             "timestamp": intent.timestamp,
             "signal_type": intent.signal_type,
             "close_position": intent.close_position,
+            "strategy": intent.strategy,
+            "strategy_type": intent.strategy_type,
         }
         if intent.trader_id:
             payload["trader_id"] = intent.trader_id
@@ -128,6 +130,8 @@ class AlpacaExecutionEngine:
         if intent.market_contract_fingerprint:
             payload["market_contract_fingerprint"] = intent.market_contract_fingerprint
 
+        if getattr(getattr(self.trader, "credentials", None), "mode", None) == "live":
+            validate_live_tp_sl_entry(payload)
         response = self.trader.submit_order(payload, action=action, side=intent.side)
         if (
             intent.signal_type == "entry"

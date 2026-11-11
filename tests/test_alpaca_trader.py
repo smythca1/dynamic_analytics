@@ -1,9 +1,52 @@
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 from fastapi import HTTPException
 
 from alpaca_trader import AlpacaCredentials, AlpacaTrader, MAX_CLIENT_ORDER_ID_LENGTH, child_client_order_id
+from exit_plan import build_renko_tp_sl_exit_plan
+
+
+class LiveTpSlAdapterInvariantTests(unittest.TestCase):
+    def payload(self):
+        plan=build_renko_tp_sl_exit_plan(
+            trader_id="generic",strategy_id="test",symbol="AMD",entry_side="buy",quantity=20,
+            entry_reference_type="signal_price",entry_reference_price=100,brick_size=0.700920,
+            take_profit_bricks=1,stop_loss_bricks=3,time_in_force="day",order_class="bracket",
+            client_order_id="entry",candidate_config_fingerprint="config",market_contract_fingerprint="market",
+        ).to_dict()
+        return {"symbol":"AMD","strategy_type":"renko_tp_sl","strategy":"test","trader_id":"generic",
+                "side":"buy","signal_type":"entry","qty":20,"brick_size":0.700920,"exit_management":"bracket",
+                "client_order_id":"entry","candidate_config_fingerprint":"config","market_contract_fingerprint":"market",
+                "take_profit_limit_price":plan["take_profit_limit_price"],"stop_loss_stop_price":plan["stop_loss_trigger_price"],"exit_plan":plan}
+
+    def test_direct_adapter_rejects_naked_or_tampered_live_tp_sl_before_submission(self):
+        for damage in ("strategy","oco","missing_plan","tampered_plan","mismatched_qty"):
+            with self.subTest(damage=damage):
+                trader=StubAlpacaTrader(None)
+                data=self.payload()
+                if damage in {"strategy","oco"}: data["exit_management"]=damage
+                if damage=="missing_plan": data.pop("exit_plan")
+                if damage=="tampered_plan": data["exit_plan"]["stop_loss_trigger_price"]="99.00"
+                if damage=="mismatched_qty": data["qty"]=25
+                with self.assertRaises(HTTPException):
+                    trader.submit_order(data,"buy","buy")
+                self.assertEqual(trader.orders,[])
+
+    def test_paper_tp_sl_research_mode_retains_strategy_execution(self):
+        trader=StubAlpacaTrader(None)
+        trader.credentials=replace(trader.credentials,mode="paper")
+        data=self.payload(); data["exit_management"]="strategy"; data.pop("exit_plan")
+        trader.submit_order(data,"buy","buy")
+        self.assertNotIn("order_class",trader.orders[0][0])
+
+    def test_live_tp_sl_close_remains_reduce_only_when_already_flat(self):
+        trader=StubAlpacaTrader(None)
+        data=self.payload(); data["close_position"]=True; data["signal_type"]="exit"; data["exit_management"]="strategy"
+        result=trader.submit_order(data,"close","sell")
+        self.assertEqual(result["status"],"no open position")
+        self.assertEqual(trader.orders,[])
 
 
 class StubAlpacaTrader(AlpacaTrader):

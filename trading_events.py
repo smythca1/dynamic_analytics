@@ -233,6 +233,9 @@ class OrderIntent:
     candidate_config_fingerprint: str | None = None
     market_contract_fingerprint: str | None = None
 
+    # Explicit execution context; do not infer strategy family from its name.
+    strategy_type: str | None = None
+
 
 @dataclass(frozen=True)
 class ExecutionEvent:

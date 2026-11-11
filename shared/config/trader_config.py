@@ -447,6 +447,18 @@ def validate_single_strategy_kernel_config(data: dict[str, Any], *, config_path:
         )
 
 
+def validate_live_tp_sl_config(config: RenkoStrategyConfig | MeanReversionStrategyConfig) -> None:
+    """Production-only invariant; canonical research engines remain independent."""
+    if config.strategy_type != "renko_tp_sl":
+        return
+    if config.exit_management != "bracket":
+        raise TraderConfigError(f"{config.trader_id}: live TP/SL requires exit_management=bracket")
+    if config.qty is None or config.qty <= 0 or config.qty != round(config.qty):
+        raise TraderConfigError(f"{config.trader_id}: live TP/SL requires positive whole-share qty")
+    if not config.candidate_config_fingerprint or not config.market_contract_fingerprint:
+        raise TraderConfigError(f"{config.trader_id}: live TP/SL requires both protection fingerprints")
+
+
 def validate_production_fleet_config(data: dict[str, Any], *, config_path: str | None = None) -> None:
     """Validate a generic multi-trader shared-account production fleet."""
     source = f"{config_path}: " if config_path else ""
@@ -502,6 +514,7 @@ def validate_production_fleet_config(data: dict[str, Any], *, config_path: str |
             raise TraderConfigError(f"{source}{trader_id}: invalid production strategy contract: {exc}") from exc
         if not isinstance(strategy_config, RenkoStrategyConfig):
             raise TraderConfigError(f"{source}{trader_id}: production fleet currently supports Renko traders only")
+        validate_live_tp_sl_config(strategy_config)
 
 
 def normalize_renko_source(value: Any) -> str:

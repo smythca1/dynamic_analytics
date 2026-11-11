@@ -44,7 +44,7 @@ from silver.market import (
 from silver.market.canonical_journal import CanonicalJournal
 from silver.market.ipc_consumer import CanonicalStreamEvent
 from silver.market.contract import contract_snapshot
-from shared.config.trader_config import TraderConfigError, validate_single_strategy_kernel_config
+from shared.config.trader_config import TraderConfigError, validate_single_strategy_kernel_config, validate_production_fleet_config, validate_live_tp_sl_config
 from scripts.live_signal_parity import iter_source_ticks
 from strategy_engine import (
     MAX_CLIENT_ORDER_ID_LENGTH,
@@ -426,6 +426,55 @@ def live_config_trader(trader_id: str) -> dict:
 
 
 class StrategyEngineOrderIntentTests(unittest.TestCase):
+    def test_uncertain_live_bracket_submission_halts_and_preserves_lineage_across_restart(self):
+        from tests.test_execution_engine import AlpacaExecutionEngineTests
+        engine,intent=AlpacaExecutionEngineTests.bracket_intent()
+        execution=AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
+        execution.trader=FakeRiskTrader()
+        execution.execute=Mock(side_effect=TimeoutError("broker response uncertain"))
+        runtime=TraderRuntime(trader_id=engine.config.trader_id,symbol=engine.config.symbol,mode="live",
+            credential_profile=None,feed="sip",enabled=True,execution_enabled=True,max_position_notional=10000,
+            max_daily_loss=0,engine=engine,execution=execution,log=MemoryLog())
+        signal=Signal(signal_id=intent.signal_id,signal_type="entry",timestamp=intent.timestamp,symbol=intent.symbol,
+            side="long",broker_side="buy",price=float(intent.exit_plan["entry_reference_price"]),reason=intent.reason,
+            strategy=intent.strategy,trader_id=intent.trader_id)
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)
+            self.assertFalse(handle_action(runtime,signal,intent,root=root))
+            self.assertFalse(runtime.enabled)
+            self.assertFalse(handle_action(runtime,signal,intent,root=root))
+            execution.execute.assert_called_once()
+            saved=json.loads((root/"state"/(runtime.trader_id+".json")).read_text())
+            self.assertTrue(saved["engine"]["trade"]["reconciliation_unsafe"])
+            self.assertEqual(saved["engine"]["trade"]["protection_state"]["exit_plan"],intent.exit_plan)
+            restored=RenkoStrategyEngine(engine.config)
+            restored.restore_snapshot(saved["engine"])
+            self.assertTrue(restored.reconciliation_unsafe)
+
+    def test_live_tp_sl_validation_rejects_strategy_and_oco_but_research_is_unchanged(self):
+        for symbol in ("TQQQ","AMD"):
+            for mode in ("strategy","oco"):
+                with self.subTest(symbol=symbol,mode=mode):
+                    config=RenkoStrategyConfig(symbol=symbol,brick_size=0.700920,entry_bricks=2,
+                        take_profit_bricks=1,stop_loss_bricks=3,qty=20,exit_management=mode)
+                    with self.assertRaisesRegex(TraderConfigError,"requires exit_management=bracket"):
+                        validate_live_tp_sl_config(config)
+                    # Research construction/execution does not call production validation.
+                    self.assertEqual(RenkoStrategyEngine(config).config.exit_management,mode)
+
+    def test_effective_live_runtime_mode_cannot_bypass_tp_sl_validation(self):
+        from fleet_runner import build_runtimes
+        config=json.loads(Path("configs/traders.live.example.json").read_text())
+        trader=next(t for t in config["traders"] if t.get("enabled") and t["symbol"]=="TQQQ")
+        trader=json.loads(json.dumps(trader)); trader["mode"]="paper"; trader["strategy"]["exit_management"]="strategy"
+        args=SimpleNamespace(force_mode="live",force_feed=None,market_data_source="shared_canonical_stream",
+            market_data_profile=None,execute_real=True,log_output=None)
+        with tempfile.TemporaryDirectory() as folder:
+            trader["event_log"]=str(Path(folder)/"events.jsonl")
+            with patch("fleet_runner.build_evidence_logger",return_value=None), patch("fleet_runner.build_shadow_sampler",return_value=None):
+                with self.assertRaisesRegex(TraderConfigError,"requires exit_management=bracket"):
+                    build_runtimes({"traders":[trader]},args)
+
     def setUp(self):
         _BROKER_FORCE_FLAT_DATES.clear()
 
@@ -738,6 +787,7 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
         enabled_megatron = {trader["id"]: trader for trader in megatron["traders"] if trader.get("enabled")}
 
         expected_camatron = {
+            "camatron_tqqq_1s_renko_tp_sl_1p20_e2_tp1_sl3_qty20_20261110_experimental": ("TQQQ", "renko_tp_sl", 0.700920, 2, 1, 3),
             "camatron_tsla_1s_renko_reversal_0p32_e1_qty8_20261005_live": ("TSLA", "renko_reversal", 3.40312712, 1, None, None),
         }
         self.assertEqual(set(enabled_camatron), set(expected_camatron))
@@ -750,15 +800,17 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
             self.assertEqual(trader["account_namespace"], "camatron")
             self.assertEqual(trader["data"]["market_data_source"], "shared_canonical_stream")
             self.assertEqual(trader["data"]["renko_source"], "1s_close")
-            self.assertEqual(trader["sizing"]["qty"], 8)
+            expected_qty = 20 if strategy_type == "renko_tp_sl" else 8
+            self.assertEqual(trader["sizing"]["qty"], expected_qty)
             self.assertEqual(config.symbol, symbol)
             self.assertEqual(config.strategy_type, strategy_type)
             self.assertAlmostEqual(config.brick_size, brick_size)
             self.assertEqual(config.entry_bricks, entry)
             self.assertEqual(config.take_profit_bricks, tp)
             self.assertEqual(config.stop_loss_bricks, sl)
-            self.assertEqual(config.qty, 8)
+            self.assertEqual(config.qty, expected_qty)
             if strategy_type == "renko_tp_sl":
+                self.assertEqual(config.exit_management, "bracket")
                 self.assertEqual(config.entry_start, "09:30:15")
                 self.assertEqual(config.entry_end, "15:50:15")
                 self.assertEqual(config.force_flat, "15:59:30")
@@ -1291,6 +1343,9 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
                 stop_loss_bricks=2,
                 qty=1,
                 account_namespace="megatron",
+                exit_management="bracket",
+                candidate_config_fingerprint="candidate",
+                market_contract_fingerprint="market",
             )
         )
         execution = AlpacaExecutionEngine.__new__(AlpacaExecutionEngine)
@@ -1324,19 +1379,7 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
             strategy="unit",
             trader_id="megatron_shortable_guard",
         )
-        intent = OrderIntent(
-            client_order_id="short-order",
-            timestamp=signal.timestamp,
-            symbol="NVDA",
-            side="sell",
-            signal_type="entry",
-            order_type="market",
-            strategy="unit",
-            reason="short_entry_e1",
-            qty=1,
-            trader_id="megatron_shortable_guard",
-            account_namespace="megatron",
-        )
+        intent = engine._build_order_intent(signal, close_position=False)
 
         self.assertEqual(should_block_for_risk(runtime, signal, intent), "asset_not_shortable")
         self.assertEqual(log.events[-1][0], "short_entry_rejected")
@@ -1531,8 +1574,8 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
         intent = engine._build_order_intent(signal, close_position=False)
         self.assertEqual(intent.exit_management, "bracket")
         self.assertEqual(intent.qty, 4)
-        self.assertEqual(intent.take_profit_limit_price, 311.5026)
-        self.assertEqual(intent.stop_loss_stop_price, 306.396)
+        self.assertEqual(intent.take_profit_limit_price, 311.50)
+        self.assertEqual(intent.stop_loss_stop_price, 306.40)
         self.assertIsNotNone(intent.exit_plan)
         self.assertEqual(intent.exit_plan["entry_reference_type"], "signal_price")
         self.assertEqual(intent.exit_plan["take_profit_limit_price"], "311.50")
@@ -3355,7 +3398,7 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
         runtime = TraderRuntime(
             trader_id="megatron_aapl",
             symbol="AAPL",
-            mode="live",
+            mode="paper",  # Engine-only TP/SL remains valid in paper/research.
             credential_profile=None,
             feed="sip",
             enabled=True,
@@ -4142,6 +4185,8 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
 
     def test_camatron_config_is_single_tsla_tp_sl_kernel(self):
         config = json.loads(Path("configs/traders.live.example.json").read_text(encoding="utf-8"))
+        # Preserve the legacy single-kernel validator test on its own TSLA fixture.
+        config["traders"]=[t for t in config["traders"] if t["symbol"]!="TQQQ"]
         validate_single_strategy_kernel_config(config, config_path="configs/traders.live.example.json")
         active = [
             trader
@@ -4176,6 +4221,7 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
 
     def test_single_strategy_kernel_validator_rejects_reversal_or_megatron_authority(self):
         config = json.loads(Path("configs/traders.live.example.json").read_text(encoding="utf-8"))
+        config["traders"]=[t for t in config["traders"] if t["symbol"]!="TQQQ"]
         active = next(trader for trader in config["traders"] if trader.get("enabled") and trader.get("execution_enabled"))
         active["account_namespace"] = "megatron"
         active["credential_profile"] = "megatron"
@@ -4804,7 +4850,7 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
         runtime = TraderRuntime(
             trader_id="camatron_tqqq_test",
             symbol="TQQQ",
-            mode="live",
+            mode="paper",  # Test the generic position mismatch independently.
             credential_profile=None,
             feed="sip",
             enabled=True,
@@ -4950,7 +4996,7 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
         runtime = TraderRuntime(
             trader_id="tp_sl_fill_test",
             symbol="TSLA",
-            mode="live",
+            mode="paper",  # Live production now requires broker-native exits.
             credential_profile=None,
             feed="sip",
             enabled=True,
@@ -5024,7 +5070,7 @@ class StrategyEngineOrderIntentTests(unittest.TestCase):
         runtime = TraderRuntime(
             trader_id="tp_sl_sl_fill_test",
             symbol="TSLA",
-            mode="live",
+            mode="paper",  # Live production now requires broker-native exits.
             credential_profile=None,
             feed="sip",
             enabled=True,

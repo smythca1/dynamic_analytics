@@ -71,7 +71,7 @@
         "stop_loss_bricks": 3,
         "allow_short": true,
         "order_type": "market",
-        "exit_management": "strategy",
+        "exit_management": "bracket",
         "candidate_config_fingerprint": "714886de5f74f8c65b4a5d2c8ad3bab9e6dedfa381ba6a8bae65c0ab29b00bf4",
         "market_contract_fingerprint": "ee5d2c2d5c4a5ba6f313437e2c6c9d20c703b6e9bbdc99bc276b69cf37f5fe40"
       },

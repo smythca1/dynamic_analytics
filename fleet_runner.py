@@ -35,6 +35,7 @@ from shared.config.trader_config import (
     production_consumer_identity,
     validate_renko_trader_source,
     validate_production_fleet_config,
+    validate_live_tp_sl_config,
 )
 from renko_builder import RenkoBuildState, initial_renko_close
 from silver.evidence import EvidenceLogger
@@ -1865,6 +1866,12 @@ def verify_flat_reversal_recovery(root: Path, runtime: TraderRuntime, trade: dic
 
 
 def reconcile_engine_with_broker(root: Path, runtime: TraderRuntime) -> None:
+    if is_renko_tp_sl_runtime(runtime) and isinstance(runtime.execution, AlpacaExecutionEngine) and runtime.mode == "live":
+        try:
+            validate_live_tp_sl_config(runtime.engine.config)
+        except ValueError as exc:
+            halt_runtime(root, runtime, "live_tp_sl_requires_bracket", {"error": str(exc)})
+            raise BrokerEngineStateMismatch(str(exc)) from exc
     if not isinstance(runtime.execution, AlpacaExecutionEngine):
         return
 
@@ -2591,6 +2598,8 @@ def build_runtimes(config: dict[str, Any], args: argparse.Namespace) -> list[Tra
         behavior_block_reason = behavior_profile_block_reason(trader)
         log = JsonlEventLog(log_path)
         strategy_config = build_strategy_config(trader)
+        if bool(trader.get("enabled", True)) and execution_enabled and args.execute_real and mode == "live":
+            validate_live_tp_sl_config(strategy_config)
         if isinstance(strategy_config, RenkoStrategyConfig):
             renko_source = validate_renko_trader_source(trader)
             market_adapter = CanonicalMarketObservationAdapter(run_id=f"production:{trader_id}")
@@ -2941,6 +2950,13 @@ def should_block_for_risk(runtime: TraderRuntime, signal: Signal, intent: OrderI
         return "tp_sl_close_already_submitted"
     if signal.signal_type != "entry":
         return None
+    if is_renko_tp_sl_runtime(runtime) and isinstance(runtime.execution, AlpacaExecutionEngine) and runtime.mode == "live":
+        try:
+            validate_live_tp_sl_config(runtime.engine.config)
+        except ValueError:
+            return "live_tp_sl_requires_bracket"
+        if intent.strategy_type != "renko_tp_sl" or intent.exit_management != "bracket" or not intent.exit_plan:
+            return "live_tp_sl_missing_bracket_intent"
     if (
         is_renko_tp_sl_runtime(runtime)
         and str(getattr(runtime.engine, "tp_sl_lifecycle_state", "")) in TP_SL_EXIT_LOCK_STATES
@@ -3060,6 +3076,21 @@ def handle_action(runtime: TraderRuntime, signal: Signal, intent: OrderIntent, r
     try:
         event = runtime.execution.execute(intent)
     except Exception as exc:
+        if root is not None and is_renko_tp_sl_runtime(runtime) and isinstance(runtime.execution, AlpacaExecutionEngine) and runtime.mode == "live" and signal.signal_type == "entry":
+            # A timeout can hide an accepted parent. Never resubmit an uncertain
+            # entry; retain its lineage and use the established recovery path.
+            detail = getattr(exc, "detail", None)
+            broker_order = detail.get("broker_order") if isinstance(detail, dict) else None
+            if intent.exit_plan:
+                runtime.engine.mark_entry_protection_submitted(intent, response=broker_order)
+                if isinstance(broker_order, dict) and broker_order.get("id"):
+                    try:
+                        _recover_runtime_broker_protection(root, runtime)
+                    except Exception as recovery_exc:
+                        runtime.log.write("critical_protection_recovery_error", {
+                            "trader_id": runtime.trader_id, "error": str(recovery_exc),
+                        })
+            halt_runtime(root, runtime, "live_tp_sl_entry_submission_uncertain", {"error": str(exc)})
         safe_evidence_call(
             runtime,
             "execution",
@@ -3415,6 +3446,9 @@ def _process_market_tick_for_runtime(
                     ),
                 )
             if not handle_action(runtime, signal, intent, root=root):
+                if not runtime.enabled and is_renko_tp_sl_runtime(runtime):
+                    archive_engine_state(root, runtime, reason="tp_sl_entry_halted")
+                    break
                 runtime.engine.restore_trade_state(trade_snapshot)
                 reconcile_engine_with_broker(root, runtime)
                 mark_processed_shared_canonical_event(runtime, source_tick, source_event)

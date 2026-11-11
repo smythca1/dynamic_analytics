@@ -1373,6 +1373,10 @@ class RenkoStrategyEngine:
                     market_contract_fingerprint=self.config.market_contract_fingerprint,
                 ).to_dict()
 
+                # The canonical ExitPlan owns broker tick rounding.
+                take_profit_limit_price = float(exit_plan["take_profit_limit_price"])
+                stop_loss_stop_price = float(exit_plan["stop_loss_trigger_price"])
+
         intent_qty = None
         if not close_position:
             intent_qty = order_qty if order_qty is not None else self.config.qty
@@ -1436,6 +1440,7 @@ class RenkoStrategyEngine:
             else None,
             candidate_config_fingerprint=self.config.candidate_config_fingerprint,
             market_contract_fingerprint=self.config.market_contract_fingerprint,
+            strategy_type=self.config.strategy_type,
         )
 
     def _client_order_id(self, signal: Signal) -> str:
